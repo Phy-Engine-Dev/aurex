@@ -75,7 +75,10 @@ Key settings:
 - `agent.commands_enabled`: enable the `!command` interface (default: `false` for safety)
 - `agent.notifications_enabled`: poll the Notifications API and auto-discover targets (default: `true`)
 - `agent.notification_category_ids`: which notification categories to poll (default: `[0, 3]`)
-- `agent.web_search_enabled`: enable Google web search (default: `false`)
+- `agent.web_search_enabled`: enable web search (default: `false`)
+- `agent.web_search_provider`: `google` | `bing` | `duckduckgo` | `baidu` | `searxng` (default: `google`)
+- `agent.web_search_searxng_base_url`: SearXNG base URL (example: `http://127.0.0.1:8080`)
+- `agent.web_search_user_agent`: optional custom User-Agent string
 - `agent.web_search_proxy`: optional HTTP(S) proxy (example: `http://127.0.0.1:7897`)
 - `agent.auto_web_search`: let the LLM decide when to use web search (default: `true`, only effective when `web_search_enabled=true`)
 - `agent.web_search_fallback_to_ddg`: fallback to DuckDuckGo when Google is blocked/captcha (default: `true`)
@@ -106,7 +109,7 @@ Supported interactions (natural language):
 - `@aurex search <query>` — search recent experiments (best effort)
 - `@aurex simulate V=5 R1=100ohm R2=200ohm` — DC simulation demo (requires `phy_engine.auto_build=true` or `phy_engine.phyengine_lib_path`)
 - `@aurex generate circuit <spec>` / `@aurex circuit <spec>` — generate Verilog + `.sav` (publishing requires explicit enablement in config)
-- `@aurex google <query>` — Google web search (requires `agent.web_search_enabled=true`)
+- `@aurex google <query>` — web search + answer (uses `agent.web_search_provider`; requires `agent.web_search_enabled=true`)
 
 Examples:
 
@@ -175,6 +178,8 @@ This context is injected into the LLM prompt for `@mention`/command-triggered re
 - `Missing dependency: requests`: run `python -m pip install -r src/phy_lab/requirements.txt`
 - `Failed to reach Ollama`: confirm `ollama serve` is running and `ollama.base_url` is correct
 - `Login failed`: verify the account email/password and ensure the API is reachable
+- Web search returns no results / captcha: try `agent.web_search_provider=bing`, or run a local SearXNG and set `agent.web_search_provider=searxng` + `agent.web_search_searxng_base_url=http://127.0.0.1:8080`
+- Web search diagnostics (no login required): `python src/phy_lab/agent.py webtest --config .phy_lab/config.json --all --query "your query"`
 - Circuit build failures: set `phy_engine.auto_build=true` (or point to a working `verilog2plsav`) and check CMake output in the cache directory
 - Agent does not reply: run `python src/phy_lab/agent.py diagnose --config .phy_lab/config.json --take 10` to verify the agent can fetch the target comments and detect `@mentions`
 - Agent still does not reply after a mention: run `python src/phy_lab/agent.py diagnose --config .phy_lab/config.json` and check the `Messages:*` sections to confirm notifications are being fetched and targets are being discovered

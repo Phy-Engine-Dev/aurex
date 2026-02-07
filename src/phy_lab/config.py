@@ -109,11 +109,13 @@ class AgentConfig:
     web_search_enabled: bool = False
     web_search_provider: str = "google"
     auto_web_search: bool = True
+    web_search_user_agent: str = ""
     web_search_proxy: str = ""
     web_search_timeout_sec: int = 20
     web_search_cache_ttl_sec: int = 3600
     web_search_max_results: int = 5
     web_search_fallback_to_ddg: bool = True
+    web_search_searxng_base_url: str = ""
     auto_tool_routing: bool = True
     auto_publish: bool = False
     publish_by_default: bool = False
@@ -406,6 +408,9 @@ def parse_config(data: dict[str, Any], *, source: str) -> Config:
     auto_web_search = _optional_bool(
         agent_obj.get("auto_web_search"), where="agent.auto_web_search"
     )
+    web_search_user_agent = _optional_str(
+        agent_obj.get("web_search_user_agent"), where="agent.web_search_user_agent"
+    )
     web_search_proxy = _optional_str(
         agent_obj.get("web_search_proxy"), where="agent.web_search_proxy"
     )
@@ -421,6 +426,10 @@ def parse_config(data: dict[str, Any], *, source: str) -> Config:
     web_search_fallback_to_ddg = _optional_bool(
         agent_obj.get("web_search_fallback_to_ddg"),
         where="agent.web_search_fallback_to_ddg",
+    )
+    web_search_searxng_base_url = _optional_str(
+        agent_obj.get("web_search_searxng_base_url"),
+        where="agent.web_search_searxng_base_url",
     )
     auto_tool_routing = _optional_bool(
         agent_obj.get("auto_tool_routing"), where="agent.auto_tool_routing"
@@ -479,10 +488,16 @@ def parse_config(data: dict[str, Any], *, source: str) -> Config:
         raise ConfigError("agent.publish_category must be 'Experiment' or 'Discussion'")
 
     web_search_provider_final = (web_search_provider or AgentConfig.web_search_provider).strip().lower()
-    if web_search_provider_final not in ("google", "duckduckgo", "ddg", "baidu"):
-        raise ConfigError("agent.web_search_provider must be one of: google, baidu, duckduckgo")
+    if web_search_provider_final not in ("google", "duckduckgo", "ddg", "baidu", "bing", "bing_html", "searxng", "searx"):
+        raise ConfigError(
+            "agent.web_search_provider must be one of: google, baidu, duckduckgo, bing, searxng"
+        )
     if web_search_provider_final == "ddg":
         web_search_provider_final = "duckduckgo"
+    if web_search_provider_final == "bing_html":
+        web_search_provider_final = "bing"
+    if web_search_provider_final == "searx":
+        web_search_provider_final = "searxng"
 
     simulation_enabled = _optional_bool(
         agent_obj.get("simulation_enabled"), where="agent.simulation_enabled"
@@ -537,6 +552,9 @@ def parse_config(data: dict[str, Any], *, source: str) -> Config:
         auto_web_search=auto_web_search
         if auto_web_search is not None
         else AgentConfig.auto_web_search,
+        web_search_user_agent=web_search_user_agent
+        if web_search_user_agent is not None
+        else AgentConfig.web_search_user_agent,
         web_search_proxy=web_search_proxy or AgentConfig.web_search_proxy,
         web_search_timeout_sec=web_search_timeout_sec
         if web_search_timeout_sec is not None
@@ -550,6 +568,9 @@ def parse_config(data: dict[str, Any], *, source: str) -> Config:
         web_search_fallback_to_ddg=web_search_fallback_to_ddg
         if web_search_fallback_to_ddg is not None
         else AgentConfig.web_search_fallback_to_ddg,
+        web_search_searxng_base_url=web_search_searxng_base_url
+        if web_search_searxng_base_url is not None
+        else AgentConfig.web_search_searxng_base_url,
         auto_tool_routing=auto_tool_routing
         if auto_tool_routing is not None
         else AgentConfig.auto_tool_routing,
@@ -671,11 +692,13 @@ def write_config(path: str, config: Config) -> None:
             "web_search_enabled": config.agent.web_search_enabled,
             "web_search_provider": config.agent.web_search_provider,
             "auto_web_search": config.agent.auto_web_search,
+            "web_search_user_agent": config.agent.web_search_user_agent,
             "web_search_proxy": config.agent.web_search_proxy,
             "web_search_timeout_sec": config.agent.web_search_timeout_sec,
             "web_search_cache_ttl_sec": config.agent.web_search_cache_ttl_sec,
             "web_search_max_results": config.agent.web_search_max_results,
             "web_search_fallback_to_ddg": config.agent.web_search_fallback_to_ddg,
+            "web_search_searxng_base_url": config.agent.web_search_searxng_base_url,
             "auto_tool_routing": config.agent.auto_tool_routing,
             "auto_publish": config.agent.auto_publish,
             "publish_by_default": config.agent.publish_by_default,

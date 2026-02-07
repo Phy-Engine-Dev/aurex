@@ -729,7 +729,7 @@ def _handle_comment(
                     if not bool(getattr(cfg.agent, "web_search_enabled", False)):
                         return "Web search is disabled. Set agent.web_search_enabled=true in config."
                     try:
-                        reply = web_search(
+                        search_txt = web_search(
                             query=routed_arg,
                             cache_dir=cache_dir,
                             provider=str(getattr(cfg.agent, "web_search_provider", "google") or "google"),
@@ -738,9 +738,29 @@ def _handle_comment(
                             ttl_sec=int(getattr(cfg.agent, "web_search_cache_ttl_sec", 3600) or 3600),
                             max_results=int(getattr(cfg.agent, "web_search_max_results", 5) or 5),
                             fallback_to_ddg=bool(getattr(cfg.agent, "web_search_fallback_to_ddg", True)),
+                            user_agent=str(getattr(cfg.agent, "web_search_user_agent", "") or ""),
+                            searxng_base_url=str(getattr(cfg.agent, "web_search_searxng_base_url", "") or ""),
                         )
                     except Exception as e:
                         return f"Web search failed: {e}"
+                    messages: list[dict[str, str]] = [{"role": "system", "content": cfg.agent.system_prompt}]
+                    messages.append(
+                        {
+                            "role": "system",
+                            "content": "Web search results (use as external references; include relevant links):\n"
+                            + search_txt,
+                        }
+                    )
+                    messages.append(
+                        {
+                            "role": "user",
+                            "content": "Answer the user's query using the web search results above.\n"
+                            "- If the results are blocked/empty, say so briefly and suggest a fix (proxy or SearXNG).\n"
+                            "- Include up to 5 relevant links.\n\n"
+                            f"User query:\n{routed_arg}",
+                        }
+                    )
+                    reply = ollama.chat(messages=messages)
                     return safe_reply(reply, max_chars=cfg.agent.max_reply_chars)
 
                 if action == "simulate":
@@ -997,9 +1017,9 @@ def _handle_comment(
         messages.extend(history)
 
         # LLM-driven automatic web search (optional).
-        if bool(getattr(cfg.agent, "web_search_enabled", False)) and bool(
-            getattr(cfg.agent, "auto_web_search", True)
-        ):
+                if bool(getattr(cfg.agent, "web_search_enabled", False)) and bool(
+                    getattr(cfg.agent, "auto_web_search", True)
+                ):
             try:
                 use_web, query = _llm_decide_web_search(
                     ollama=ollama,
@@ -1011,30 +1031,34 @@ def _handle_comment(
                 logger.debug("Web router failed: %s", e)
                 use_web, query = False, ""
 
-            if use_web:
-                if _looks_political_sensitive(query or arg):
-                    return _political_refusal_message(query or arg)
-                logger.info("Auto web search triggered (query=%r)", truncate(query, max_chars=200))
-                try:
-                    search_txt = web_search(
-                        query=query,
-                        cache_dir=cache_dir,
-                        provider=str(getattr(cfg.agent, "web_search_provider", "google") or "google"),
-                        proxy=str(getattr(cfg.agent, "web_search_proxy", "") or ""),
-                        timeout_sec=int(getattr(cfg.agent, "web_search_timeout_sec", 20) or 20),
-                        ttl_sec=int(getattr(cfg.agent, "web_search_cache_ttl_sec", 3600) or 3600),
-                        max_results=int(getattr(cfg.agent, "web_search_max_results", 5) or 5),
-                        fallback_to_ddg=bool(getattr(cfg.agent, "web_search_fallback_to_ddg", True)),
-                    )
-                    messages.append(
-                        {
-                            "role": "system",
-                            "content": "Web search results (use as external references; do not mention tools):\n"
-                            + search_txt,
-                        }
-                    )
-                except Exception as e:
-                    logger.warning("Web search failed: %s", e)
+                    if use_web:
+                        if _looks_political_sensitive(query or arg):
+                            return _political_refusal_message(query or arg)
+                        logger.info("Auto web search triggered (query=%r)", truncate(query, max_chars=200))
+                        try:
+                            search_txt = web_search(
+                                query=query,
+                                cache_dir=cache_dir,
+                                provider=str(getattr(cfg.agent, "web_search_provider", "google") or "google"),
+                                proxy=str(getattr(cfg.agent, "web_search_proxy", "") or ""),
+                                timeout_sec=int(getattr(cfg.agent, "web_search_timeout_sec", 20) or 20),
+                                ttl_sec=int(getattr(cfg.agent, "web_search_cache_ttl_sec", 3600) or 3600),
+                                max_results=int(getattr(cfg.agent, "web_search_max_results", 5) or 5),
+                                fallback_to_ddg=bool(getattr(cfg.agent, "web_search_fallback_to_ddg", True)),
+                                user_agent=str(getattr(cfg.agent, "web_search_user_agent", "") or ""),
+                                searxng_base_url=str(
+                                    getattr(cfg.agent, "web_search_searxng_base_url", "") or ""
+                                ),
+                            )
+                            messages.append(
+                                {
+                                    "role": "system",
+                                    "content": "Web search results (use as external references; do not mention tools):\n"
+                                    + search_txt,
+                                }
+                            )
+                        except Exception as e:
+                            logger.warning("Web search failed: %s", e)
 
         messages.append({"role": "user", "content": arg})
         reply = ollama.chat(messages=messages)
@@ -1084,7 +1108,7 @@ def _handle_comment(
             return "Web search is disabled. Set agent.web_search_enabled=true in config."
         logger.debug("Tool google invoked (query=%r)", arg[:200])
         try:
-            reply = web_search(
+            search_txt = web_search(
                 query=arg,
                 cache_dir=cache_dir,
                 provider=str(getattr(cfg.agent, "web_search_provider", "google") or "google"),
@@ -1093,9 +1117,29 @@ def _handle_comment(
                 ttl_sec=int(getattr(cfg.agent, "web_search_cache_ttl_sec", 3600) or 3600),
                 max_results=int(getattr(cfg.agent, "web_search_max_results", 5) or 5),
                 fallback_to_ddg=bool(getattr(cfg.agent, "web_search_fallback_to_ddg", True)),
+                user_agent=str(getattr(cfg.agent, "web_search_user_agent", "") or ""),
+                searxng_base_url=str(getattr(cfg.agent, "web_search_searxng_base_url", "") or ""),
             )
         except Exception as e:
             return f"Web search failed: {e}"
+        messages: list[dict[str, str]] = [{"role": "system", "content": cfg.agent.system_prompt}]
+        messages.append(
+            {
+                "role": "system",
+                "content": "Web search results (use as external references; include relevant links):\n"
+                + search_txt,
+            }
+        )
+        messages.append(
+            {
+                "role": "user",
+                "content": "Answer the user's query using the web search results above.\n"
+                "- If the results are blocked/empty, say so briefly and suggest a fix (proxy or SearXNG).\n"
+                "- Include up to 5 relevant links.\n\n"
+                f"User query:\n{arg}",
+            }
+        )
+        reply = ollama.chat(messages=messages)
         return safe_reply(reply, max_chars=cfg.agent.max_reply_chars)
 
     if cmd in ("circuit", "verilog"):
@@ -2772,6 +2816,65 @@ def _safe_json(value: Any) -> str:
         return str(value)
 
 
+def _cmd_webtest(args: argparse.Namespace) -> int:
+    try:
+        cfg = load_config(args.config)
+    except (OSError, json.JSONDecodeError, ConfigError) as e:
+        print(f"Failed to load config: {e}")
+        return 2
+
+    base_dir = config_dir(args.config)
+    cache_dir = pick_cache_dir(args.config, config=cfg)
+    os.makedirs(cache_dir, exist_ok=True)
+    logger = _setup_logging(cache_dir=cache_dir, level=(args.log_level or "DEBUG"))
+    logger.info("Web search test (config=%s, cache_dir=%s)", os.path.abspath(args.config), cache_dir)
+
+    query = (args.query or "").strip() or "Physics Lab AR"
+    proxy = (args.proxy if args.proxy is not None else getattr(cfg.agent, "web_search_proxy", "")) or ""
+    user_agent = (args.user_agent if args.user_agent is not None else getattr(cfg.agent, "web_search_user_agent", "")) or ""
+    searxng_base = (
+        args.searxng_base_url
+        if args.searxng_base_url is not None
+        else getattr(cfg.agent, "web_search_searxng_base_url", "")
+    ) or ""
+
+    providers: list[str]
+    if args.all:
+        providers = ["bing", "duckduckgo", "baidu", "google", "searxng"]
+    else:
+        providers = [((args.provider or "") or getattr(cfg.agent, "web_search_provider", "google") or "google")]
+
+    for p in providers:
+        provider = str(p or "").strip().lower()
+        if not provider:
+            continue
+        logger.info("Testing provider=%s proxy=%r searxng_base_url=%r", provider, proxy, searxng_base)
+        try:
+            res = web_search(
+                query=query,
+                cache_dir=cache_dir,
+                provider=provider,
+                proxy=str(proxy),
+                timeout_sec=int(args.timeout_sec or getattr(cfg.agent, "web_search_timeout_sec", 20) or 20),
+                ttl_sec=0,  # always fetch fresh for diagnostics
+                max_results=int(args.max_results or getattr(cfg.agent, "web_search_max_results", 5) or 5),
+                fallback_to_ddg=bool(getattr(cfg.agent, "web_search_fallback_to_ddg", True)),
+                user_agent=str(user_agent),
+                searxng_base_url=str(searxng_base),
+            )
+        except Exception as e:
+            logger.error("Provider %s failed: %s", provider, e)
+            continue
+
+        print("\n" + ("=" * 72))
+        print(f"Provider: {provider}")
+        print(f"Query: {query}")
+        print(res)
+        print(("=" * 72) + "\n")
+
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="phy_lab-agent")
     sub = parser.add_subparsers(dest="cmd", required=True)
@@ -2836,6 +2939,31 @@ def main(argv: list[str] | None = None) -> int:
         help="Console log level (DEBUG, INFO, WARNING, ERROR). Defaults to DEBUG for diagnose.",
     )
     p_diag.set_defaults(func=_cmd_diagnose)
+
+    p_web = sub.add_parser("webtest", help="Test web search providers (no login required)")
+    p_web.add_argument("--config", required=True, help="Path to config JSON")
+    p_web.add_argument("--query", default=None, help="Query to search (default: Physics Lab AR)")
+    p_web.add_argument(
+        "--provider",
+        default=None,
+        help="Override provider (google|bing|duckduckgo|baidu|searxng). Defaults to config.",
+    )
+    p_web.add_argument(
+        "--all",
+        action="store_true",
+        help="Test multiple providers in sequence (bing, duckduckgo, baidu, google, searxng).",
+    )
+    p_web.add_argument("--proxy", default=None, help="Override HTTP(S) proxy URL")
+    p_web.add_argument("--user-agent", dest="user_agent", default=None, help="Override User-Agent")
+    p_web.add_argument(
+        "--searxng-base-url",
+        default=None,
+        help="Override SearXNG base URL (e.g. http://127.0.0.1:8080)",
+    )
+    p_web.add_argument("--timeout-sec", default=None, type=int, help="HTTP timeout seconds")
+    p_web.add_argument("--max-results", default=None, type=int, help="Max results to parse (<=10)")
+    p_web.add_argument("--log-level", default=None, help="Console log level (default: DEBUG)")
+    p_web.set_defaults(func=_cmd_webtest)
 
     args = parser.parse_args(argv)
     return int(args.func(args))

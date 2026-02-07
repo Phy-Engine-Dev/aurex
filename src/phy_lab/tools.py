@@ -1,12 +1,15 @@
 from __future__ import annotations
 
+import json
 import hashlib
 import html
+import gzip
 import os
 import re
 import shutil
 import tempfile
 import time
+import urllib.request
 import urllib.parse
 import uuid
 from dataclasses import dataclass
@@ -33,15 +36,64 @@ from plar import (
 from text import extract_fenced_code, truncate
 
 
-def _require_requests():
-    try:
-        import requests  # type: ignore
-    except ImportError as e:  # pragma: no cover
-        raise RuntimeError(
-            "Missing dependency: requests (required for web search features). "
-            "Install it with pip (e.g. 'pip install requests')."
-        ) from e
-    return requests
+def _default_user_agent() -> str:
+    # Keep this stable and boring to reduce blocks, but still realistic.
+    return (
+        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/120.0 Safari/537.36"
+    )
+
+
+def _http_get_text(
+    *,
+    url: str,
+    proxy: str = "",
+    timeout_sec: float = 20.0,
+    user_agent: str = "",
+) -> str:
+    """Fetch a URL and return text content.
+
+    Uses stdlib urllib to avoid external dependencies. Supports HTTP(S) proxy URLs
+    (e.g. 'http://127.0.0.1:7897').
+    """
+    url = (url or "").strip()
+    if not url:
+        raise RuntimeError("Empty URL")
+
+    ua = (user_agent or "").strip() or _default_user_agent()
+    headers = {
+        "User-Agent": ua,
+        # Avoid gzip to keep decoding simple. If a server still gzips, we handle it.
+        "Accept-Encoding": "identity",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    }
+    req = urllib.request.Request(url, headers=headers, method="GET")
+
+    handlers: list[Any] = []
+    p = (proxy or "").strip()
+    if p:
+        if "://" not in p:
+            p = "http://" + p
+        if p.lower().startswith("socks"):
+            raise RuntimeError(
+                "SOCKS proxy is not supported by urllib. Use an HTTP proxy URL, or install and use requests[socks]."
+            )
+        handlers.append(urllib.request.ProxyHandler({"http": p, "https": p}))
+
+    opener = urllib.request.build_opener(*handlers)
+    with opener.open(req, timeout=float(timeout_sec)) as resp:
+        raw = resp.read()
+        enc = (resp.headers.get("Content-Encoding") or "").casefold()
+        if "gzip" in enc:
+            try:
+                raw = gzip.decompress(raw)
+            except Exception:
+                pass
+        charset = resp.headers.get_content_charset() or "utf-8"
+        try:
+            return raw.decode(charset, errors="replace")
+        except LookupError:
+            return raw.decode("utf-8", errors="replace")
 
 
 def render_help(*, command_prefix: str) -> str:
@@ -735,6 +787,7 @@ def web_search_google(
     timeout_sec: int = 20,
     ttl_sec: int = 3600,
     max_results: int = 5,
+    user_agent: str = "",
 ) -> str:
     query = (query or "").strip()
     if not query:
@@ -757,27 +810,12 @@ def web_search_google(
     cache_path = os.path.join(cache_root, f"{digest}.html")
     cached = _cache_get(cache_path, ttl_sec=int(ttl_sec))
     if cached is None or _looks_like_google_block(cached):
-        proxies = None
-        p = (proxy or "").strip()
-        if p:
-            if "://" not in p:
-                p = "http://" + p
-            if p.lower().startswith("socks"):
-                raise RuntimeError(
-                    "SOCKS proxy requires requests[socks]. Use an HTTP proxy URL or install requests[socks]."
-                )
-            proxies = {"http": p, "https": p}
-
-        headers = {
-            "User-Agent": (
-                "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-                "(KHTML, like Gecko) Chrome/120.0 Safari/537.36"
-            )
-        }
-        requests = _require_requests()
-        r = requests.get(url, headers=headers, timeout=float(timeout_sec), proxies=proxies)
-        r.raise_for_status()
-        cached = r.text
+        cached = _http_get_text(
+            url=url,
+            proxy=proxy,
+            timeout_sec=float(timeout_sec),
+            user_agent=user_agent,
+        )
         if not _looks_like_google_block(cached):
             _cache_put(cache_path, cached)
 
@@ -839,6 +877,7 @@ def web_search_duckduckgo(
     timeout_sec: int = 20,
     ttl_sec: int = 3600,
     max_results: int = 5,
+    user_agent: str = "",
 ) -> str:
     query = (query or "").strip()
     if not query:
@@ -848,33 +887,20 @@ def web_search_duckduckgo(
     if max_results > 10:
         max_results = 10
 
-    url = "https://duckduckgo.com/html/?" + urllib.parse.urlencode({"q": query})
+    # Prefer the lightweight HTML endpoint (often less blocked than the main site).
+    url = "https://html.duckduckgo.com/html/?" + urllib.parse.urlencode({"q": query})
 
     cache_root = os.path.join(cache_dir, "web_cache", "duckduckgo")
     digest = hashlib.sha256(url.encode("utf-8")).hexdigest()
     cache_path = os.path.join(cache_root, f"{digest}.html")
     cached = _cache_get(cache_path, ttl_sec=int(ttl_sec))
     if cached is None:
-        proxies = None
-        p = (proxy or "").strip()
-        if p:
-            if "://" not in p:
-                p = "http://" + p
-            if p.lower().startswith("socks"):
-                raise RuntimeError(
-                    "SOCKS proxy requires requests[socks]. Use an HTTP proxy URL or install requests[socks]."
-                )
-            proxies = {"http": p, "https": p}
-        headers = {
-            "User-Agent": (
-                "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-                "(KHTML, like Gecko) Chrome/120.0 Safari/537.36"
-            )
-        }
-        requests = _require_requests()
-        r = requests.get(url, headers=headers, timeout=float(timeout_sec), proxies=proxies)
-        r.raise_for_status()
-        cached = r.text
+        cached = _http_get_text(
+            url=url,
+            proxy=proxy,
+            timeout_sec=float(timeout_sec),
+            user_agent=user_agent,
+        )
         _cache_put(cache_path, cached)
 
     a_re = re.compile(
@@ -903,6 +929,180 @@ def web_search_duckduckgo(
     return "\n".join(lines)
 
 
+_BING_H2_RE = re.compile(
+    r'<li[^>]*class="[^"]*b_algo[^"]*"[^>]*>.*?<h2[^>]*>\\s*<a[^>]+href="(?P<url>[^"]+)"[^>]*>(?P<title>.*?)</a>',
+    re.IGNORECASE | re.DOTALL,
+)
+
+
+def _looks_like_bing_block(html_text: str) -> bool:
+    t = (html_text or "").casefold()
+    return any(
+        x in t
+        for x in (
+            "unusual traffic",
+            "verify you are a human",
+            "captcha",
+            "our systems have detected unusual traffic",
+        )
+    )
+
+
+def web_search_bing(
+    *,
+    query: str,
+    cache_dir: str,
+    proxy: str = "",
+    timeout_sec: int = 20,
+    ttl_sec: int = 3600,
+    max_results: int = 5,
+    user_agent: str = "",
+) -> str:
+    query = (query or "").strip()
+    if not query:
+        return "Provide a query string."
+    if max_results <= 0:
+        max_results = 5
+    if max_results > 10:
+        max_results = 10
+
+    url = "https://www.bing.com/search?" + urllib.parse.urlencode(
+        {
+            "q": query,
+            "count": str(max_results),
+            "setlang": "en-us",
+        }
+    )
+
+    cache_root = os.path.join(cache_dir, "web_cache", "bing")
+    digest = hashlib.sha256(url.encode("utf-8")).hexdigest()
+    cache_path = os.path.join(cache_root, f"{digest}.html")
+    cached = _cache_get(cache_path, ttl_sec=int(ttl_sec))
+    if cached is None or _looks_like_bing_block(cached):
+        cached = _http_get_text(
+            url=url,
+            proxy=proxy,
+            timeout_sec=float(timeout_sec),
+            user_agent=user_agent,
+        )
+        if not _looks_like_bing_block(cached):
+            _cache_put(cache_path, cached)
+
+    results: list[tuple[str, str]] = []
+    for m in _BING_H2_RE.finditer(cached):
+        u = html.unescape((m.group("url") or "").strip())
+        t = _strip_tags(m.group("title") or "")
+        if not u.startswith("http"):
+            continue
+        if not t:
+            continue
+        results.append((t, u))
+        if len(results) >= max_results:
+            break
+
+    if not results:
+        if _looks_like_bing_block(cached):
+            return (
+                "Bing blocked this automated request (captcha/verification).\n"
+                "Try: enable proxy, change IP, reduce frequency, or use the DuckDuckGo fallback."
+            )
+        return (
+            "No results parsed. Bing may have returned a blocked/captcha page or changed markup.\n"
+            f"Query: {query}"
+        )
+
+    lines = ["Bing results:"]
+    for i, (t, u) in enumerate(results, start=1):
+        lines.append(f"{i}. {truncate(t, max_chars=120)}")
+        lines.append(f"   {u}")
+    return "\n".join(lines)
+
+
+def web_search_searxng(
+    *,
+    query: str,
+    cache_dir: str,
+    base_url: str = "",
+    proxy: str = "",
+    timeout_sec: int = 20,
+    ttl_sec: int = 3600,
+    max_results: int = 5,
+    user_agent: str = "",
+) -> str:
+    """Search via a SearXNG instance (recommended for robustness).
+
+    Requires a running SearXNG server reachable from this machine.
+    """
+    query = (query or "").strip()
+    if not query:
+        return "Provide a query string."
+    if max_results <= 0:
+        max_results = 5
+    if max_results > 10:
+        max_results = 10
+
+    b = (base_url or "").strip().rstrip("/")
+    if not b:
+        b = "http://127.0.0.1:8080"
+
+    url = b + "/search?" + urllib.parse.urlencode(
+        {
+            "q": query,
+            "format": "json",
+            "language": "auto",
+        }
+    )
+
+    cache_root = os.path.join(cache_dir, "web_cache", "searxng")
+    digest = hashlib.sha256(url.encode("utf-8")).hexdigest()
+    cache_path = os.path.join(cache_root, f"{digest}.json")
+    cached = _cache_get(cache_path, ttl_sec=int(ttl_sec))
+    if cached is None:
+        cached = _http_get_text(
+            url=url,
+            proxy=proxy,
+            timeout_sec=float(timeout_sec),
+            user_agent=user_agent,
+        )
+        _cache_put(cache_path, cached)
+
+    try:
+        data = json.loads(cached)
+    except Exception as e:
+        return f"SearXNG returned invalid JSON: {e}"
+
+    items = data.get("results")
+    if not isinstance(items, list):
+        return "SearXNG returned an unexpected response (missing 'results')."
+
+    results: list[tuple[str, str]] = []
+    for it in items:
+        if not isinstance(it, dict):
+            continue
+        title = it.get("title")
+        href = it.get("url")
+        if not isinstance(title, str) or not title.strip():
+            continue
+        if not isinstance(href, str) or not href.strip():
+            continue
+        results.append((title.strip(), href.strip()))
+        if len(results) >= max_results:
+            break
+
+    if not results:
+        return (
+            "No results parsed from SearXNG.\n"
+            f"BaseURL: {b}\n"
+            f"Query: {query}"
+        )
+
+    lines = ["SearXNG results:"]
+    for i, (t, u) in enumerate(results, start=1):
+        lines.append(f"{i}. {truncate(t, max_chars=120)}")
+        lines.append(f"   {u}")
+    return "\n".join(lines)
+
+
 def web_search(
     *,
     query: str,
@@ -913,6 +1113,8 @@ def web_search(
     ttl_sec: int = 3600,
     max_results: int = 5,
     fallback_to_ddg: bool = True,
+    user_agent: str = "",
+    searxng_base_url: str = "",
 ) -> str:
     provider = (provider or "google").strip().lower()
     if provider == "ddg":
@@ -926,6 +1128,7 @@ def web_search(
             timeout_sec=timeout_sec,
             ttl_sec=ttl_sec,
             max_results=max_results,
+            user_agent=user_agent,
         )
         if fallback_to_ddg and (
             "Baidu blocked" in res or "No results parsed." in res or "captcha" in res.casefold()
@@ -938,6 +1141,44 @@ def web_search(
                     timeout_sec=timeout_sec,
                     ttl_sec=ttl_sec,
                     max_results=max_results,
+                    user_agent=user_agent,
+                )
+            except Exception:
+                return res
+        return res
+
+    if provider in ("searx", "searxng"):
+        return web_search_searxng(
+            query=query,
+            cache_dir=cache_dir,
+            base_url=searxng_base_url,
+            proxy=proxy,
+            timeout_sec=timeout_sec,
+            ttl_sec=ttl_sec,
+            max_results=max_results,
+            user_agent=user_agent,
+        )
+
+    if provider in ("bing", "bing_html"):
+        res = web_search_bing(
+            query=query,
+            cache_dir=cache_dir,
+            proxy=proxy,
+            timeout_sec=timeout_sec,
+            ttl_sec=ttl_sec,
+            max_results=max_results,
+            user_agent=user_agent,
+        )
+        if fallback_to_ddg and ("No results parsed." in res or "blocked" in res.casefold()):
+            try:
+                return web_search_duckduckgo(
+                    query=query,
+                    cache_dir=cache_dir,
+                    proxy=proxy,
+                    timeout_sec=timeout_sec,
+                    ttl_sec=ttl_sec,
+                    max_results=max_results,
+                    user_agent=user_agent,
                 )
             except Exception:
                 return res
@@ -951,6 +1192,7 @@ def web_search(
             timeout_sec=timeout_sec,
             ttl_sec=ttl_sec,
             max_results=max_results,
+            user_agent=user_agent,
         )
 
     res = web_search_google(
@@ -960,6 +1202,7 @@ def web_search(
         timeout_sec=timeout_sec,
         ttl_sec=ttl_sec,
         max_results=max_results,
+        user_agent=user_agent,
     )
     if fallback_to_ddg and (
         "Google blocked this automated request" in res or "No results parsed." in res
@@ -972,6 +1215,7 @@ def web_search(
                 timeout_sec=timeout_sec,
                 ttl_sec=ttl_sec,
                 max_results=max_results,
+                user_agent=user_agent,
             )
         except Exception:
             return res
@@ -1007,6 +1251,7 @@ def web_search_baidu(
     timeout_sec: int = 20,
     ttl_sec: int = 3600,
     max_results: int = 5,
+    user_agent: str = "",
 ) -> str:
     query = (query or "").strip()
     if not query:
@@ -1028,27 +1273,12 @@ def web_search_baidu(
     cache_path = os.path.join(cache_root, f"{digest}.html")
     cached = _cache_get(cache_path, ttl_sec=int(ttl_sec))
     if cached is None or _looks_like_baidu_block(cached):
-        proxies = None
-        p = (proxy or "").strip()
-        if p:
-            if "://" not in p:
-                p = "http://" + p
-            if p.lower().startswith("socks"):
-                raise RuntimeError(
-                    "SOCKS proxy requires requests[socks]. Use an HTTP proxy URL or install requests[socks]."
-                )
-            proxies = {"http": p, "https": p}
-
-        headers = {
-            "User-Agent": (
-                "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-                "(KHTML, like Gecko) Chrome/120.0 Safari/537.36"
-            )
-        }
-        requests = _require_requests()
-        r = requests.get(url, headers=headers, timeout=float(timeout_sec), proxies=proxies)
-        r.raise_for_status()
-        cached = r.text
+        cached = _http_get_text(
+            url=url,
+            proxy=proxy,
+            timeout_sec=float(timeout_sec),
+            user_agent=user_agent,
+        )
         if not _looks_like_baidu_block(cached):
             _cache_put(cache_path, cached)
 

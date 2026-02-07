@@ -68,9 +68,12 @@ python src/phy_lab/agent.py run --config .phy_lab/config.json
 
 补充：即使开启了 `require_mention=true`，当对方是“回复你/回复 aurex”（评论的 `ReplyID` 指向 aurex 的用户 ID）时，Agent 也会触发回复（用于覆盖某些客户端 @ 提及不显示在纯文本里的情况）。
 
-如果你希望启用外网搜索（Google），可以设置：
+如果你希望启用外网搜索（联网检索 + 结合结果回答），可以设置：
 
 - `agent.web_search_enabled=true`
+- `agent.web_search_provider=bing|baidu|duckduckgo|google|searxng`（建议：`bing`；更稳定的方案是自建 `searxng`）
+- `agent.web_search_searxng_base_url=http://127.0.0.1:8080`（当 provider=searxng 时使用）
+- `agent.web_search_user_agent=`（选配，自定义 UA）
 - `agent.web_search_proxy=http://127.0.0.1:7897`（选配）
 - `agent.auto_web_search=true`（让模型自动判断何时需要联网搜索）
 
@@ -181,6 +184,19 @@ python src/phy_lab/agent.py run --config .phy_lab/config.json --log-level DEBUG
 ```
 
 如果你需要把“评论原文”也写入 debug 日志，请在配置中设置 `agent.log_include_comment_content=true`（注意隐私风险）。
+
+## 联网搜索排查
+
+如果你发现联网搜索（Google/Baidu/DuckDuckGo 等）返回空结果或被验证码拦截，建议：
+
+- 尝试 `agent.web_search_provider=bing`
+- 或者自建 SearXNG：`agent.web_search_provider=searxng` 并设置 `agent.web_search_searxng_base_url=http://127.0.0.1:8080`
+
+你也可以直接跑一个无需登录的联网测试命令，快速判断是“网络不可达/代理问题/验证码拦截/解析失败”：
+
+```bash
+python src/phy_lab/agent.py webtest --config .phy_lab/config.json --all --query "你的问题"
+```
 
 ## 仍然不回复时如何排查
 
