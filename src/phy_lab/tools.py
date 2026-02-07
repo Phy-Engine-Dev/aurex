@@ -20,6 +20,7 @@ from plsav import PlSavError, load_plsav_counts
 from pe_sim import PhyEngineLib, SeriesVdcResistorsSpec
 from plsav_sim import PlSavSimError, build_pe_circuit_input_from_status_save
 from phy_engine import (
+    PhyEngineError,
     Verilog2PlSavOptions,
     ensure_phyengine_lib,
     ensure_verilog2plsav,
@@ -1344,6 +1345,35 @@ def _write_artifacts(
     return artifact_dir, v_path, out_sav
 
 
+def _write_compile_failure_artifacts(
+    *,
+    cache_dir: str,
+    spec: str,
+    verilog_text: str,
+    error_text: str,
+) -> tuple[str, str]:
+    artifacts_root = os.path.join(cache_dir, "artifacts")
+    os.makedirs(artifacts_root, exist_ok=True)
+    artifact_id = uuid.uuid4().hex
+    artifact_dir = os.path.join(artifacts_root, artifact_id)
+    os.makedirs(artifact_dir, exist_ok=True)
+
+    v_path = os.path.join(artifact_dir, "design.v")
+    err_path = os.path.join(artifact_dir, "compile_error.txt")
+    spec_path = os.path.join(artifact_dir, "spec.txt")
+    with open(v_path, "w", encoding="utf-8") as f:
+        f.write(verilog_text)
+        f.write("\n")
+    with open(err_path, "w", encoding="utf-8") as f:
+        f.write(error_text or "")
+        f.write("\n")
+    with open(spec_path, "w", encoding="utf-8") as f:
+        f.write(spec or "")
+        f.write("\n")
+
+    return artifact_id, artifact_dir
+
+
 def build_and_maybe_publish_circuit(
     *,
     ollama: OllamaClient,
@@ -1414,9 +1444,19 @@ def build_and_maybe_publish_circuit(
                 last_error = None
                 break
             except Exception as e:
-                last_error = str(e)
+                last_error = str(e) or e.__class__.__name__
                 if attempt >= max_attempts:
-                    raise
+                    artifact_id, _artifact_dir = _write_compile_failure_artifacts(
+                        cache_dir=cache_dir,
+                        spec=spec,
+                        verilog_text=verilog,
+                        error_text=last_error,
+                    )
+                    raise PhyEngineError(
+                        "Circuit compilation failed after multiple attempts. "
+                        f"(artifact_id={artifact_id})\n"
+                        f"Compiler output:\n{truncate(last_error, max_chars=2000)}"
+                    ) from e
                 verilog = llm_fix_verilog(
                     ollama=ollama,
                     spec=spec,

@@ -181,6 +181,7 @@ This context is injected into the LLM prompt for `@mention`/command-triggered re
 - Web search returns no results / captcha: try `agent.web_search_provider=bing`, or run a local SearXNG and set `agent.web_search_provider=searxng` + `agent.web_search_searxng_base_url=http://127.0.0.1:8080`
 - Web search diagnostics (no login required): `python src/phy_lab/agent.py webtest --config .phy_lab/config.json --all --query "your query"`
 - Circuit build failures: set `phy_engine.auto_build=true` (or point to a working `verilog2plsav`) and check CMake output in the cache directory
+- Circuit compile keeps failure artifacts under `storage.cache_dir/artifacts/<artifact_id>/` (includes `design.v` and `compile_error.txt`)
 - Agent does not reply: run `python src/phy_lab/agent.py diagnose --config .phy_lab/config.json --take 10` to verify the agent can fetch the target comments and detect `@mentions`
 - Agent still does not reply after a mention: run `python src/phy_lab/agent.py diagnose --config .phy_lab/config.json` and check the `Messages:*` sections to confirm notifications are being fetched and targets are being discovered
 - After updating the agent, you may want to reset local state to re-process recent notifications: `python src/phy_lab/agent.py reset-state --config .phy_lab/config.json --scope notifications`

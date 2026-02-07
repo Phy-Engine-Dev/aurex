@@ -211,9 +211,13 @@ def verilog_to_plsav(
         raise PhyEngineError(f"verilog2plsav timed out: {e}") from e
     except subprocess.CalledProcessError as e:
         stderr = (e.stderr or "").strip()
-        if len(stderr) > 4000:
-            stderr = stderr[-4000:]
-        raise PhyEngineError(f"verilog2plsav failed (exit={e.returncode}): {stderr}") from e
+        stdout = (e.stdout or "").strip()
+        out = "\n".join([x for x in (stderr, stdout) if x])
+        if not out:
+            out = "<no output from verilog2plsav>"
+        if len(out) > 4000:
+            out = out[-4000:]
+        raise PhyEngineError(f"verilog2plsav failed (exit={e.returncode}): {out}") from e
 
     if not os.path.exists(out_sav_path):
         raise PhyEngineError(f"verilog2plsav did not produce output: {out_sav_path}")

@@ -849,8 +849,13 @@ def _handle_comment(
                             publish_tags=list(getattr(cfg.agent, "publish_tags", []) or []),
                         )
                     except Exception as e:
+                        logger.warning(
+                            "Circuit compilation failed (auto_routed=true): %s",
+                            _public_error_text(e, max_chars=2000),
+                        )
                         return safe_reply(
-                            f"Sorry, I couldn't compile the circuit after multiple attempts. Error: {e}",
+                            "Sorry, I couldn't compile the circuit after multiple attempts.\n"
+                            f"Error: {_public_error_text(e)}",
                             max_chars=cfg.agent.max_reply_chars,
                         )
 
@@ -970,8 +975,13 @@ def _handle_comment(
                             publish_tags=list(getattr(cfg.agent, "publish_tags", []) or []),
                         )
                     except Exception as e:
+                        logger.warning(
+                            "Circuit compilation failed (auto_routed=false): %s",
+                            _public_error_text(e, max_chars=2000),
+                        )
                         return safe_reply(
-                            f"Sorry, I couldn't compile the circuit after multiple attempts. Error: {e}",
+                            "Sorry, I couldn't compile the circuit after multiple attempts.\n"
+                            f"Error: {_public_error_text(e)}",
                             max_chars=cfg.agent.max_reply_chars,
                         )
 
@@ -2814,6 +2824,17 @@ def _safe_json(value: Any) -> str:
         return json.dumps(value, ensure_ascii=False, sort_keys=False, default=str)
     except Exception:
         return str(value)
+
+
+_ABS_PATH_RE = re.compile(r"(?:(?:[A-Za-z]:\\\\)|/)[^\\s'\"<>]+")
+
+
+def _public_error_text(err: Exception, *, max_chars: int = 600) -> str:
+    msg = str(err).strip()
+    if not msg:
+        msg = err.__class__.__name__
+    msg = _ABS_PATH_RE.sub("<path>", msg)
+    return truncate(msg, max_chars=max_chars)
 
 
 def _cmd_webtest(args: argparse.Namespace) -> int:

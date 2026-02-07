@@ -216,6 +216,13 @@ python src/phy_lab/agent.py diagnose --config .phy_lab/config.json --take 10
 python src/phy_lab/agent.py reset-state --config .phy_lab/config.json --scope notifications
 ```
 
+## 电路编译失败如何排查
+
+当你让 aurex 生成电路并编译 `.sav` 时，如果 `verilog2plsav` 编译失败，Agent 会把“失败工件”保存到缓存目录中，方便你离线复现与排查：
+
+- `storage.cache_dir/artifacts/<artifact_id>/design.v`
+- `storage.cache_dir/artifacts/<artifact_id>/compile_error.txt`
+
 ## 许可证
 
 见 `src/phy_lab/LICENSE`（私有/专有许可证）。
