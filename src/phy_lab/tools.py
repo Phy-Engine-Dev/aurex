@@ -220,6 +220,18 @@ def llm_build_pe_sim_spec_json(
     ).strip()
 
 
+def _extract_json_object_text(text: str) -> str:
+    """Best-effort extract a JSON object substring from LLM output."""
+    s = (text or "").strip()
+    if not s:
+        return s
+    start = s.find("{")
+    end = s.rfind("}")
+    if start < 0 or end < 0 or end <= start:
+        return s
+    return s[start : end + 1].strip()
+
+
 def llm_fix_pe_sim_spec_json(
     *,
     ollama: OllamaClient,
@@ -401,12 +413,14 @@ def simulate_ai_circuit_with_phyengine(
         build_timeout_sec=int(getattr(phy_engine_cfg, "build_timeout_sec", 900)),
     )
 
-    raw_json = llm_build_pe_sim_spec_json(
-        ollama=ollama,
-        user_text=text,
-        context_json=context_json,
-        max_components=max_components,
-        max_probes=max_probes,
+    raw_json = _extract_json_object_text(
+        llm_build_pe_sim_spec_json(
+            ollama=ollama,
+            user_text=text,
+            context_json=context_json,
+            max_components=max_components,
+            max_probes=max_probes,
+        )
     )
     last_err: PEBuilderError | None = None
     for attempt in range(1, max_attempts + 1):
@@ -420,14 +434,16 @@ def simulate_ai_circuit_with_phyengine(
             last_err = e
             if attempt >= max_attempts:
                 break
-            raw_json = llm_fix_pe_sim_spec_json(
-                ollama=ollama,
-                user_text=text,
-                context_json=context_json,
-                max_components=max_components,
-                max_probes=max_probes,
-                prior_json=raw_json,
-                error_text=str(e),
+            raw_json = _extract_json_object_text(
+                llm_fix_pe_sim_spec_json(
+                    ollama=ollama,
+                    user_text=text,
+                    context_json=context_json,
+                    max_components=max_components,
+                    max_probes=max_probes,
+                    prior_json=raw_json,
+                    error_text=str(e),
+                )
             )
 
     if last_err is not None:
@@ -1444,6 +1460,8 @@ def web_search_duckduckgo(
     max_results: int = 5,
     user_agent: str = "",
 ) -> str:
+    lib_error_note: str | None = None
+
     def _try_ddgsearch() -> str | None:
         """DuckDuckGo via the `duckduckgo-search` library (preferred).
 
@@ -1451,6 +1469,7 @@ def web_search_duckduckgo(
             - str: formatted results
             - None: if dependency is missing (so caller can fall back)
         """
+        nonlocal lib_error_note
         try:
             from duckduckgo_search import DDGS  # type: ignore
         except Exception:
@@ -1508,19 +1527,30 @@ def web_search_duckduckgo(
             if "timeout" in params:
                 kwargs["timeout"] = float(timeout_sec)
 
+        try:
             ddgs = DDGS(**kwargs) if kwargs else DDGS()
-            try:
-                results = ddgs.text(q, max_results=n)  # type: ignore[call-arg]
-            except TypeError:
-                results = ddgs.text(q, n)  # type: ignore[misc]
+        except RecursionError as e:
+            # Some environments / library versions can trigger recursive proxy/session wiring.
+            lib_error_note = f"duckduckgo-search init failed: {e}"
+            return None
+        try:
+            results = ddgs.text(q, max_results=n)  # type: ignore[call-arg]
+        except TypeError:
+            results = ddgs.text(q, n)  # type: ignore[misc]
+        except RecursionError as e:
+            lib_error_note = f"duckduckgo-search failed: {e}"
+            return None
 
-            try:
-                raw_items = list(results)
-            except TypeError:
-                raw_items = results if isinstance(results, list) else []
+        try:
+            raw_items = list(results)
+        except TypeError:
+            raw_items = results if isinstance(results, list) else []
+        except RecursionError as e:
+            lib_error_note = f"duckduckgo-search failed: {e}"
+            return None
 
-            items = [x for x in raw_items if isinstance(x, dict)]
-            _cache_put(cache_path, json.dumps(items, ensure_ascii=False))
+        items = [x for x in raw_items if isinstance(x, dict)]
+        _cache_put(cache_path, json.dumps(items, ensure_ascii=False))
 
         pairs: list[tuple[str, str]] = []
         seen: set[str] = set()
@@ -1590,9 +1620,14 @@ def web_search_duckduckgo(
             break
 
     if not results:
-        return f"No results parsed from DuckDuckGo.\nQuery: {query}"
+        extra = ""
+        if lib_error_note:
+            extra = f"\nNote: {lib_error_note}"
+        return f"No results parsed from DuckDuckGo.\nQuery: {query}{extra}"
 
     lines = ["DuckDuckGo results:"]
+    if lib_error_note:
+        lines.append(f"(Note: {lib_error_note}; fell back to HTML endpoint)")
     for i, (t, u) in enumerate(results, start=1):
         lines.append(f"{i}. {truncate(t, max_chars=120)}")
         lines.append(f"   {u}")

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import threading
+import urllib.parse
 from queue import Queue
 from dataclasses import dataclass
 from typing import Any
@@ -9,6 +10,15 @@ from typing import Any
 
 class OllamaError(RuntimeError):
     pass
+
+
+def _is_local_base_url(url: str) -> bool:
+    try:
+        p = urllib.parse.urlparse((url or "").strip())
+    except Exception:
+        return False
+    host = (p.hostname or "").strip().casefold()
+    return host in ("127.0.0.1", "localhost", "::1", "0.0.0.0")
 
 
 @dataclass(frozen=True)
@@ -36,7 +46,11 @@ class OllamaClient:
         }
 
         try:
-            resp = requests.post(url, json=payload, timeout=self.timeout_sec)
+            # Avoid accidentally proxying localhost (common when users set HTTP_PROXY for web search).
+            session = requests.Session()
+            if _is_local_base_url(self.base_url):
+                session.trust_env = False
+            resp = session.post(url, json=payload, timeout=self.timeout_sec)
         except requests.RequestException as e:
             raise OllamaError(f"Failed to reach Ollama at {url}: {e}") from e
 
@@ -57,7 +71,10 @@ class OllamaClient:
         content = message.get("content")
         if not isinstance(content, str):
             raise OllamaError("Ollama response missing 'message.content' string")
-        return content.strip()
+        content = content.strip()
+        if not content:
+            raise OllamaError("Ollama returned empty 'message.content'")
+        return content
 
 
 class OllamaPool:

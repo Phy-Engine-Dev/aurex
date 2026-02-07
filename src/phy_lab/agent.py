@@ -3431,6 +3431,97 @@ def _cmd_webtest(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_simtest(args: argparse.Namespace) -> int:
+    try:
+        cfg = load_config(args.config)
+    except (OSError, json.JSONDecodeError, ConfigError) as e:
+        print(f"Failed to load config: {e}")
+        return 2
+
+    cache_dir = pick_cache_dir(args.config, config=cfg)
+    os.makedirs(cache_dir, exist_ok=True)
+    logger = _setup_logging(cache_dir=cache_dir, level=(args.log_level or "DEBUG"))
+    logger.info("Simulation smoke test (config=%s, cache_dir=%s)", os.path.abspath(args.config), cache_dir)
+
+    text = str(args.text or "").strip() or "simulate V=5V R1=100ohm R2=200ohm"
+
+    # Print proxy-related env vars (common root cause for localhost Ollama failures).
+    for k in ("HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY", "http_proxy", "https_proxy", "no_proxy"):
+        v = os.environ.get(k)
+        if isinstance(v, str) and v.strip():
+            print(f"{k}={v}")
+
+    endpoints = list(getattr(cfg.ollama, "base_urls", None) or []) or [cfg.ollama.base_url]
+    base_url = str(endpoints[0] or cfg.ollama.base_url).strip()
+    client = OllamaClient(
+        base_url=base_url,
+        model=cfg.ollama.model,
+        timeout_sec=int(getattr(cfg.ollama, "request_timeout_sec", 240) or 240),
+        temperature=float(getattr(cfg.ollama, "temperature", 0.2) or 0.2),
+        num_predict=int(getattr(cfg.ollama, "num_predict", 2048) or 2048),
+    )
+    print(f"ollama.base_url={base_url}")
+    print(f"ollama.model={cfg.ollama.model}")
+    print(f"phy_engine.phyengine_lib_path={getattr(cfg.phy_engine, 'phyengine_lib_path', '')}")
+
+    try:
+        ping = client.chat(messages=[{"role": "user", "content": "Reply with exactly: OK"}])
+        print(f"ollama.ping={ping!r}")
+    except Exception as e:
+        print(f"ollama.ping_failed={e}")
+        return 3
+
+    # LLM build PE-SCRIPT -> parse only (no simulation).
+    try:
+        from tools import llm_build_pe_sim_script  # local import to keep startup minimal
+        from pe_cmd import parse_pe_script_to_spec_obj
+        from pe_builder import parse_pe_sim_spec, build_circuit
+
+        script = llm_build_pe_sim_script(
+            ollama=client,
+            user_text=text,
+            context_json=None,
+            max_components=int(args.max_components or 30),
+            max_probes=int(args.max_probes or 20),
+        )
+        print("\nPE-SCRIPT (truncated):")
+        print(truncate(script, max_chars=800))
+        spec_obj = parse_pe_script_to_spec_obj(
+            script,
+            max_components=int(args.max_components or 30),
+            max_probes=int(args.max_probes or 20),
+        )
+        spec = parse_pe_sim_spec(spec_obj, max_components=int(args.max_components or 30), max_probes=int(args.max_probes or 20))
+        built = build_circuit(spec)
+        print(f"pe_script.parse_ok=True components={len(spec.components)} nodes={len(built.node_to_pin)}")
+    except Exception as e:
+        print(f"pe_script.parse_ok=False error={e}")
+
+    # LLM build strict JSON spec -> parse only (no simulation).
+    try:
+        from tools import llm_build_pe_sim_spec_json, _extract_json_object_text  # type: ignore
+        from pe_builder import parse_spec_json, parse_pe_sim_spec, build_circuit
+
+        raw = llm_build_pe_sim_spec_json(
+            ollama=client,
+            user_text=text,
+            context_json=None,
+            max_components=int(args.max_components or 30),
+            max_probes=int(args.max_probes or 20),
+        )
+        extracted = _extract_json_object_text(raw)
+        print("\nJSON-SPEC (truncated):")
+        print(truncate(extracted, max_chars=800))
+        obj = parse_spec_json(extracted)
+        spec = parse_pe_sim_spec(obj, max_components=int(args.max_components or 30), max_probes=int(args.max_probes or 20))
+        built = build_circuit(spec)
+        print(f"json_spec.parse_ok=True components={len(spec.components)} nodes={len(built.node_to_pin)}")
+    except Exception as e:
+        print(f"json_spec.parse_ok=False error={e}")
+
+    return 0
+
+
 def _cmd_apitest(args: argparse.Namespace) -> int:
     try:
         cfg = load_config(args.config)
@@ -3699,6 +3790,14 @@ def main(argv: list[str] | None = None) -> int:
     p_web.add_argument("--max-results", default=None, type=int, help="Max results to parse (<=10)")
     p_web.add_argument("--log-level", default=None, help="Console log level (default: DEBUG)")
     p_web.set_defaults(func=_cmd_webtest)
+
+    p_sim = sub.add_parser("simtest", help="Smoke test simulation LLM outputs (no login required)")
+    p_sim.add_argument("--config", required=True, help="Path to config JSON")
+    p_sim.add_argument("--text", default=None, help="Simulation request text")
+    p_sim.add_argument("--max-components", default=30, type=int, help="Max components in LLM output")
+    p_sim.add_argument("--max-probes", default=20, type=int, help="Max probes in LLM output")
+    p_sim.add_argument("--log-level", default=None, help="Console log level (default: DEBUG)")
+    p_sim.set_defaults(func=_cmd_simtest)
 
     p_api = sub.add_parser("apitest", help="Smoke test Physics Lab APIs (requires login)")
     p_api.add_argument("--config", required=True, help="Path to config JSON")

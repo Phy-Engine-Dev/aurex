@@ -89,7 +89,39 @@ class TestDuckDuckGoSearchBackend(unittest.TestCase):
                 )
         self.assertIn("https://example.com/x", out)
 
+    def test_duckduckgo_search_recursionerror_falls_back_to_html(self):
+        captured = {"http_called": 0}
+
+        class FakeDDGS:
+            def __init__(self, **kwargs):
+                pass
+
+            def text(self, q, max_results=None):
+                raise RecursionError("boom")
+
+        fake_mod = types.ModuleType("duckduckgo_search")
+        fake_mod.DDGS = FakeDDGS  # type: ignore[attr-defined]
+
+        def _fake_http_get_text(*, url, proxy="", timeout_sec=20.0, user_agent=""):
+            captured["http_called"] += 1
+            return (
+                '<a class="result__a" href="https://example.com/a">Title A</a>'
+                '<a class="result__a" href="https://example.com/b">Title B</a>'
+            )
+
+        with tempfile.TemporaryDirectory() as td:
+            with mock.patch.dict(sys.modules, {"duckduckgo_search": fake_mod}):
+                with mock.patch.object(tools, "_http_get_text", side_effect=_fake_http_get_text):
+                    out = tools.web_search_duckduckgo(
+                        query="x",
+                        cache_dir=td,
+                        ttl_sec=0,
+                        max_results=2,
+                    )
+        self.assertIn("DuckDuckGo results:", out)
+        self.assertIn("fell back to HTML endpoint", out)
+        self.assertEqual(captured["http_called"], 1)
+
 
 if __name__ == "__main__":
     unittest.main()
-
