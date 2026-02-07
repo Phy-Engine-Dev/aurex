@@ -17,7 +17,13 @@ from typing import Any
 
 from ollama import OllamaClient
 from plsav import PlSavError, load_plsav_counts
-from pe_sim import PhyEngineLib, SeriesVdcResistorsSpec
+from pe_sim import AnalyzeType, PhyEngineLib, SeriesVdcResistorsSpec
+from pe_builder import (
+    PEBuilderError,
+    build_circuit,
+    parse_pe_sim_spec,
+    parse_spec_json,
+)
 from plsav_sim import PlSavSimError, build_pe_circuit_input_from_status_save
 from phy_engine import (
     PhyEngineError,
@@ -131,6 +137,267 @@ def llm_summarize(*, ollama: OllamaClient, system_prompt: str, text: str) -> str
         f"{text}"
     )
     return llm_chat(ollama=ollama, system_prompt=system_prompt, user_text=prompt)
+
+
+def llm_build_pe_sim_spec_json(
+    *,
+    ollama: OllamaClient,
+    user_text: str,
+    context_json: dict[str, Any] | None,
+    max_components: int,
+    max_probes: int,
+) -> str:
+    """Ask the LLM to produce a strict JSON spec for PE circuit simulation."""
+    context_blob = ""
+    if context_json is not None:
+        context_blob = (
+            "Context JSON (current page):\n"
+            + json.dumps(context_json, ensure_ascii=False, indent=2)
+            + "\n\n"
+        )
+    prompt = (
+        "Convert the user's request into a strict JSON specification for a Phy-Engine circuit simulation.\n"
+        "You MUST follow this JSON schema exactly:\n"
+        "{\n"
+        '  "analysis": {\n'
+        '    "type": "dc" | "ac" | "tr",\n'
+        '    "ac_omega_rad_s": number | null,\n'
+        '    "tr_t_step_s": number | null,\n'
+        '    "tr_t_stop_s": number | null\n'
+        "  },\n"
+        '  "components": [\n'
+        "    {\n"
+        '      "id": "R1",\n'
+        '      "type": "resistor" | "capacitor" | "inductor" | "vdc" | "idc" | "vac" | "iac",\n'
+        '      "nodes": ["n1", "n2"],\n'
+        '      "params": { "r_ohm"/"c_f"/"l_h"/"v_v"/"i_a"/("vp_v","freq_hz","phase_deg") : number }\n'
+        "    }\n"
+        "  ],\n"
+        '  "probes": [\n'
+        "    {\"kind\":\"node_voltage\"|\"component_current\"|\"component_vdrop\",\"target\":\"...\"}\n"
+        "  ]\n"
+        "}\n"
+        "\n"
+        "Hard constraints:\n"
+        f"- components.length MUST be between 1 and {int(max_components)}.\n"
+        f"- probes.length MUST be between 0 and {int(max_probes)}.\n"
+        "- Every component must be a 2-terminal element (nodes length exactly 2).\n"
+        "- You MUST include a ground node named exactly 'gnd'.\n"
+        "- Use simple node names like: gnd, n1, n2, vin, vout.\n"
+        "- Use SI units (Ohm, Farad, Henry, Volt, Ampere).\n"
+        "\n"
+        "Analysis selection rules:\n"
+        "- Use 'dc' for pure resistive/source circuits.\n"
+        "- Use 'tr' if the user asks about time behavior, or if capacitors/inductors are present.\n"
+        "- Use 'ac' only if the user asks about frequency response; if so, set ac_omega_rad_s.\n"
+        "- For 'tr', set tr_t_step_s and tr_t_stop_s (use reasonable defaults if not provided).\n"
+        "\n"
+        "Probe rules:\n"
+        "- If the user asks 'what is the current' include component_current for a resistor.\n"
+        "- If the user asks for a node voltage, include node_voltage.\n"
+        "- If the user asks for voltage drop across a component, include component_vdrop.\n"
+        "- If user does not specify probes, you may leave probes empty.\n"
+        "\n"
+        "Output rules:\n"
+        "- Output ONLY valid JSON (no markdown, no comments).\n"
+        "- Do NOT include any extra keys.\n"
+        "\n"
+        + context_blob
+        + "User request:\n"
+        + user_text.strip()
+    )
+    return ollama.chat(
+        messages=[
+            {
+                "role": "system",
+                "content": "You are a careful circuit engineer. Output strict JSON only.",
+            },
+            {"role": "user", "content": prompt},
+        ]
+    ).strip()
+
+
+def simulate_ai_circuit_with_phyengine(
+    *,
+    ollama: OllamaClient,
+    text: str,
+    context_json: dict[str, Any] | None,
+    phy_engine_cfg: Any,
+    config_base_dir: str,
+    max_components: int = 30,
+    max_probes: int = 20,
+) -> str:
+    lang_zh = _looks_like_zh(text)
+
+    cmake_source_dir = _resolve_existing_path(
+        str(getattr(phy_engine_cfg, "cmake_source_dir", "")),
+        base_dir=config_base_dir,
+    )
+    lib_cfg_path = _resolve_existing_path(
+        str(getattr(phy_engine_cfg, "phyengine_lib_path", "")),
+        base_dir=config_base_dir,
+    )
+    lib_path = ensure_phyengine_lib(
+        phyengine_lib_path=lib_cfg_path,
+        auto_build=bool(getattr(phy_engine_cfg, "auto_build", False)),
+        cmake_source_dir=cmake_source_dir,
+        cmake_build_dir=os.path.abspath(
+            os.path.join(config_base_dir, str(getattr(phy_engine_cfg, "cmake_build_dir", "")))
+        ),
+        cmake_build_type=str(getattr(phy_engine_cfg, "cmake_build_type", "Release")),
+        build_timeout_sec=int(getattr(phy_engine_cfg, "build_timeout_sec", 900)),
+    )
+
+    raw_json = llm_build_pe_sim_spec_json(
+        ollama=ollama,
+        user_text=text,
+        context_json=context_json,
+        max_components=max_components,
+        max_probes=max_probes,
+    )
+    try:
+        obj = parse_spec_json(raw_json)
+        spec = parse_pe_sim_spec(obj, max_components=max_components, max_probes=max_probes)
+        built = build_circuit(spec)
+    except PEBuilderError as e:
+        return (
+            "I couldn't build a valid circuit spec from your request. "
+            f"Error: {e}"
+            if not lang_zh
+            else f"我没能从你的描述里构建出可仿真的电路规格。错误：{e}"
+        )
+
+    pe = PhyEngineLib(lib_path)
+    circuit, vec_pos, chunk_pos, comp_size = pe.create_circuit(
+        element_codes=built.element_codes,
+        wires=built.wires,
+        properties=built.properties,
+    )
+    try:
+        if spec.analysis_type == "dc":
+            pe.set_analyze_type(circuit=circuit, analyze_type=AnalyzeType.DC)
+        elif spec.analysis_type == "ac":
+            pe.set_analyze_type(circuit=circuit, analyze_type=AnalyzeType.AC)
+            omega = float(spec.ac_omega_rad_s or 0.0)
+            if omega <= 0.0:
+                omega = 2.0 * 3.141592653589793 * 1000.0  # default 1kHz
+            pe.set_ac_omega(circuit=circuit, omega=omega)
+        else:
+            pe.set_analyze_type(circuit=circuit, analyze_type=AnalyzeType.TR)
+            t_step = float(spec.tr_t_step_s or 1e-4)
+            t_stop = float(spec.tr_t_stop_s or 5e-3)
+            if t_step <= 0.0:
+                t_step = 1e-4
+            if t_stop <= 0.0:
+                t_stop = 5e-3
+            if t_step > t_stop:
+                t_step = t_stop
+            pe.set_tr(circuit=circuit, t_step=t_step, t_stop=t_stop)
+
+        pe.analyze(circuit=circuit)
+        voltage, voltage_ord, current, current_ord, _dig, _dig_ord = pe.sample(
+            circuit=circuit,
+            vec_pos=vec_pos,
+            chunk_pos=chunk_pos,
+            comp_size=comp_size,
+            max_pins_per_comp=16,
+            max_branches_per_comp=8,
+        )
+    finally:
+        pe.destroy_circuit(circuit=circuit, vec_pos=vec_pos, chunk_pos=chunk_pos)
+
+    # Helpers for extracting values.
+    def comp_index_for_element_index(element_index: int) -> int | None:
+        if element_index <= 0:
+            return None
+        # Component order is non-ground elements in ascending element index.
+        return element_index - 1
+
+    def node_voltage(node: str) -> float | None:
+        n = (node or "").strip()
+        if not n:
+            return None
+        if n.casefold() in ("gnd", "ground", "0"):
+            return 0.0
+        ref = built.node_to_pin.get(n) or built.node_to_pin.get(n.casefold())  # best effort
+        if not ref:
+            return None
+        ei, pin = ref
+        ci = comp_index_for_element_index(ei)
+        if ci is None or ci + 1 >= len(voltage_ord):
+            return None
+        start = voltage_ord[ci]
+        end = voltage_ord[ci + 1]
+        if (end - start) <= pin:
+            return None
+        return float(voltage[start + pin])
+
+    def component_current(cid: str) -> float | None:
+        ei = built.element_index_by_id.get(cid)
+        if ei is None:
+            return None
+        ci = comp_index_for_element_index(ei)
+        if ci is None or ci + 1 >= len(current_ord):
+            return None
+        start = current_ord[ci]
+        end = current_ord[ci + 1]
+        if end <= start:
+            return None
+        return float(current[start])
+
+    def component_vdrop(cid: str) -> float | None:
+        ei = built.element_index_by_id.get(cid)
+        if ei is None:
+            return None
+        ci = comp_index_for_element_index(ei)
+        if ci is None or ci + 1 >= len(voltage_ord):
+            return None
+        start = voltage_ord[ci]
+        end = voltage_ord[ci + 1]
+        if (end - start) < 2:
+            return None
+        v0 = float(voltage[start + 0])
+        v1 = float(voltage[start + 1])
+        return v0 - v1
+
+    probes = list(spec.probes)
+    if not probes:
+        # Default probes: show node voltages (excluding gnd) and per-component current/vdrop (limited).
+        node_names = [n for n in built.node_to_pin.keys() if n != "gnd"]
+        for n in node_names[: max(0, max_probes // 2)]:
+            probes.append(PEProbe(kind="node_voltage", target=n))
+        for comp in spec.components[: max(0, max_probes // 2)]:
+            probes.append(PEProbe(kind="component_current", target=comp.id))
+
+    lines: list[str] = []
+    if lang_zh:
+        lines.append("仿真结果（Phy-Engine）:")
+        lines.append(f"- analysis={spec.analysis_type}, components={len(spec.components)}")
+    else:
+        lines.append("Simulation result (Phy-Engine):")
+        lines.append(f"- analysis={spec.analysis_type}, components={len(spec.components)}")
+
+    for p in probes[:max_probes]:
+        if p.kind == "node_voltage":
+            v = node_voltage(p.target)
+            if v is None:
+                lines.append(f"- V({p.target}) = <unavailable>")
+            else:
+                lines.append(f"- V({p.target}) = {v:.6g} V")
+        elif p.kind == "component_current":
+            i = component_current(p.target)
+            if i is None:
+                lines.append(f"- I({p.target}) = <unavailable>")
+            else:
+                lines.append(f"- I({p.target}) = {i:.6g} A")
+        else:
+            vd = component_vdrop(p.target)
+            if vd is None:
+                lines.append(f"- Vdrop({p.target}) = <unavailable>")
+            else:
+                lines.append(f"- Vdrop({p.target}) = {vd:.6g} V")
+
+    return "\n".join(lines)
 
 
 def search_recent_experiments(

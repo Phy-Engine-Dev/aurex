@@ -135,17 +135,68 @@ def query_experiments(
     skip: int = 0,
     from_skip: str | None = None,
 ) -> list[dict[str, Any]]:
-    result = user.query_experiments(
-        category=category,
-        tags=None,
-        exclude_tags=None,
-        languages=[],
-        exclude_languages=[],
-        user_id=None,
-        take=take,
-        skip=skip,
-        from_skip=from_skip,
-    )
+    qe = getattr(user, "query_experiments", None)
+    if callable(qe):
+        result = qe(
+            category=category,
+            tags=None,
+            exclude_tags=None,
+            languages=[],
+            exclude_languages=[],
+            user_id=None,
+            take=take,
+            skip=skip,
+            from_skip=from_skip,
+        )
+    else:
+        # Defensive fallback: some wrappers/mocks may expose a non-callable attribute with the
+        # same name. In that case, call the underlying HTTP API directly using the user's
+        # token/auth_code.
+        token = getattr(user, "token", None)
+        auth_code = getattr(user, "auth_code", None)
+        if not isinstance(token, str) or not token.strip() or not isinstance(auth_code, str) or not auth_code.strip():
+            raise PLARError(
+                "query_experiments is not callable on this user object, and token/auth_code are missing."
+            )
+        cat_val = getattr(category, "value", category)
+        try:
+            import requests  # type: ignore
+        except ImportError as e:  # pragma: no cover
+            raise PLARError(
+                "Missing dependency: requests (required for Physics Lab API calls). "
+                "Install it with pip (e.g. 'pip install requests')."
+            ) from e
+        resp = requests.post(
+            "https://physics-api-cn.turtlesim.com/Contents/QueryExperiments",
+            json={
+                "Query": {
+                    "Category": cat_val,
+                    "Languages": [],
+                    "ExcludeLanguages": [],
+                    "Tags": None,
+                    "ExcludeTags": None,
+                    "ModelTags": None,
+                    "ModelID": None,
+                    "ParentID": None,
+                    "UserID": None,
+                    "Special": None,
+                    "From": from_skip,
+                    "Skip": int(skip),
+                    "Take": int(take),
+                    "Days": 0,
+                    "Sort": 0,
+                    "ShowAnnouncement": False,
+                }
+            },
+            headers={
+                "Content-Type": "application/json",
+                "x-API-Token": token,
+                "x-API-AuthCode": auth_code,
+            },
+            timeout=_requests_default_timeout_sec,
+        )
+        resp.raise_for_status()
+        result = resp.json()
     data = result.get("Data")
     if not isinstance(data, dict):
         raise PLARError("Unexpected query_experiments response: missing Data object")

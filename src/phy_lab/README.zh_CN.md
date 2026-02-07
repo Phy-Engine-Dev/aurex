@@ -91,6 +91,12 @@ python src/phy_lab/agent.py run --config .phy_lab/config.json
 如果你担心短时间内请求过多导致负载过高，可以启用“过载保护”。当 10 分钟内请求数量超过阈值时，新请求会直接回复英文忙碌提示：
 
 - `agent.overload_protection_enabled=true`
+
+如果你希望启用“AI 自动构建电路并仿真”（当内置串联解析/实验 StatusSave 仿真无法满足时，模型会生成一个小电路并调用 Phy-Engine 仿真），可以设置：
+
+- `agent.simulation_ai_enabled=true`
+- `agent.simulation_ai_max_components=30`（AI 构建电路的最大元件数）
+- `agent.simulation_ai_max_probes=20`（最多输出多少行探针结果）
 - `agent.overload_window_sec=600`
 - `agent.overload_max_requests=40`
 - `agent.overload_message_en="Too many requests at the moment, please try again later."`

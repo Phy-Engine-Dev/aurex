@@ -125,6 +125,9 @@ class AgentConfig:
     publish_tags: list[str] = field(default_factory=lambda: list(DEFAULT_PUBLISH_TAGS))
     simulation_enabled: bool = True
     simulation_max_elements: int = 300
+    simulation_ai_enabled: bool = True
+    simulation_ai_max_components: int = 30
+    simulation_ai_max_probes: int = 20
     overload_protection_enabled: bool = True
     overload_window_sec: int = 600
     overload_max_requests: int = 40
@@ -507,6 +510,21 @@ def parse_config(data: dict[str, Any], *, source: str) -> Config:
     )
     if simulation_max_elements is not None and simulation_max_elements < 0:
         raise ConfigError("agent.simulation_max_elements must be >= 0")
+    simulation_ai_enabled = _optional_bool(
+        agent_obj.get("simulation_ai_enabled"), where="agent.simulation_ai_enabled"
+    )
+    simulation_ai_max_components = _optional_int(
+        agent_obj.get("simulation_ai_max_components"),
+        where="agent.simulation_ai_max_components",
+    )
+    simulation_ai_max_probes = _optional_int(
+        agent_obj.get("simulation_ai_max_probes"),
+        where="agent.simulation_ai_max_probes",
+    )
+    if simulation_ai_max_components is not None and simulation_ai_max_components <= 0:
+        raise ConfigError("agent.simulation_ai_max_components must be > 0")
+    if simulation_ai_max_probes is not None and simulation_ai_max_probes < 0:
+        raise ConfigError("agent.simulation_ai_max_probes must be >= 0")
 
     agent = AgentConfig(
         include_self_wall=include_self_wall
@@ -592,6 +610,15 @@ def parse_config(data: dict[str, Any], *, source: str) -> Config:
         simulation_max_elements=simulation_max_elements
         if simulation_max_elements is not None
         else AgentConfig.simulation_max_elements,
+        simulation_ai_enabled=simulation_ai_enabled
+        if simulation_ai_enabled is not None
+        else AgentConfig.simulation_ai_enabled,
+        simulation_ai_max_components=simulation_ai_max_components
+        if simulation_ai_max_components is not None
+        else AgentConfig.simulation_ai_max_components,
+        simulation_ai_max_probes=simulation_ai_max_probes
+        if simulation_ai_max_probes is not None
+        else AgentConfig.simulation_ai_max_probes,
         overload_protection_enabled=overload_protection_enabled
         if overload_protection_enabled is not None
         else AgentConfig.overload_protection_enabled,
@@ -708,6 +735,9 @@ def write_config(path: str, config: Config) -> None:
             "publish_tags": list(config.agent.publish_tags),
             "simulation_enabled": config.agent.simulation_enabled,
             "simulation_max_elements": config.agent.simulation_max_elements,
+            "simulation_ai_enabled": config.agent.simulation_ai_enabled,
+            "simulation_ai_max_components": config.agent.simulation_ai_max_components,
+            "simulation_ai_max_probes": config.agent.simulation_ai_max_probes,
             "overload_protection_enabled": config.agent.overload_protection_enabled,
             "overload_window_sec": config.agent.overload_window_sec,
             "overload_max_requests": config.agent.overload_max_requests,

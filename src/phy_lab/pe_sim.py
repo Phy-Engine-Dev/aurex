@@ -9,6 +9,36 @@ class PESimError(RuntimeError):
     pass
 
 
+class AnalyzeType:
+    OP = 0
+    DC = 1
+    AC = 2
+    ACOP = 3
+    TR = 4
+    TROP = 5
+
+
+class DigitalState:
+    L = 0
+    H = 1
+    X = 2
+    Z = 3
+
+
+class ElementCode:
+    # Keep in sync with `third-parties/Phy-Engine/include/phy_engine/dll_api.h`.
+    RESISTOR = 1
+    CAPACITOR = 2
+    INDUCTOR = 3
+    VDC = 4
+    VAC = 5
+    IDC = 6
+    IAC = 7
+
+    DIGITAL_INPUT = 200
+    DIGITAL_OUTPUT = 201
+
+
 @dataclass(frozen=True)
 class SeriesVdcResistorsSpec:
     v_volts: float
@@ -50,8 +80,10 @@ class PhyEngineLib:
         c_size_t_pp = ctypes.POINTER(c_size_t_p)
         c_double_p = ctypes.POINTER(ctypes.c_double)
         c_bool_p = ctypes.POINTER(ctypes.c_bool)
+        c_uint8_p = ctypes.POINTER(ctypes.c_uint8)
         c_uint32 = ctypes.c_uint32
         c_double = ctypes.c_double
+        c_uint8 = ctypes.c_uint8
 
         self._lib.create_circuit.argtypes = [
             c_int_p,
@@ -74,8 +106,20 @@ class PhyEngineLib:
         self._lib.circuit_set_tr.argtypes = [c_void_p, c_double, c_double]
         self._lib.circuit_set_tr.restype = ctypes.c_int
 
+        self._lib.circuit_set_ac_omega.argtypes = [c_void_p, c_double]
+        self._lib.circuit_set_ac_omega.restype = ctypes.c_int
+
+        self._lib.circuit_set_temperature.argtypes = [c_void_p, c_double]
+        self._lib.circuit_set_temperature.restype = ctypes.c_int
+
+        self._lib.circuit_set_tnom.argtypes = [c_void_p, c_double]
+        self._lib.circuit_set_tnom.restype = ctypes.c_int
+
         self._lib.circuit_analyze.argtypes = [c_void_p]
         self._lib.circuit_analyze.restype = ctypes.c_int
+
+        self._lib.circuit_digital_clk.argtypes = [c_void_p]
+        self._lib.circuit_digital_clk.restype = ctypes.c_int
 
         self._lib.circuit_sample.argtypes = [
             c_void_p,
@@ -90,6 +134,29 @@ class PhyEngineLib:
             c_size_t_p,
         ]
         self._lib.circuit_sample.restype = ctypes.c_int
+
+        self._lib.circuit_sample_u8.argtypes = [
+            c_void_p,
+            c_size_t_p,
+            c_size_t_p,
+            c_size_t,
+            c_double_p,
+            c_size_t_p,
+            c_double_p,
+            c_size_t_p,
+            c_uint8_p,
+            c_size_t_p,
+        ]
+        self._lib.circuit_sample_u8.restype = ctypes.c_int
+
+        self._lib.circuit_set_model_digital.argtypes = [
+            c_void_p,
+            c_size_t,
+            c_size_t,
+            c_size_t,
+            c_uint8,
+        ]
+        self._lib.circuit_set_model_digital.restype = ctypes.c_int
 
     def create_circuit(
         self,
@@ -139,9 +206,46 @@ class PhyEngineLib:
         if self._lib.circuit_set_tr(ctypes.c_void_p(circuit), ctypes.c_double(t_step), ctypes.c_double(t_stop)) != 0:
             raise PESimError("circuit_set_tr failed")
 
+    def set_ac_omega(self, *, circuit: int, omega: float) -> None:
+        if self._lib.circuit_set_ac_omega(ctypes.c_void_p(circuit), ctypes.c_double(omega)) != 0:
+            raise PESimError("circuit_set_ac_omega failed")
+
+    def set_temperature(self, *, circuit: int, temp_c: float) -> None:
+        if self._lib.circuit_set_temperature(ctypes.c_void_p(circuit), ctypes.c_double(temp_c)) != 0:
+            raise PESimError("circuit_set_temperature failed")
+
+    def set_tnom(self, *, circuit: int, tnom_c: float) -> None:
+        if self._lib.circuit_set_tnom(ctypes.c_void_p(circuit), ctypes.c_double(tnom_c)) != 0:
+            raise PESimError("circuit_set_tnom failed")
+
     def analyze(self, *, circuit: int) -> None:
         if self._lib.circuit_analyze(ctypes.c_void_p(circuit)) != 0:
             raise PESimError("circuit_analyze failed")
+
+    def digital_clk(self, *, circuit: int) -> None:
+        if self._lib.circuit_digital_clk(ctypes.c_void_p(circuit)) != 0:
+            raise PESimError("circuit_digital_clk failed")
+
+    def set_model_digital(
+        self,
+        *,
+        circuit: int,
+        vec_pos: int,
+        chunk_pos: int,
+        attribute_index: int,
+        state: int,
+    ) -> None:
+        if (
+            self._lib.circuit_set_model_digital(
+                ctypes.c_void_p(circuit),
+                ctypes.c_size_t(int(vec_pos)),
+                ctypes.c_size_t(int(chunk_pos)),
+                ctypes.c_size_t(int(attribute_index)),
+                ctypes.c_uint8(int(state)),
+            )
+            != 0
+        ):
+            raise PESimError("circuit_set_model_digital failed")
 
     def sample(
         self,
@@ -189,6 +293,55 @@ class PhyEngineLib:
         cur = [float(current[i]) for i in range(min(i_len, int(current_ord[comp_size])))]
         cord = [int(current_ord[i]) for i in range(comp_size + 1)]
         dig = [bool(digital[i]) for i in range(min(v_len, int(digital_ord[comp_size])))]
+        dord = [int(digital_ord[i]) for i in range(comp_size + 1)]
+        return v, vord, cur, cord, dig, dord
+
+    def sample_u8(
+        self,
+        *,
+        circuit: int,
+        vec_pos: ctypes.POINTER(ctypes.c_size_t),
+        chunk_pos: ctypes.POINTER(ctypes.c_size_t),
+        comp_size: int,
+        max_pins_per_comp: int = 4,
+        max_branches_per_comp: int = 2,
+    ) -> tuple[list[float], list[int], list[float], list[int], list[int], list[int]]:
+        if comp_size <= 0:
+            return ([], [0], [], [0], [], [0])
+        if max_pins_per_comp <= 0:
+            max_pins_per_comp = 4
+        if max_branches_per_comp <= 0:
+            max_branches_per_comp = 2
+
+        v_len = comp_size * max_pins_per_comp
+        i_len = comp_size * max_branches_per_comp
+        voltage = (ctypes.c_double * max(1, v_len))()
+        voltage_ord = (ctypes.c_size_t * (comp_size + 1))()
+        current = (ctypes.c_double * max(1, i_len))()
+        current_ord = (ctypes.c_size_t * (comp_size + 1))()
+        digital = (ctypes.c_uint8 * max(1, v_len))()
+        digital_ord = (ctypes.c_size_t * (comp_size + 1))()
+
+        rc = self._lib.circuit_sample_u8(
+            ctypes.c_void_p(circuit),
+            vec_pos,
+            chunk_pos,
+            ctypes.c_size_t(comp_size),
+            voltage,
+            voltage_ord,
+            current,
+            current_ord,
+            digital,
+            digital_ord,
+        )
+        if rc != 0:
+            raise PESimError("circuit_sample_u8 failed")
+
+        v = [float(voltage[i]) for i in range(min(v_len, int(voltage_ord[comp_size])))]
+        vord = [int(voltage_ord[i]) for i in range(comp_size + 1)]
+        cur = [float(current[i]) for i in range(min(i_len, int(current_ord[comp_size])))]
+        cord = [int(current_ord[i]) for i in range(comp_size + 1)]
+        dig = [int(digital[i]) for i in range(min(v_len, int(digital_ord[comp_size])))]
         dord = [int(digital_ord[i]) for i in range(comp_size + 1)]
         return v, vord, cur, cord, dig, dord
 

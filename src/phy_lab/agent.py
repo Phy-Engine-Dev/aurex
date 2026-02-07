@@ -76,6 +76,7 @@ from tools import (  # noqa: E402
     render_help,
     safe_reply,
     search_recent_experiments,
+    simulate_ai_circuit_with_phyengine,
     simulate_series_vdc_resistors,
     simulate_series_vdc_two_resistors,
     simulate_status_save_with_phyengine,
@@ -718,6 +719,7 @@ def _handle_comment(
                             user=user, query=routed_arg, max_scan=200, max_results=5
                         )
                     except Exception as e:
+                        logger.warning("Local search failed: %s", _public_error_text(e, max_chars=2000))
                         return f"Search failed: {e}"
                     return safe_reply(format_experiment_hits(hits), max_chars=cfg.agent.max_reply_chars)
 
@@ -797,8 +799,29 @@ def _handle_comment(
                             phy_engine_cfg=cfg.phy_engine,
                             config_base_dir=config_base_dir,
                         )
+                        return safe_reply(reply, max_chars=cfg.agent.max_reply_chars)
                     except Exception as e:
-                        return f"Simulation failed: {e}"
+                        logger.info("Fallback demo simulation failed: %s", e)
+
+                    # AI-built circuit simulation (optional, more flexible).
+                    if bool(getattr(cfg.agent, "simulation_ai_enabled", True)):
+                        try:
+                            reply = simulate_ai_circuit_with_phyengine(
+                                ollama=ollama,
+                                text=sim_text,
+                                context_json=experiment_context,
+                                phy_engine_cfg=cfg.phy_engine,
+                                config_base_dir=config_base_dir,
+                                max_components=int(
+                                    getattr(cfg.agent, "simulation_ai_max_components", 30) or 30
+                                ),
+                                max_probes=int(
+                                    getattr(cfg.agent, "simulation_ai_max_probes", 20) or 20
+                                ),
+                            )
+                            return safe_reply(reply, max_chars=cfg.agent.max_reply_chars)
+                        except Exception as e:
+                            return f"Simulation failed: {e}"
                     return safe_reply(reply, max_chars=cfg.agent.max_reply_chars)
 
                 if action == "circuit":
@@ -925,6 +948,25 @@ def _handle_comment(
                     except Exception as e:
                         logger.info("Fallback demo simulation failed: %s", e)
 
+                    if bool(getattr(cfg.agent, "simulation_ai_enabled", True)):
+                        try:
+                            reply = simulate_ai_circuit_with_phyengine(
+                                ollama=ollama,
+                                text=arg,
+                                context_json=experiment_context,
+                                phy_engine_cfg=cfg.phy_engine,
+                                config_base_dir=config_base_dir,
+                                max_components=int(
+                                    getattr(cfg.agent, "simulation_ai_max_components", 30) or 30
+                                ),
+                                max_probes=int(
+                                    getattr(cfg.agent, "simulation_ai_max_probes", 20) or 20
+                                ),
+                            )
+                            return safe_reply(reply, max_chars=cfg.agent.max_reply_chars)
+                        except Exception as e:
+                            logger.info("AI circuit simulation failed: %s", e)
+
                 looks_like_circuit, explicit_publish = _fallback_route_for_circuit(arg)
                 if looks_like_circuit:
                     logger.info(
@@ -1027,9 +1069,9 @@ def _handle_comment(
         messages.extend(history)
 
         # LLM-driven automatic web search (optional).
-                if bool(getattr(cfg.agent, "web_search_enabled", False)) and bool(
-                    getattr(cfg.agent, "auto_web_search", True)
-                ):
+        if bool(getattr(cfg.agent, "web_search_enabled", False)) and bool(
+            getattr(cfg.agent, "auto_web_search", True)
+        ):
             try:
                 use_web, query = _llm_decide_web_search(
                     ollama=ollama,
@@ -1041,34 +1083,36 @@ def _handle_comment(
                 logger.debug("Web router failed: %s", e)
                 use_web, query = False, ""
 
-                    if use_web:
-                        if _looks_political_sensitive(query or arg):
-                            return _political_refusal_message(query or arg)
-                        logger.info("Auto web search triggered (query=%r)", truncate(query, max_chars=200))
-                        try:
-                            search_txt = web_search(
-                                query=query,
-                                cache_dir=cache_dir,
-                                provider=str(getattr(cfg.agent, "web_search_provider", "google") or "google"),
-                                proxy=str(getattr(cfg.agent, "web_search_proxy", "") or ""),
-                                timeout_sec=int(getattr(cfg.agent, "web_search_timeout_sec", 20) or 20),
-                                ttl_sec=int(getattr(cfg.agent, "web_search_cache_ttl_sec", 3600) or 3600),
-                                max_results=int(getattr(cfg.agent, "web_search_max_results", 5) or 5),
-                                fallback_to_ddg=bool(getattr(cfg.agent, "web_search_fallback_to_ddg", True)),
-                                user_agent=str(getattr(cfg.agent, "web_search_user_agent", "") or ""),
-                                searxng_base_url=str(
-                                    getattr(cfg.agent, "web_search_searxng_base_url", "") or ""
-                                ),
-                            )
-                            messages.append(
-                                {
-                                    "role": "system",
-                                    "content": "Web search results (use as external references; do not mention tools):\n"
-                                    + search_txt,
-                                }
-                            )
-                        except Exception as e:
-                            logger.warning("Web search failed: %s", e)
+            if use_web:
+                if _looks_political_sensitive(query or arg):
+                    return _political_refusal_message(query or arg)
+                logger.info(
+                    "Auto web search triggered (query=%r)", truncate(query, max_chars=200)
+                )
+                try:
+                    search_txt = web_search(
+                        query=query,
+                        cache_dir=cache_dir,
+                        provider=str(getattr(cfg.agent, "web_search_provider", "google") or "google"),
+                        proxy=str(getattr(cfg.agent, "web_search_proxy", "") or ""),
+                        timeout_sec=int(getattr(cfg.agent, "web_search_timeout_sec", 20) or 20),
+                        ttl_sec=int(getattr(cfg.agent, "web_search_cache_ttl_sec", 3600) or 3600),
+                        max_results=int(getattr(cfg.agent, "web_search_max_results", 5) or 5),
+                        fallback_to_ddg=bool(getattr(cfg.agent, "web_search_fallback_to_ddg", True)),
+                        user_agent=str(getattr(cfg.agent, "web_search_user_agent", "") or ""),
+                        searxng_base_url=str(
+                            getattr(cfg.agent, "web_search_searxng_base_url", "") or ""
+                        ),
+                    )
+                    messages.append(
+                        {
+                            "role": "system",
+                            "content": "Web search results (use as external references; do not mention tools):\n"
+                            + search_txt,
+                        }
+                    )
+                except Exception as e:
+                    logger.warning("Web search failed: %s", e)
 
         messages.append({"role": "user", "content": arg})
         reply = ollama.chat(messages=messages)
@@ -1106,6 +1150,7 @@ def _handle_comment(
         try:
             hits = search_recent_experiments(user=user, query=arg, max_scan=200, max_results=5)
         except Exception as e:
+            logger.warning("Local search failed: %s", _public_error_text(e, max_chars=2000))
             return f"Search failed: {e}"
         return safe_reply(format_experiment_hits(hits), max_chars=cfg.agent.max_reply_chars)
 
@@ -1224,7 +1269,23 @@ def _handle_comment(
                 config_base_dir=config_base_dir,
             )
         except Exception as e:
-            return f"Simulation failed: {e}"
+            if bool(getattr(cfg.agent, "simulation_ai_enabled", True)):
+                try:
+                    reply = simulate_ai_circuit_with_phyengine(
+                        ollama=ollama,
+                        text=arg or text,
+                        context_json=experiment_context,
+                        phy_engine_cfg=cfg.phy_engine,
+                        config_base_dir=config_base_dir,
+                        max_components=int(
+                            getattr(cfg.agent, "simulation_ai_max_components", 30) or 30
+                        ),
+                        max_probes=int(getattr(cfg.agent, "simulation_ai_max_probes", 20) or 20),
+                    )
+                except Exception as e2:
+                    return f"Simulation failed: {e2}"
+            else:
+                return f"Simulation failed: {e}"
         return safe_reply(reply, max_chars=cfg.agent.max_reply_chars)
 
     return safe_reply(
