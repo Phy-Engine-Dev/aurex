@@ -54,8 +54,13 @@
     "web_search_fallback_to_ddg": true,
     "auto_tool_routing": true,
     "auto_publish": false,
+    "publish_by_default": false,
     "circuit_max_attempts": 3,
     "publish_max_elements": 5000,
+    "publish_category": "Discussion",
+    "publish_tags": [
+      "SmallProject"
+    ],
     "overload_protection_enabled": true,
     "overload_window_sec": 600,
     "overload_max_requests": 40,

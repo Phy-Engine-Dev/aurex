@@ -18,7 +18,7 @@ def safe_mention_prefix(nickname: str) -> str | None:
         return None
     if any(ch in nickname for ch in (":", " ")):
         return None
-    return f"Reply@{nickname}: "
+    return f"@{nickname} "
 
 
 _FENCED_CODE_BLOCK_RE = re.compile(

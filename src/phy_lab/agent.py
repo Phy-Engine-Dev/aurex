@@ -109,6 +109,17 @@ def _extract_safe_mentions(text: str) -> list[str]:
     return out
 
 
+def _infer_publish_category(user_text: str, *, default_category: str) -> str:
+    t = (user_text or "").lower()
+    if any(x in t for x in ("discussion", "discuss", "black hole", "讨论", "黑洞", "交流")):
+        return "Discussion"
+    if any(x in t for x in ("experiment", "lab", "实验", "实验区")):
+        return "Experiment"
+    if default_category in ("Experiment", "Discussion"):
+        return default_category
+    return "Discussion"
+
+
 _POLITICAL_RE = re.compile(
     r"(?i)\\b("
     r"politic|politics|election|vote|campaign|parliament|congress|senate|president|prime\\s+minister|government|regime|party|"
@@ -658,7 +669,17 @@ def _handle_comment(
                         routed_arg = arg
                     if not routed_arg:
                         return "Provide a circuit specification."
-                    enable_publish = bool(cfg.agent.enable_publish) and bool(getattr(cfg.agent, "auto_publish", False)) and publish_intent
+                    publish_wanted = bool(publish_intent) or bool(
+                        getattr(cfg.agent, "publish_by_default", False)
+                    )
+                    enable_publish = (
+                        bool(cfg.agent.enable_publish)
+                        and bool(getattr(cfg.agent, "auto_publish", False))
+                        and publish_wanted
+                    )
+                    publish_category_value = _infer_publish_category(
+                        routed_arg, default_category=getattr(cfg.agent, "publish_category", "Discussion")
+                    )
                     title = truncate(f"Auto Circuit: {routed_arg}", max_chars=60)
                     requested_by = nickname or author_id or "unknown"
                     mentions = []
@@ -687,6 +708,8 @@ def _handle_comment(
                             publish_max_elements=int(getattr(cfg.agent, "publish_max_elements", 5000) or 5000),
                             title=title,
                             introduction=introduction,
+                            publish_category_value=publish_category_value,
+                            publish_tags=list(getattr(cfg.agent, "publish_tags", []) or []),
                         )
                     except Exception as e:
                         return safe_reply(
@@ -704,13 +727,21 @@ def _handle_comment(
 
                     if enable_publish and res.published:
                         return safe_reply(
-                            "Done. I generated Verilog, compiled to .sav with -O4 and '--layout hier', and published the experiment.\n"
-                            f"SummaryID: {res.summary_id}",
+                            "Done. I generated Verilog, compiled to .sav with -O4 and '--layout hier', and published it.\n"
+                            f"Category: {publish_category_value}\nSummaryID: {res.summary_id}",
                             max_chars=cfg.agent.max_reply_chars,
                         )
                     return safe_reply(
                         "Done. I generated Verilog and compiled a .sav with -O4 and '--layout hier'.\n"
-                        "Publishing is disabled (or dry-run). Ask to publish explicitly and ensure config enables publishing.",
+                        (
+                            "Publishing is disabled (or dry-run). Enable publishing in config."
+                            if not bool(cfg.agent.enable_publish)
+                            else (
+                                "Publishing was not requested. Ask to publish explicitly, or set agent.publish_by_default=true."
+                                if not publish_wanted
+                                else "Publishing did not run due to configuration."
+                            )
+                        ),
                         max_chars=cfg.agent.max_reply_chars,
                     )
             else:
@@ -721,10 +752,16 @@ def _handle_comment(
                         explicit_publish,
                     )
                     publish_intent = explicit_publish
+                    publish_wanted = bool(publish_intent) or bool(
+                        getattr(cfg.agent, "publish_by_default", False)
+                    )
                     enable_publish = (
                         bool(cfg.agent.enable_publish)
                         and bool(getattr(cfg.agent, "auto_publish", False))
-                        and publish_intent
+                        and publish_wanted
+                    )
+                    publish_category_value = _infer_publish_category(
+                        arg, default_category=getattr(cfg.agent, "publish_category", "Discussion")
                     )
                     title = truncate(f"Auto Circuit: {arg}", max_chars=60)
                     requested_by = nickname or author_id or "unknown"
@@ -754,6 +791,8 @@ def _handle_comment(
                             publish_max_elements=int(getattr(cfg.agent, "publish_max_elements", 5000) or 5000),
                             title=title,
                             introduction=introduction,
+                            publish_category_value=publish_category_value,
+                            publish_tags=list(getattr(cfg.agent, "publish_tags", []) or []),
                         )
                     except Exception as e:
                         return safe_reply(
@@ -771,13 +810,21 @@ def _handle_comment(
 
                     if enable_publish and res.published:
                         return safe_reply(
-                            "Done. I generated Verilog, compiled to .sav with -O4 and '--layout hier', and published the experiment.\n"
-                            f"SummaryID: {res.summary_id}",
+                            "Done. I generated Verilog, compiled to .sav with -O4 and '--layout hier', and published it.\n"
+                            f"Category: {publish_category_value}\nSummaryID: {res.summary_id}",
                             max_chars=cfg.agent.max_reply_chars,
                         )
                     return safe_reply(
                         "Done. I generated Verilog and compiled a .sav with -O4 and '--layout hier'.\n"
-                        "Publishing is disabled (or dry-run). Ask to publish explicitly and ensure config enables publishing.",
+                        (
+                            "Publishing is disabled (or dry-run). Enable publishing in config."
+                            if not bool(cfg.agent.enable_publish)
+                            else (
+                                "Publishing was not requested. Ask to publish explicitly, or set agent.publish_by_default=true."
+                                if not publish_wanted
+                                else "Publishing did not run due to configuration."
+                            )
+                        ),
                         max_chars=cfg.agent.max_reply_chars,
                     )
 

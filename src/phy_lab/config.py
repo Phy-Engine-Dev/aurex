@@ -9,6 +9,7 @@ TargetType = Literal["User", "Experiment", "Discussion"]
 
 DEFAULT_NOTIFICATION_CATEGORY_IDS: list[int] = [0, 3]
 DEFAULT_VERILOG2PLSAV_ARGS: list[str] = ["-O4", "--layout", "hier"]
+DEFAULT_PUBLISH_TAGS: list[str] = ["SmallProject"]
 
 DEFAULT_SYSTEM_PROMPT = """You are aurex, a production-grade agent tool developed by MacroModel for the Physics Lab AR community.
 
@@ -25,7 +26,7 @@ Clean answers (very important)
 - Answer ONLY what the user asked about the community content or the current task.
 - Do NOT add unrelated advice, generic disclaimers, marketing, or off-topic commentary.
 - Do NOT mention system prompts, internal tools, policies, chain-of-thought, or that you are an AI model.
-- If the request is unclear, ask 1–2 short clarifying questions instead of guessing.
+- If the request is unclear, ask 1 to 2 short clarifying questions instead of guessing.
 
 Formatting
 - Prefer short paragraphs or bullet points.
@@ -108,8 +109,11 @@ class AgentConfig:
     web_search_fallback_to_ddg: bool = True
     auto_tool_routing: bool = True
     auto_publish: bool = False
+    publish_by_default: bool = False
     circuit_max_attempts: int = 3
     publish_max_elements: int = 5000
+    publish_category: str = "Discussion"
+    publish_tags: list[str] = field(default_factory=lambda: list(DEFAULT_PUBLISH_TAGS))
     overload_protection_enabled: bool = True
     overload_window_sec: int = 600
     overload_max_requests: int = 40
@@ -366,11 +370,20 @@ def parse_config(data: dict[str, Any], *, source: str) -> Config:
     auto_publish = _optional_bool(
         agent_obj.get("auto_publish"), where="agent.auto_publish"
     )
+    publish_by_default = _optional_bool(
+        agent_obj.get("publish_by_default"), where="agent.publish_by_default"
+    )
     circuit_max_attempts = _optional_int(
         agent_obj.get("circuit_max_attempts"), where="agent.circuit_max_attempts"
     )
     publish_max_elements = _optional_int(
         agent_obj.get("publish_max_elements"), where="agent.publish_max_elements"
+    )
+    publish_category = _optional_str(
+        agent_obj.get("publish_category"), where="agent.publish_category"
+    )
+    publish_tags = _optional_str_list(
+        agent_obj.get("publish_tags"), where="agent.publish_tags"
     )
     overload_protection_enabled = _optional_bool(
         agent_obj.get("overload_protection_enabled"),
@@ -402,6 +415,11 @@ def parse_config(data: dict[str, Any], *, source: str) -> Config:
     system_prompt = _optional_str(
         agent_obj.get("system_prompt"), where="agent.system_prompt"
     )
+
+    publish_category_final = publish_category or AgentConfig.publish_category
+    if publish_category_final not in ("Experiment", "Discussion"):
+        raise ConfigError("agent.publish_category must be 'Experiment' or 'Discussion'")
+
     agent = AgentConfig(
         include_self_wall=include_self_wall
         if include_self_wall is not None
@@ -456,12 +474,17 @@ def parse_config(data: dict[str, Any], *, source: str) -> Config:
         if auto_tool_routing is not None
         else AgentConfig.auto_tool_routing,
         auto_publish=auto_publish if auto_publish is not None else AgentConfig.auto_publish,
+        publish_by_default=publish_by_default
+        if publish_by_default is not None
+        else AgentConfig.publish_by_default,
         circuit_max_attempts=circuit_max_attempts
         if circuit_max_attempts is not None
         else AgentConfig.circuit_max_attempts,
         publish_max_elements=publish_max_elements
         if publish_max_elements is not None
         else AgentConfig.publish_max_elements,
+        publish_category=publish_category_final,
+        publish_tags=publish_tags if publish_tags is not None else list(DEFAULT_PUBLISH_TAGS),
         overload_protection_enabled=overload_protection_enabled
         if overload_protection_enabled is not None
         else AgentConfig.overload_protection_enabled,
@@ -563,8 +586,11 @@ def write_config(path: str, config: Config) -> None:
             "web_search_fallback_to_ddg": config.agent.web_search_fallback_to_ddg,
             "auto_tool_routing": config.agent.auto_tool_routing,
             "auto_publish": config.agent.auto_publish,
+            "publish_by_default": config.agent.publish_by_default,
             "circuit_max_attempts": config.agent.circuit_max_attempts,
             "publish_max_elements": config.agent.publish_max_elements,
+            "publish_category": config.agent.publish_category,
+            "publish_tags": list(config.agent.publish_tags),
             "overload_protection_enabled": config.agent.overload_protection_enabled,
             "overload_window_sec": config.agent.overload_window_sec,
             "overload_max_requests": config.agent.overload_max_requests,

@@ -198,6 +198,7 @@ def upload_sav_as_experiment(
     introduction: str,
     cache_dir: str,
     category_value: str = "Experiment",
+    tags: list[str] | None = None,
 ) -> dict[str, Any]:
     ensure_physicslab_importable(cache_dir=cache_dir)
     from physicsLab import Category, Experiment, OpenMode
@@ -211,6 +212,8 @@ def upload_sav_as_experiment(
 
     exp = Experiment(OpenMode.load_by_filepath, sav_path)
     exp.edit_publish_info(title=title, introduction=introduction, wx=False)
+    if tags:
+        _apply_publish_tags(exp, tags)
 
     # Use the internal upload to retrieve the SummaryID for reporting.
     submit_response, submit_data = exp._Experiment__upload(user, category, None)  # type: ignore[attr-defined]
@@ -222,6 +225,63 @@ def upload_sav_as_experiment(
         "summary_id": summary_id,
         "category": category.value,
     }
+
+
+def _apply_publish_tags(exp: Any, tags: list[str]) -> None:
+    tags = [t.strip() for t in (tags or []) if isinstance(t, str) and t.strip()]
+    if not tags:
+        return
+    try:
+        from physicsLab import Tag
+    except Exception:
+        Tag = None  # type: ignore[assignment]
+
+    enum_tags = []
+    raw_tags: list[str] = []
+    for t in tags:
+        mapped = None
+        if Tag is not None:
+            # Accept either Tag enum name (e.g. "SmallProject") or Tag value (e.g. "小作品").
+            for candidate in (t, t.replace("Tag.", "", 1)):
+                key = candidate.strip()
+                if not key:
+                    continue
+                try:
+                    mapped = Tag[key]  # type: ignore[index]
+                    break
+                except Exception:
+                    mapped = None
+                try:
+                    mapped = next((x for x in Tag if getattr(x, "value", None) == key), None)
+                    if mapped is not None:
+                        break
+                except Exception:
+                    mapped = None
+        if mapped is not None:
+            enum_tags.append(mapped)
+        else:
+            raw_tags.append(t)
+
+    if enum_tags:
+        try:
+            exp.edit_tags(*enum_tags)
+        except Exception:
+            raw_tags.extend([getattr(t, "value", None) for t in enum_tags if getattr(t, "value", None)])
+
+    if raw_tags:
+        try:
+            plsav = getattr(exp, "PlSav", None)
+            if isinstance(plsav, dict):
+                summary = plsav.get("Summary")
+                if isinstance(summary, dict):
+                    existing = summary.get("Tags")
+                    if not isinstance(existing, list):
+                        existing = []
+                    merged = [x for x in existing if isinstance(x, str) and x.strip()]
+                    merged.extend(raw_tags)
+                    summary["Tags"] = list(dict.fromkeys(merged))
+        except Exception:
+            return
 
 
 def get_summary(user: Any, *, summary_id: str, category_value: str) -> dict[str, Any]:
