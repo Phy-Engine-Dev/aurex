@@ -94,12 +94,13 @@ def get_comments(
     target_id: str,
     target_type: str,
     take: int,
+    skip: int = 0,
 ) -> list[dict[str, Any]]:
     result = user.get_comments(
         target_id=target_id,
         target_type=target_type,
         take=take,
-        skip=0,
+        skip=int(skip),
     )
     data = result.get("Data")
     if not isinstance(data, dict):

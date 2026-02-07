@@ -95,7 +95,9 @@ class AgentConfig:
     include_self_wall: bool = True
     poll_interval_sec: float = 15.0
     take: int = 20
+    comment_scan_pages: int = 5
     bootstrap_lookback_sec: float = 600.0
+    dispatch_fast_poll_interval_sec: float = 0.2
     max_reply_chars: int = 2000
     dry_run: bool = False
     require_mention: bool = True
@@ -359,9 +361,20 @@ def parse_config(data: dict[str, Any], *, source: str) -> Config:
         agent_obj.get("poll_interval_sec"), where="agent.poll_interval_sec"
     )
     take = _optional_int(agent_obj.get("take"), where="agent.take")
+    comment_scan_pages = _optional_int(
+        agent_obj.get("comment_scan_pages"), where="agent.comment_scan_pages"
+    )
     bootstrap_lookback_sec = _optional_float(
         agent_obj.get("bootstrap_lookback_sec"), where="agent.bootstrap_lookback_sec"
     )
+    dispatch_fast_poll_interval_sec = _optional_float(
+        agent_obj.get("dispatch_fast_poll_interval_sec"),
+        where="agent.dispatch_fast_poll_interval_sec",
+    )
+    if comment_scan_pages is not None and comment_scan_pages <= 0:
+        raise ConfigError("agent.comment_scan_pages must be >= 1")
+    if dispatch_fast_poll_interval_sec is not None and dispatch_fast_poll_interval_sec <= 0:
+        raise ConfigError("agent.dispatch_fast_poll_interval_sec must be > 0")
     max_reply_chars = _optional_int(
         agent_obj.get("max_reply_chars"), where="agent.max_reply_chars"
     )
@@ -488,9 +501,15 @@ def parse_config(data: dict[str, Any], *, source: str) -> Config:
         if poll_interval_sec is not None
         else AgentConfig.poll_interval_sec,
         take=take if take is not None else AgentConfig.take,
+        comment_scan_pages=comment_scan_pages
+        if comment_scan_pages is not None
+        else AgentConfig.comment_scan_pages,
         bootstrap_lookback_sec=bootstrap_lookback_sec
         if bootstrap_lookback_sec is not None
         else AgentConfig.bootstrap_lookback_sec,
+        dispatch_fast_poll_interval_sec=dispatch_fast_poll_interval_sec
+        if dispatch_fast_poll_interval_sec is not None
+        else AgentConfig.dispatch_fast_poll_interval_sec,
         max_reply_chars=max_reply_chars
         if max_reply_chars is not None
         else AgentConfig.max_reply_chars,
@@ -638,7 +657,9 @@ def write_config(path: str, config: Config) -> None:
             "include_self_wall": config.agent.include_self_wall,
             "poll_interval_sec": config.agent.poll_interval_sec,
             "take": config.agent.take,
+            "comment_scan_pages": config.agent.comment_scan_pages,
             "bootstrap_lookback_sec": config.agent.bootstrap_lookback_sec,
+            "dispatch_fast_poll_interval_sec": config.agent.dispatch_fast_poll_interval_sec,
             "max_reply_chars": config.agent.max_reply_chars,
             "dry_run": config.agent.dry_run,
             "require_mention": config.agent.require_mention,

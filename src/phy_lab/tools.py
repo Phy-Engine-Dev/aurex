@@ -12,8 +12,6 @@ import uuid
 from dataclasses import dataclass
 from typing import Any
 
-import requests
-
 from ollama import OllamaClient
 from plsav import PlSavError, load_plsav_counts
 from pe_sim import PhyEngineLib, SeriesVdcResistorsSpec
@@ -33,6 +31,17 @@ from plar import (
     upload_sav_as_experiment,
 )
 from text import extract_fenced_code, truncate
+
+
+def _require_requests():
+    try:
+        import requests  # type: ignore
+    except ImportError as e:  # pragma: no cover
+        raise RuntimeError(
+            "Missing dependency: requests (required for web search features). "
+            "Install it with pip (e.g. 'pip install requests')."
+        ) from e
+    return requests
 
 
 def render_help(*, command_prefix: str) -> str:
@@ -129,11 +138,29 @@ def format_experiment_hits(hits: list[dict[str, Any]]) -> str:
 
 def llm_generate_verilog(*, ollama: OllamaClient, spec: str) -> str:
     prompt = (
-        "Generate synthesizable Verilog-2001 code for the following specification.\n"
-        "Rules:\n"
+        "Generate synthesizable Verilog-2001 (IEEE 1364-2001) code for the following specification.\n"
+        "The output must be compatible with Phy-Engine 'verilog2plsav' (a strict synthesizable subset).\n"
+        "\n"
+        "Hard compatibility constraints (very important):\n"
+        "- Verilog-2001 ONLY (no SystemVerilog).\n"
+        "- The top module MUST be named 'top'.\n"
+        "- Prefer a single module; if you use submodules, keep everything in one file.\n"
+        "- Do NOT use: logic, always_comb, always_ff, always_latch, enum, struct, typedef, interface, package, class.\n"
+        "- Do NOT use: inout ports, tri-states, multiple drivers on one net, wand/wor/tri, force/release.\n"
+        "- Do NOT use: initial blocks, delays (#), wait/fork/join, system tasks ($display/$monitor), file I/O.\n"
+        "- Do NOT use: memories/arrays (reg [..] mem [..]), multi-dimensional arrays, unpacked arrays.\n"
+        "- Avoid complex generate/for/while; if absolutely necessary, use ONLY constant-bounded unrolling.\n"
+        "- Keep arithmetic simple (prefer +, -, &, |, ^, ~, <<, >> with constant shifts). Avoid *, /, %, and variable shifts.\n"
+        "\n"
+        "Style constraints (recommended):\n"
+        "- Use 'wire' for combinational nets and 'reg' for always blocks.\n"
+        "- Combinational: use continuous 'assign' or 'always @(*)' with blocking '='.\n"
+        "- Sequential: use 'always @(posedge clk)' with nonblocking '<='.\n"
+        "- Keep ports and signals 1-D vectors only (e.g. [7:0]); avoid fancy packing.\n"
+        "\n"
+        "Output rules:\n"
         "- Output ONLY a single fenced code block.\n"
         "- The fenced block language tag must be 'verilog'.\n"
-        "- Include a clear top module.\n"
         "- Keep it minimal and correct.\n\n"
         f"Specification:\n{spec}\n"
     )
@@ -160,7 +187,16 @@ def llm_fix_verilog(
     prompt = (
         "The following Verilog failed to compile/export to a Physics Lab .sav.\n"
         "Fix the Verilog while preserving the original specification.\n\n"
-        "Rules:\n"
+        "Hard compatibility constraints (very important):\n"
+        "- Verilog-2001 ONLY (no SystemVerilog).\n"
+        "- The top module MUST be named 'top'.\n"
+        "- Do NOT use: logic, always_comb, always_ff, always_latch, enum, struct, typedef, interface, package, class.\n"
+        "- Do NOT use: inout ports, tri-states, multiple drivers on one net, wand/wor/tri, force/release.\n"
+        "- Do NOT use: initial blocks, delays (#), wait/fork/join, system tasks ($display/$monitor), file I/O.\n"
+        "- Do NOT use: memories/arrays (reg [..] mem [..]), multi-dimensional arrays, unpacked arrays.\n"
+        "- Avoid complex generate/for/while; if absolutely necessary, use ONLY constant-bounded unrolling.\n"
+        "- Keep arithmetic simple (prefer +, -, &, |, ^, ~, <<, >> with constant shifts). Avoid *, /, %, and variable shifts.\n\n"
+        "Output rules:\n"
         "- Output ONLY a single fenced code block.\n"
         "- The fenced block language tag must be 'verilog'.\n"
         "- Keep it synthesizable Verilog-2001.\n\n"
@@ -242,6 +278,182 @@ def _parse_series_vdc_2r_spec(text: str) -> SeriesVdcResistorsSpec | None:
         return None
 
     return SeriesVdcResistorsSpec(v_volts=v, r1_ohm=r_values[0], r2_ohm=r_values[1])
+
+
+_N_SAME_RES_RE = re.compile(
+    r"(?P<count>[0-9]{1,3})\s*(?:x|×|个)\s*(?P<value>[0-9]+(?:\.[0-9]+)?)\s*(?P<scale>[kKmM]?)\s*(?:ohm|Ω|欧姆|欧)\s*(?:电阻|resistors?)?",
+    re.IGNORECASE,
+)
+_N_RES_ONLY_RE = re.compile(r"(?P<count>[0-9]{1,3})\s*(?:个)?\s*(?:电阻|resistors?)", re.IGNORECASE)
+
+
+def _parse_series_vdc_n_resistors(text: str) -> tuple[float | None, list[float]]:
+    """Best-effort parse for series VDC + N resistors."""
+    text = (text or "").strip()
+    if not text:
+        return None, []
+
+    v = None
+    m = _KV_RE.search(text) or _VOLT_RE.search(text)
+    if m:
+        v = float(m.group("value"))
+
+    # Pattern: "3x4ohm resistors"
+    m2 = _N_SAME_RES_RE.search(text)
+    if m2:
+        count = int(m2.group("count"))
+        raw = float(m2.group("value"))
+        scale = (m2.group("scale") or "").lower()
+        mult = 1.0
+        if scale == "k":
+            mult = 1_000.0
+        elif scale == "m":
+            mult = 1_000_000.0
+        r = raw * mult
+        if count > 0:
+            return v, [r] * count
+
+    r_matches = list(_RES_RE.finditer(text))
+    r_values: list[float] = []
+    for rm in r_matches:
+        raw = float(rm.group("value"))
+        scale = (rm.group("scale") or "").lower()
+        mult = 1.0
+        if scale == "k":
+            mult = 1_000.0
+        elif scale == "m":
+            mult = 1_000_000.0
+        r_values.append(raw * mult)
+
+    # If only one R specified but count is mentioned, replicate.
+    if len(r_values) == 1:
+        m3 = _N_RES_ONLY_RE.search(text)
+        if m3:
+            count = int(m3.group("count"))
+            if count > 1:
+                r_values = [r_values[0]] * count
+
+    return v, r_values
+
+
+def simulate_series_vdc_resistors(
+    *,
+    text: str,
+    phy_engine_cfg: Any,
+    config_base_dir: str,
+) -> str:
+    lang_zh = _looks_like_zh(text)
+    v, rs = _parse_series_vdc_n_resistors(text)
+    if not rs:
+        return (
+            "To simulate a series circuit, include the number of resistors and their resistance.\n"
+            "Example: 'simulate V=5V 3x4ohm resistors in series with a VDC'."
+            if not lang_zh
+            else "要进行串联直流仿真，请写清电阻数量与阻值。\n例如：'仿真 V=5V 3个4Ω电阻 串联 VDC'。"
+        )
+    if v is None:
+        return (
+            "I can simulate it, but I need the VDC voltage value. Example: 'V=5V'."
+            if not lang_zh
+            else "我可以仿真，但需要你给出 VDC 的电压值，例如：'V=5V'。"
+        )
+
+    cmake_source_dir = _resolve_existing_path(
+        str(getattr(phy_engine_cfg, "cmake_source_dir", "")),
+        base_dir=config_base_dir,
+    )
+    cmake_build_dir = os.path.abspath(
+        os.path.join(config_base_dir, str(getattr(phy_engine_cfg, "cmake_build_dir", "")))
+    )
+    lib_cfg_path = _resolve_existing_path(
+        str(getattr(phy_engine_cfg, "phyengine_lib_path", "")),
+        base_dir=config_base_dir,
+    )
+    lib_path = ensure_phyengine_lib(
+        phyengine_lib_path=lib_cfg_path,
+        auto_build=bool(getattr(phy_engine_cfg, "auto_build", False)),
+        cmake_source_dir=cmake_source_dir,
+        cmake_build_dir=cmake_build_dir,
+        cmake_build_type=str(getattr(phy_engine_cfg, "cmake_build_type", "Release")),
+        build_timeout_sec=int(getattr(phy_engine_cfg, "build_timeout_sec", 900)),
+    )
+
+    pe = PhyEngineLib(lib_path)
+
+    # elements: 0=ground placeholder, 1=VDC, 2..=resistors
+    n = len(rs)
+    element_codes = [0, 4] + [1] * n
+    properties = [float(v)] + [float(r) for r in rs]
+
+    wires: list[int] = []
+    if n >= 1:
+        # VDC(+) -> R1
+        wires.extend([1, 0, 2, 0])
+        # Chain resistors
+        for i in range(0, n - 1):
+            a = 2 + i
+            b = 2 + i + 1
+            wires.extend([a, 1, b, 0])
+        # Rn -> VDC(-)
+        wires.extend([2 + (n - 1), 1, 1, 1])
+    # Tie VDC(-) to ground
+    wires.extend([1, 1, 0, 0])
+
+    circuit, vec_pos, chunk_pos, comp_size = pe.create_circuit(
+        element_codes=element_codes,
+        wires=wires,
+        properties=properties,
+    )
+    try:
+        pe.set_analyze_type(circuit=circuit, analyze_type=1)
+        pe.analyze(circuit=circuit)
+        voltage, voltage_ord, current, current_ord, _digital, _digital_ord = pe.sample(
+            circuit=circuit,
+            vec_pos=vec_pos,
+            chunk_pos=chunk_pos,
+            comp_size=comp_size,
+            max_pins_per_comp=8,
+            max_branches_per_comp=4,
+        )
+    finally:
+        pe.destroy_circuit(circuit=circuit, vec_pos=vec_pos, chunk_pos=chunk_pos)
+
+    # comp order: VDC(0), R1(1), R2(2)...
+    i_r1 = 0.0
+    if comp_size >= 2 and (current_ord[2] - current_ord[1]) >= 1:
+        i_r1 = float(current[current_ord[1] + 0])
+    i = abs(i_r1) if i_r1 != 0.0 else abs(float(v) / sum(rs))
+    r_total = float(sum(rs))
+    i_ma = i * 1000.0
+
+    lines: list[str] = []
+    if lang_zh:
+        lines.append("直流仿真（VDC + 多个电阻串联）:")
+        lines.append(f"- R_total = {r_total:.6g} Ω")
+        lines.append(f"- I ≈ {i:.6g} A ({i_ma:.6g} mA)")
+    else:
+        lines.append("DC simulation (VDC + N resistors in series):")
+        lines.append(f"- R_total = {r_total:.6g} Ω")
+        lines.append(f"- I ≈ {i:.6g} A ({i_ma:.6g} mA)")
+
+    # Per-resistor voltage drops (best-effort, using first 2 pins).
+    for idx, r in enumerate(rs, start=1):
+        comp = idx  # R1 comp_index=1
+        if comp + 1 >= len(voltage_ord):
+            break
+        pin0 = voltage_ord[comp]
+        pin1 = voltage_ord[comp + 1]
+        if (pin1 - pin0) < 2:
+            continue
+        v0 = float(voltage[pin0 + 0])
+        v1 = float(voltage[pin0 + 1])
+        vdrop = abs(v0 - v1)
+        if lang_zh:
+            lines.append(f"- R{idx}={float(r):.6g}Ω, V_drop≈{vdrop:.6g}V")
+        else:
+            lines.append(f"- R{idx}={float(r):.6g}Ω, V_drop≈{vdrop:.6g}V")
+
+    return "\n".join(lines)
 
 
 def simulate_series_vdc_two_resistors(
@@ -562,6 +774,7 @@ def web_search_google(
                 "(KHTML, like Gecko) Chrome/120.0 Safari/537.36"
             )
         }
+        requests = _require_requests()
         r = requests.get(url, headers=headers, timeout=float(timeout_sec), proxies=proxies)
         r.raise_for_status()
         cached = r.text
@@ -658,6 +871,7 @@ def web_search_duckduckgo(
                 "(KHTML, like Gecko) Chrome/120.0 Safari/537.36"
             )
         }
+        requests = _require_requests()
         r = requests.get(url, headers=headers, timeout=float(timeout_sec), proxies=proxies)
         r.raise_for_status()
         cached = r.text
@@ -831,6 +1045,7 @@ def web_search_baidu(
                 "(KHTML, like Gecko) Chrome/120.0 Safari/537.36"
             )
         }
+        requests = _require_requests()
         r = requests.get(url, headers=headers, timeout=float(timeout_sec), proxies=proxies)
         r.raise_for_status()
         cached = r.text
@@ -963,7 +1178,7 @@ def build_and_maybe_publish_circuit(
                     verilog2plsav_bin=verilog2plsav_bin,
                     out_sav_path=out_sav,
                     in_verilog_path=in_v,
-                    options=Verilog2PlSavOptions(top=None, extra_args=extra_args_list or None),
+                    options=Verilog2PlSavOptions(top="top", extra_args=extra_args_list or None),
                     timeout_sec=int(getattr(phy_engine_cfg, "run_timeout_sec", 300)),
                 )
                 last_error = None

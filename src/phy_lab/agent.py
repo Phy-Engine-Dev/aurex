@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import getpass
 import hashlib
 import json
@@ -9,8 +10,10 @@ import os
 import re
 import shutil
 import sys
+import threading
 import time
 from logging.handlers import RotatingFileHandler
+from queue import Empty, Queue
 from typing import Any
 
 THIS_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -73,10 +76,70 @@ from tools import (  # noqa: E402
     render_help,
     safe_reply,
     search_recent_experiments,
+    simulate_series_vdc_resistors,
     simulate_series_vdc_two_resistors,
     simulate_status_save_with_phyengine,
     web_search,
 )
+
+
+@dataclasses.dataclass(frozen=True)
+class _WorkItem:
+    target: TargetConfig
+    comment: dict[str, Any]
+    comment_key: str
+    comment_ts_ms: int
+
+
+class _PendingTracker:
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._by_target: dict[str, dict[str, int]] = {}
+
+    def has(self, target_key: str, comment_key: str) -> bool:
+        with self._lock:
+            return comment_key in self._by_target.get(target_key, {})
+
+    def add(self, target_key: str, comment_key: str, ts_ms: int) -> None:
+        with self._lock:
+            if target_key not in self._by_target:
+                self._by_target[target_key] = {}
+            self._by_target[target_key][comment_key] = int(ts_ms)
+
+    def remove(self, target_key: str, comment_key: str) -> None:
+        with self._lock:
+            m = self._by_target.get(target_key)
+            if not m:
+                return
+            m.pop(comment_key, None)
+            if not m:
+                self._by_target.pop(target_key, None)
+
+    def min_ts(self, target_key: str) -> int | None:
+        with self._lock:
+            m = self._by_target.get(target_key)
+            if not m:
+                return None
+            return min(m.values()) if m else None
+
+
+class _LockedUser:
+    """Serialize access to the PhysicsLab user/session object across threads."""
+
+    def __init__(self, user: Any, lock: threading.RLock):
+        self._user = user
+        self._lock = lock
+
+    def __getattr__(self, name: str) -> Any:  # pragma: no cover (thin proxy)
+        attr = getattr(self._user, name)
+        if not callable(attr):
+            return attr
+
+        def wrapped(*args: Any, **kwargs: Any) -> Any:
+            with self._lock:
+                return attr(*args, **kwargs)
+
+        return wrapped
 
 
 def _safe_at_mention(handle: str) -> str | None:
@@ -709,7 +772,7 @@ def _handle_comment(
                         except Exception as e:
                             logger.info("StatusSave simulation failed; falling back to demo: %s", e)
                     try:
-                        reply = simulate_series_vdc_two_resistors(
+                        reply = simulate_series_vdc_resistors(
                             text=sim_text,
                             phy_engine_cfg=cfg.phy_engine,
                             config_base_dir=config_base_dir,
@@ -787,7 +850,7 @@ def _handle_comment(
                         )
                     return safe_reply(
                         "Done. I generated Verilog and compiled a .sav with -O4 and '--layout hier'.\n"
-                        (
+                        + (
                             "Publishing is disabled (or dry-run). Enable publishing in config."
                             if not bool(cfg.agent.enable_publish)
                             else (
@@ -828,7 +891,7 @@ def _handle_comment(
                         except Exception as e:
                             logger.info("Fallback simulation failed: %s", e)
                     try:
-                        reply = simulate_series_vdc_two_resistors(
+                        reply = simulate_series_vdc_resistors(
                             text=arg,
                             phy_engine_cfg=cfg.phy_engine,
                             config_base_dir=config_base_dir,
@@ -908,7 +971,7 @@ def _handle_comment(
                         )
                     return safe_reply(
                         "Done. I generated Verilog and compiled a .sav with -O4 and '--layout hier'.\n"
-                        (
+                        + (
                             "Publishing is disabled (or dry-run). Enable publishing in config."
                             if not bool(cfg.agent.enable_publish)
                             else (
@@ -1101,7 +1164,7 @@ def _handle_comment(
     if cmd in ("simulate", "sim"):
         logger.debug("Tool simulate invoked (len=%d)", len(arg))
         try:
-            reply = simulate_series_vdc_two_resistors(
+            reply = simulate_series_vdc_resistors(
                 text=arg or text,
                 phy_engine_cfg=cfg.phy_engine,
                 config_base_dir=config_base_dir,
@@ -1399,6 +1462,221 @@ def _process_target(
     prune_processed_keys(target_state, keep_last=500)
 
 
+def _bootstrap_last_seen(
+    *,
+    target_state: Any,
+    cfg: Any,
+    logger: logging.Logger,
+    target_key: str,
+) -> None:
+    if int(getattr(target_state, "last_seen_timestamp_ms", 0) or 0) != 0:
+        return
+    lookback_sec = float(getattr(cfg.agent, "bootstrap_lookback_sec", 0.0) or 0.0)
+    if lookback_sec <= 0:
+        return
+    target_state.last_seen_timestamp_ms = max(
+        0, int(time.time() * 1000) - int(lookback_sec * 1000)
+    )
+    logger.info(
+        "[%s] Bootstrapping last_seen to %d (lookback_sec=%.1f)",
+        target_key,
+        target_state.last_seen_timestamp_ms,
+        lookback_sec,
+    )
+
+
+def _update_last_seen_capped(
+    *,
+    target_state: Any,
+    ts_ms: int,
+    pending_min_ts_ms: int | None,
+) -> None:
+    cur = int(getattr(target_state, "last_seen_timestamp_ms", 0) or 0)
+    ts_ms = int(ts_ms)
+    candidate = max(cur, ts_ms)
+    if isinstance(pending_min_ts_ms, int) and pending_min_ts_ms > 0 and candidate >= pending_min_ts_ms:
+        cap = max(cur, pending_min_ts_ms - 1)
+        candidate = min(candidate, cap)
+    target_state.last_seen_timestamp_ms = candidate
+
+
+def _fetch_comments_paged(
+    *,
+    user: Any,
+    target: TargetConfig,
+    take: int,
+    last_seen_ms: int,
+    max_pages: int,
+    logger: logging.Logger,
+) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    skip = 0
+    for _ in range(max(1, int(max_pages))):
+        try:
+            page = get_comments(
+                user,
+                target_id=target.id,
+                target_type=target.type,
+                take=int(take),
+                skip=int(skip),
+            )
+        except Exception as e:
+            logger.warning("[%s:%s] Fetch comments failed (skip=%d take=%d): %s", target.type, target.id, skip, take, e)
+            break
+        if not page:
+            break
+
+        min_ts = None
+        for c in page:
+            if not isinstance(c, dict):
+                continue
+            k = _comment_key(c)
+            if k in seen:
+                continue
+            seen.add(k)
+            out.append(c)
+            ts = _comment_timestamp_ms(c)
+            if isinstance(ts, int):
+                min_ts = ts if min_ts is None else min(min_ts, ts)
+
+        if last_seen_ms > 0 and isinstance(min_ts, int) and min_ts <= last_seen_ms:
+            break
+        skip += int(take)
+
+    return out
+
+
+def _scan_and_enqueue(
+    *,
+    user: Any,
+    target: TargetConfig,
+    state: AgentState,
+    state_lock: threading.RLock,
+    cfg: Any,
+    pending: _PendingTracker,
+    work_q: "Queue[_WorkItem]",
+    max_enqueue: int,
+    logger: logging.Logger,
+) -> int:
+    target_key = f"{target.type}:{target.id}"
+    take = int(getattr(cfg.agent, "take", 20) or 20)
+    max_pages = int(getattr(cfg.agent, "comment_scan_pages", 5) or 5)
+    with state_lock:
+        target_state = get_target_state(state, target_key)
+        _bootstrap_last_seen(
+            target_state=target_state, cfg=cfg, logger=logger, target_key=target_key
+        )
+        last_seen_ms = int(target_state.last_seen_timestamp_ms)
+
+    comments = _fetch_comments_paged(
+        user=user,
+        target=target,
+        take=take,
+        last_seen_ms=last_seen_ms,
+        max_pages=max_pages,
+        logger=logger,
+    )
+    if not comments:
+        return 0
+
+    # Process in chronological order to keep behavior stable.
+    comments = [c for c in comments if isinstance(c, dict)]
+    comments.sort(key=lambda c: _comment_timestamp_ms(c) or 0)
+
+    enq = 0
+
+    with state_lock:
+        target_state = get_target_state(state, target_key)
+        processed = set(target_state.processed_comment_keys)
+
+    for comment in comments:
+        if enq >= max_enqueue:
+            break
+
+        ts = _comment_timestamp_ms(comment)
+        if not isinstance(ts, int):
+            continue
+        key = _comment_key(comment)
+        if not key:
+            continue
+
+        if pending.has(target_key, key):
+            continue
+
+        if key in processed:
+            with state_lock:
+                target_state = get_target_state(state, target_key)
+                _update_last_seen_capped(
+                    target_state=target_state,
+                    ts_ms=ts,
+                    pending_min_ts_ms=pending.min_ts(target_key),
+                )
+            continue
+
+        author_id, nickname = _comment_author(comment)
+        if author_id is not None and getattr(user, "user_id", None) == author_id:
+            with state_lock:
+                target_state = get_target_state(state, target_key)
+                target_state.processed_comment_keys.append(key)
+                processed.add(key)
+                _update_last_seen_capped(
+                    target_state=target_state,
+                    ts_ms=ts,
+                    pending_min_ts_ms=pending.min_ts(target_key),
+                )
+            continue
+
+        content = _comment_content(comment) or ""
+        reply_id = None
+        for rk in ("ReplyID", "ReplyId", "ReplyUserID", "ReplyUserId"):
+            rv = comment.get(rk)
+            if isinstance(rv, str) and rv.strip():
+                reply_id = rv.strip()
+                break
+        reply_to_self = bool(
+            reply_id
+            and isinstance(getattr(user, "user_id", None), str)
+            and reply_id == getattr(user, "user_id", None)
+        )
+
+        effective_require_mention = cfg.agent.require_mention
+        if target.type == "User":
+            effective_require_mention = bool(cfg.agent.user_targets_require_mention)
+
+        triggered = _should_trigger(
+            text=content,
+            require_mention=effective_require_mention,
+            mention_tag=cfg.agent.mention_tag,
+            command_prefix=cfg.agent.command_prefix,
+            commands_enabled=cfg.agent.commands_enabled,
+            reply_to_self=reply_to_self,
+        )
+        if not triggered:
+            with state_lock:
+                target_state = get_target_state(state, target_key)
+                target_state.processed_comment_keys.append(key)
+                processed.add(key)
+                _update_last_seen_capped(
+                    target_state=target_state,
+                    ts_ms=ts,
+                    pending_min_ts_ms=pending.min_ts(target_key),
+                )
+            continue
+
+        # Reserve this comment for a worker.
+        pending.add(target_key, key, ts)
+        work_q.put(
+            _WorkItem(target=target, comment=comment, comment_key=key, comment_ts_ms=ts)
+        )
+        enq += 1
+
+    with state_lock:
+        target_state = get_target_state(state, target_key)
+        prune_processed_keys(target_state, keep_last=500)
+    return enq
+
+
 def _message_timestamp_ms(message: dict[str, Any]) -> int | None:
     ts = message.get("Timestamp")
     return ts if isinstance(ts, int) else None
@@ -1611,15 +1889,12 @@ def _process_notifications(
     *,
     user: Any,
     state: AgentState,
+    state_lock: threading.RLock,
     cfg: Any,
-    cache_dir: str,
-    config_base_dir: str,
-    dry_run: bool,
     logger: logging.Logger,
-    ollama: OllamaClient,
-) -> None:
+) -> list[TargetConfig]:
     if not getattr(cfg.agent, "notifications_enabled", True):
-        return
+        return []
     category_ids = list(getattr(cfg.agent, "notification_category_ids", [3]) or [3])
     take = int(getattr(cfg.agent, "notification_take", 20) or 20)
 
@@ -1627,19 +1902,20 @@ def _process_notifications(
 
     for cat in category_ids:
         msg_target_key = f"Messages:{int(cat)}"
-        msg_state = get_target_state(state, msg_target_key)
-        if msg_state.last_seen_timestamp_ms == 0:
-            lookback_sec = float(getattr(cfg.agent, "bootstrap_lookback_sec", 0.0) or 0.0)
-            if lookback_sec > 0:
-                msg_state.last_seen_timestamp_ms = max(
-                    0, int(time.time() * 1000) - int(lookback_sec * 1000)
-                )
-                logger.info(
-                    "[%s] Bootstrapping last_seen to %d (lookback_sec=%.1f)",
-                    msg_target_key,
-                    msg_state.last_seen_timestamp_ms,
-                    lookback_sec,
-                )
+        with state_lock:
+            msg_state = get_target_state(state, msg_target_key)
+            if msg_state.last_seen_timestamp_ms == 0:
+                lookback_sec = float(getattr(cfg.agent, "bootstrap_lookback_sec", 0.0) or 0.0)
+                if lookback_sec > 0:
+                    msg_state.last_seen_timestamp_ms = max(
+                        0, int(time.time() * 1000) - int(lookback_sec * 1000)
+                    )
+                    logger.info(
+                        "[%s] Bootstrapping last_seen to %d (lookback_sec=%.1f)",
+                        msg_target_key,
+                        msg_state.last_seen_timestamp_ms,
+                        lookback_sec,
+                    )
 
         try:
             messages, templates = get_messages(
@@ -1676,14 +1952,18 @@ def _process_notifications(
                 new_msgs.append(m)
         new_msgs.sort(key=lambda m: _message_timestamp_ms(m) or 0)
 
-        processed = set(msg_state.processed_comment_keys)
+        with state_lock:
+            msg_state = get_target_state(state, msg_target_key)
+            processed = set(msg_state.processed_comment_keys)
         for m in new_msgs:
             ts = _message_timestamp_ms(m)
             if ts is None:
                 continue
             key = _message_key(m)
             if key in processed:
-                msg_state.last_seen_timestamp_ms = max(msg_state.last_seen_timestamp_ms, ts)
+                with state_lock:
+                    msg_state = get_target_state(state, msg_target_key)
+                    msg_state.last_seen_timestamp_ms = max(msg_state.last_seen_timestamp_ms, ts)
                 continue
 
             tmpl_id = m.get("TemplateID") or m.get("TemplateId")
@@ -1720,28 +2000,248 @@ def _process_notifications(
             for t0 in candidates:
                 discovered[f"{t0.type}:{t0.id}"] = t0
 
-            msg_state.processed_comment_keys.append(key)
-            processed.add(key)
-            msg_state.last_seen_timestamp_ms = max(msg_state.last_seen_timestamp_ms, ts)
+            with state_lock:
+                msg_state = get_target_state(state, msg_target_key)
+                msg_state.processed_comment_keys.append(key)
+                processed.add(key)
+                msg_state.last_seen_timestamp_ms = max(msg_state.last_seen_timestamp_ms, ts)
 
-        prune_processed_keys(msg_state, keep_last=500)
+        with state_lock:
+            msg_state = get_target_state(state, msg_target_key)
+            prune_processed_keys(msg_state, keep_last=500)
 
     if not discovered:
-        return
+        return []
 
     logger.info("Discovered %d targets from notifications", len(discovered))
-    for t in discovered.values():
-        _process_target(
-            user=user,
-            target=t,
-            state=state,
-            ollama=ollama,
-            cfg=cfg,
-            cache_dir=cache_dir,
-            config_base_dir=config_base_dir,
-            dry_run=dry_run,
-            logger=logger,
+    return list(discovered.values())
+
+
+def _process_work_item(
+    *,
+    user: Any,
+    item: _WorkItem,
+    state: AgentState,
+    state_path: str,
+    state_lock: threading.RLock,
+    pending: _PendingTracker,
+    cfg: Any,
+    cache_dir: str,
+    config_base_dir: str,
+    dry_run: bool,
+    logger: logging.Logger,
+    ollama: Any,
+) -> None:
+    target = item.target
+    comment = item.comment
+    key = item.comment_key
+    ts = int(item.comment_ts_ms)
+    target_key = f"{target.type}:{target.id}"
+
+    author_id, nickname = _comment_author(comment)
+    if author_id is not None and getattr(user, "user_id", None) == author_id:
+        pending.remove(target_key, key)
+        return
+
+    content = _comment_content(comment) or ""
+
+    now_ms = int(time.time() * 1000)
+    if bool(getattr(cfg.agent, "overload_protection_enabled", True)):
+        window_ms = int(getattr(cfg.agent, "overload_window_sec", 600) or 600) * 1000
+        max_req = int(getattr(cfg.agent, "overload_max_requests", 40) or 40)
+        with state_lock:
+            recent_n = count_recent_requests(state, now_ms=now_ms, window_ms=window_ms)
+        if max_req > 0 and recent_n >= max_req:
+            busy_msg = str(getattr(cfg.agent, "overload_message_en", "") or "").strip()
+            if not busy_msg:
+                busy_msg = "Too many requests at the moment, please try again later."
+            prefix = safe_mention_prefix(nickname) if nickname else None
+            post_body = f"{prefix or ''}{busy_msg}".strip()
+            if dry_run:
+                logger.info("[%s] DRY RUN busy reply: %s", target_key, post_body)
+            else:
+                post_comment(
+                    user,
+                    target_id=target.id,
+                    target_type=target.type,
+                    content=post_body,
+                    reply_id=author_id,
+                )
+                logger.info("[%s] Busy reply posted", target_key)
+
+            with state_lock:
+                record_request_timestamp(state, ts_ms=now_ms)
+                target_state = get_target_state(state, target_key)
+                target_state.processed_comment_keys.append(key)
+                _update_last_seen_capped(
+                    target_state=target_state,
+                    ts_ms=ts,
+                    pending_min_ts_ms=pending.min_ts(target_key),
+                )
+                prune_processed_keys(target_state, keep_last=500)
+                pending.remove(target_key, key)
+                save_state(state_path, state)
+            return
+
+    conversation_key = None
+    if isinstance(author_id, str) and author_id.strip():
+        conversation_key = f"{target_key}|{author_id.strip()}"
+    with state_lock:
+        history = (
+            get_conversation_history(state, key=conversation_key, max_turns=12)
+            if conversation_key
+            else []
         )
+
+    experiment_context: dict[str, Any] | None = None
+    if target.type in ("Experiment", "Discussion"):
+        try:
+            comments = get_comments(
+                user,
+                target_id=target.id,
+                target_type=target.type,
+                take=int(getattr(cfg.agent, "take", 20) or 20),
+                skip=0,
+            )
+        except Exception:
+            comments = []
+        try:
+            experiment_context = get_experiment_context(
+                user,
+                summary_id=target.id,
+                category_value="Experiment" if target.type == "Experiment" else "Discussion",
+                cache_dir=cache_dir,
+                ttl_sec=300,
+                max_json_chars=20_000,
+            )
+            experiment_context = dict(experiment_context)
+            experiment_context["recent_comments"] = _recent_comments_context(comments, limit=8)
+        except Exception as e:
+            logger.debug("[%s] Failed to load experiment context: %s", target_key, e)
+
+    reply = _handle_comment(
+        comment=comment,
+        user=user,
+        ollama=ollama,
+        cache_dir=cache_dir,
+        config_base_dir=config_base_dir,
+        cfg=cfg,
+        dry_run=dry_run,
+        logger=logger,
+        conversation_key=conversation_key,
+        experiment_context=experiment_context,
+        history=history,
+    )
+
+    with state_lock:
+        record_request_timestamp(state, ts_ms=now_ms)
+
+    if reply:
+        prefix = safe_mention_prefix(nickname) if nickname else None
+        post_body = f"{prefix or ''}{reply}".strip()
+        if dry_run:
+            logger.info("[%s] DRY RUN reply: %s", target_key, post_body)
+        else:
+            post_comment(
+                user,
+                target_id=target.id,
+                target_type=target.type,
+                content=post_body,
+                reply_id=author_id,
+            )
+            logger.info("[%s] Replied to %s", target_key, nickname or author_id or "unknown")
+
+    with state_lock:
+        if conversation_key:
+            user_text = strip_leading_mention(content, mention_tag=cfg.agent.mention_tag)
+            normalized_user_turn = user_text
+            if cfg.agent.commands_enabled:
+                cmd_name, cmd_arg = parse_command(user_text, prefix=cfg.agent.command_prefix)
+                normalized_user_turn = cmd_arg if cmd_name is not None else user_text
+            append_conversation_turn(
+                state,
+                key=conversation_key,
+                role="user",
+                content=normalized_user_turn,
+                ts_ms=ts,
+                keep_last=20,
+            )
+            if reply:
+                append_conversation_turn(
+                    state,
+                    key=conversation_key,
+                    role="assistant",
+                    content=reply,
+                    ts_ms=int(time.time() * 1000),
+                    keep_last=20,
+                )
+
+        target_state = get_target_state(state, target_key)
+        target_state.processed_comment_keys.append(key)
+        _update_last_seen_capped(
+            target_state=target_state,
+            ts_ms=ts,
+            pending_min_ts_ms=pending.min_ts(target_key),
+        )
+        prune_processed_keys(target_state, keep_last=500)
+        pending.remove(target_key, key)
+        save_state(state_path, state)
+
+
+def _worker_loop(
+    *,
+    worker_id: int,
+    user: Any,
+    work_q: "Queue[_WorkItem]",
+    capacity: threading.BoundedSemaphore,
+    stop_event: threading.Event,
+    state: AgentState,
+    state_path: str,
+    state_lock: threading.RLock,
+    pending: _PendingTracker,
+    cfg: Any,
+    cache_dir: str,
+    config_base_dir: str,
+    dry_run: bool,
+    logger: logging.Logger,
+    ollama: Any,
+) -> None:
+    while not stop_event.is_set():
+        try:
+            item = work_q.get(timeout=0.5)
+        except Empty:
+            continue
+
+        try:
+            logger.info(
+                "[worker-%d] Start %s comment=%s ts=%d",
+                worker_id,
+                f"{item.target.type}:{item.target.id}",
+                item.comment_key,
+                int(item.comment_ts_ms),
+            )
+            _process_work_item(
+                user=user,
+                item=item,
+                state=state,
+                state_path=state_path,
+                state_lock=state_lock,
+                pending=pending,
+                cfg=cfg,
+                cache_dir=cache_dir,
+                config_base_dir=config_base_dir,
+                dry_run=dry_run,
+                logger=logger,
+                ollama=ollama,
+            )
+            logger.info("[worker-%d] Done %s", worker_id, item.comment_key)
+        except Exception as e:
+            # On failure, drop from pending so it can be re-queued later.
+            pending.remove(f"{item.target.type}:{item.target.id}", item.comment_key)
+            logger.warning("[worker-%d] Failed %s: %s", worker_id, item.comment_key, e)
+        finally:
+            work_q.task_done()
+            capacity.release()
 
 
 def _cmd_run(args: argparse.Namespace) -> int:
@@ -1849,6 +2349,12 @@ def _cmd_run(args: argparse.Namespace) -> int:
     max_parallel = int(getattr(cfg.ollama, "max_parallel_requests", 1) or 1)
     if max_parallel < 1:
         max_parallel = 1
+
+    user_lock = threading.RLock()
+    locked_user = _LockedUser(user, user_lock)
+    state_lock = threading.RLock()
+    pending = _PendingTracker()
+
     clients: list[OllamaClient] = []
     for i in range(max_parallel):
         url = str(endpoints[i % len(endpoints)]).strip() if endpoints else cfg.ollama.base_url
@@ -1863,12 +2369,11 @@ def _cmd_run(args: argparse.Namespace) -> int:
                 num_predict=int(getattr(cfg.ollama, "num_predict", 2048) or 2048),
             )
         )
-    ollama: Any = OllamaPool(clients) if len(clients) > 1 else clients[0]
 
     logger.info("Targets: %s", format_targets(targets))
     if len(clients) > 1:
         logger.info(
-            "Ollama pool: endpoints=%s model=%s max_parallel=%d",
+            "Ollama workers: endpoints=%s model=%s max_parallel=%d",
             ", ".join(sorted(set(endpoints))),
             cfg.ollama.model,
             max_parallel,
@@ -1886,41 +2391,148 @@ def _cmd_run(args: argparse.Namespace) -> int:
     logger.info("Agent is running. Press Ctrl-C to stop.")
 
     try:
-        while True:
-            logger.debug("Polling cycle start")
-            for target in targets:
-                _process_target(
-                    user=user,
-                    target=target,
+        if len(clients) <= 1:
+            # Legacy single-worker polling loop (kept for simplicity).
+            ollama = clients[0]
+            while True:
+                logger.debug("Polling cycle start")
+                for target in targets:
+                    _process_target(
+                        user=locked_user,
+                        target=target,
+                        state=state,
+                        ollama=ollama,
+                        cfg=cfg,
+                        cache_dir=cache_dir,
+                        config_base_dir=base_dir,
+                        dry_run=dry_run,
+                        logger=logger,
+                    )
+                discovered = _process_notifications(
+                    user=locked_user,
                     state=state,
-                    ollama=ollama,
+                    state_lock=state_lock,
                     cfg=cfg,
-                    cache_dir=cache_dir,
-                    config_base_dir=base_dir,
-                    dry_run=dry_run,
                     logger=logger,
                 )
-            _process_notifications(
-                user=user,
+                for t in discovered:
+                    if f"{t.type}:{t.id}" not in {f"{x.type}:{x.id}" for x in targets}:
+                        targets.append(t)
+                logger.debug("Polling cycle end")
+
+                try:
+                    save_state(state_path, state)
+                except OSError as e:
+                    logger.warning("Failed to save state to %s: %s", state_path, e)
+
+                if args.once:
+                    return 0
+                time.sleep(cfg.agent.poll_interval_sec)
+
+        # Dispatch mode: poll only when at least one worker is available; enqueue work and process in parallel.
+        capacity = threading.BoundedSemaphore(len(clients))
+        work_q: "Queue[_WorkItem]" = Queue(maxsize=len(clients))
+        stop_event = threading.Event()
+
+        workers: list[threading.Thread] = []
+        for idx, c in enumerate(clients, start=1):
+            t = threading.Thread(
+                target=_worker_loop,
+                kwargs={
+                    "worker_id": idx,
+                    "user": locked_user,
+                    "work_q": work_q,
+                    "capacity": capacity,
+                    "stop_event": stop_event,
+                    "state": state,
+                    "state_path": state_path,
+                    "state_lock": state_lock,
+                    "pending": pending,
+                    "cfg": cfg,
+                    "cache_dir": cache_dir,
+                    "config_base_dir": base_dir,
+                    "dry_run": dry_run,
+                    "logger": logger,
+                    "ollama": c,
+                },
+                daemon=True,
+            )
+            t.start()
+            workers.append(t)
+
+        fast_poll_sec = float(getattr(cfg.agent, "dispatch_fast_poll_interval_sec", 1.0) or 1.0)
+        if fast_poll_sec <= 0:
+            fast_poll_sec = 1.0
+
+        targets_by_key: dict[str, TargetConfig] = {f"{t.type}:{t.id}": t for t in targets}
+
+        while True:
+            # Block until at least one worker slot is free, then reserve it.
+            reserved = 0
+            while reserved < len(clients) and capacity.acquire(blocking=False):
+                reserved += 1
+            if reserved == 0:
+                capacity.acquire()
+                reserved = 1
+
+            enqueued = 0
+            logger.debug("Dispatch poll start (reserved=%d queue=%d)", reserved, work_q.qsize())
+
+            discovered = _process_notifications(
+                user=locked_user,
                 state=state,
-                ollama=ollama,
+                state_lock=state_lock,
                 cfg=cfg,
-                cache_dir=cache_dir,
-                config_base_dir=base_dir,
-                dry_run=dry_run,
                 logger=logger,
             )
-            logger.debug("Polling cycle end")
+            for t in discovered:
+                k = f"{t.type}:{t.id}"
+                if k not in targets_by_key:
+                    targets_by_key[k] = t
+                    logger.info("Added target from notifications: %s", k)
 
-            try:
-                save_state(state_path, state)
-            except OSError as e:
-                logger.warning("Failed to save state to %s: %s", state_path, e)
+            for t in list(targets_by_key.values()):
+                if enqueued >= reserved:
+                    break
+                enqueued += _scan_and_enqueue(
+                    user=locked_user,
+                    target=t,
+                    state=state,
+                    state_lock=state_lock,
+                    cfg=cfg,
+                    pending=pending,
+                    work_q=work_q,
+                    max_enqueue=reserved - enqueued,
+                    logger=logger,
+                )
+
+            # Release unused reserved slots.
+            for _ in range(max(0, reserved - enqueued)):
+                capacity.release()
+
+            logger.debug("Dispatch poll end (enqueued=%d)", enqueued)
+
+            with state_lock:
+                try:
+                    save_state(state_path, state)
+                except OSError as e:
+                    logger.warning("Failed to save state to %s: %s", state_path, e)
 
             if args.once:
+                # Wait for queued work to finish, then exit.
+                while not work_q.empty():
+                    time.sleep(0.1)
                 return 0
-            time.sleep(cfg.agent.poll_interval_sec)
+
+            # If we didn't enqueue anything, avoid hammering the server.
+            if enqueued == 0:
+                time.sleep(fast_poll_sec)
     except KeyboardInterrupt:
+        logger.info("Stopping...")
+        try:
+            stop_event.set()  # type: ignore[name-defined]
+        except Exception:
+            pass
         logger.info("Stopped.")
         return 0
 
