@@ -220,6 +220,82 @@ def llm_build_pe_sim_spec_json(
     ).strip()
 
 
+def llm_fix_pe_sim_spec_json(
+    *,
+    ollama: OllamaClient,
+    user_text: str,
+    context_json: dict[str, Any] | None,
+    max_components: int,
+    max_probes: int,
+    prior_json: str,
+    error_text: str,
+) -> str:
+    """Ask the LLM to fix a previously invalid JSON spec."""
+    context_blob = ""
+    if context_json is not None:
+        context_blob = (
+            "Context JSON (current page):\n"
+            + json.dumps(context_json, ensure_ascii=False, indent=2)
+            + "\n\n"
+        )
+    prompt = (
+        "You previously produced a JSON specification for a Phy-Engine circuit simulation, but it failed validation.\n"
+        "Fix the JSON so it passes the validator.\n"
+        "\n"
+        "You MUST follow this JSON schema exactly:\n"
+        "{\n"
+        '  "analysis": {\n'
+        '    "type": "dc" | "ac" | "tr",\n'
+        '    "ac_omega_rad_s": number | null,\n'
+        '    "tr_t_step_s": number | null,\n'
+        '    "tr_t_stop_s": number | null\n'
+        "  },\n"
+        '  "components": [\n'
+        "    {\n"
+        '      "id": "R1",\n'
+        '      "type": "resistor" | "capacitor" | "inductor" | "vdc" | "idc" | "vac" | "iac",\n'
+        '      "nodes": ["n1", "n2"],\n'
+        '      "params": { "r_ohm"/"c_f"/"l_h"/"v_v"/"i_a"/("vp_v","freq_hz","phase_deg") : number }\n'
+        "    }\n"
+        "  ],\n"
+        '  "probes": [\n'
+        "    {\"kind\":\"node_voltage\"|\"component_current\"|\"component_vdrop\",\"target\":\"...\"}\n"
+        "  ]\n"
+        "}\n"
+        "\n"
+        "Hard constraints:\n"
+        f"- components.length MUST be between 1 and {int(max_components)}.\n"
+        f"- probes.length MUST be between 0 and {int(max_probes)}.\n"
+        "- Every component must be a 2-terminal element (nodes length exactly 2).\n"
+        "- You MUST include a ground node named exactly 'gnd'.\n"
+        "- Use simple node names like: gnd, n1, n2, vin, vout.\n"
+        "- Use SI units (Ohm, Farad, Henry, Volt, Ampere).\n"
+        "\n"
+        "Output rules:\n"
+        "- Output ONLY valid JSON (no markdown, no comments).\n"
+        "- Do NOT include any extra keys.\n"
+        "\n"
+        + context_blob
+        + "User request:\n"
+        + user_text.strip()
+        + "\n\n"
+        + "Validator error:\n"
+        + truncate(error_text or "", max_chars=1200)
+        + "\n\n"
+        + "Prior invalid JSON:\n"
+        + truncate(prior_json or "", max_chars=3000)
+    )
+    return ollama.chat(
+        messages=[
+            {
+                "role": "system",
+                "content": "You are a careful circuit engineer. Output strict JSON only.",
+            },
+            {"role": "user", "content": prompt},
+        ]
+    ).strip()
+
+
 def llm_build_pe_sim_script(
     *,
     ollama: OllamaClient,
@@ -300,8 +376,11 @@ def simulate_ai_circuit_with_phyengine(
     config_base_dir: str,
     max_components: int = 30,
     max_probes: int = 20,
+    max_attempts: int = 3,
 ) -> str:
     lang_zh = _looks_like_zh(text)
+    if max_attempts <= 0:
+        max_attempts = 1
 
     cmake_source_dir = _resolve_existing_path(
         str(getattr(phy_engine_cfg, "cmake_source_dir", "")),
@@ -329,16 +408,34 @@ def simulate_ai_circuit_with_phyengine(
         max_components=max_components,
         max_probes=max_probes,
     )
-    try:
-        obj = parse_spec_json(raw_json)
-        spec = parse_pe_sim_spec(obj, max_components=max_components, max_probes=max_probes)
-        built = build_circuit(spec)
-    except PEBuilderError as e:
+    last_err: PEBuilderError | None = None
+    for attempt in range(1, max_attempts + 1):
+        try:
+            obj = parse_spec_json(raw_json)
+            spec = parse_pe_sim_spec(obj, max_components=max_components, max_probes=max_probes)
+            built = build_circuit(spec)
+            last_err = None
+            break
+        except PEBuilderError as e:
+            last_err = e
+            if attempt >= max_attempts:
+                break
+            raw_json = llm_fix_pe_sim_spec_json(
+                ollama=ollama,
+                user_text=text,
+                context_json=context_json,
+                max_components=max_components,
+                max_probes=max_probes,
+                prior_json=raw_json,
+                error_text=str(e),
+            )
+
+    if last_err is not None:
         return (
             "I couldn't build a valid circuit spec from your request. "
-            f"Error: {e}"
+            f"Error: {last_err}"
             if not lang_zh
-            else f"我没能从你的描述里构建出可仿真的电路规格。错误：{e}"
+            else f"我没能从你的描述里构建出可仿真的电路规格。错误：{last_err}"
         )
 
     pe = PhyEngineLib(lib_path)
