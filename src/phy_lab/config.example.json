@@ -5,10 +5,14 @@
   },
   "ollama": {
     "base_url": "http://127.0.0.1:11434",
+    "base_urls": [
+      "http://127.0.0.1:11434"
+    ],
     "model": "llama3.1",
     "request_timeout_sec": 240,
     "temperature": 0.2,
-    "num_predict": 2048
+    "num_predict": 2048,
+    "max_parallel_requests": 1
   },
   "storage": {
     "cache_dir": "cache",
