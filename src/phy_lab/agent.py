@@ -73,7 +73,7 @@ from tools import (  # noqa: E402
     safe_reply,
     search_recent_experiments,
     simulate_series_vdc_two_resistors,
-    web_search_google,
+    web_search,
 )
 
 
@@ -107,6 +107,57 @@ def _extract_safe_mentions(text: str) -> list[str]:
         if len(out) >= 5:
             break
     return out
+
+
+_POLITICAL_RE = re.compile(
+    r"(?i)\\b("
+    r"politic|politics|election|vote|campaign|parliament|congress|senate|president|prime\\s+minister|government|regime|party|"
+    r"propaganda|geopolit|sanction|war|invasion|conflict|military|terroris|"
+    r"ukraine|russia|israel|palestin|gaza|taiwan|hong\\s*kong|xinjiang|tibet"
+    r")\\b"
+)
+
+
+def _looks_political_sensitive(text: str) -> bool:
+    t = (text or "").strip()
+    if not t:
+        return False
+    if _POLITICAL_RE.search(t) is not None:
+        return True
+    # CJK keywords (broad, intentionally conservative).
+    cjk = (
+        "政治",
+        "选举",
+        "投票",
+        "总统",
+        "政府",
+        "政党",
+        "宣传",
+        "意识形态",
+        "战争",
+        "冲突",
+        "军事",
+        "制裁",
+        "台海",
+        "台湾",
+        "香港",
+        "新疆",
+        "西藏",
+        "以色列",
+        "巴勒斯坦",
+        "加沙",
+        "乌克兰",
+        "俄罗斯",
+    )
+    return any(k in t for k in cjk)
+
+
+def _political_refusal_message(user_text: str) -> str:
+    t = user_text or ""
+    is_cjk = any("\u4e00" <= ch <= "\u9fff" for ch in t)
+    if is_cjk:
+        return "抱歉，我不能处理或搜索任何政治相关内容。我可以帮助你解决物理实验室社区相关问题。"
+    return "Sorry, I can't help with political content or political web searches. I can help with Physics Lab AR community questions."
 
 
 def _try_parse_json_object(text: str) -> dict[str, Any] | None:
@@ -573,16 +624,19 @@ def _handle_comment(
                 if action == "google":
                     if not routed_arg:
                         return "Provide a query string."
+                    if _looks_political_sensitive(routed_arg):
+                        return _political_refusal_message(routed_arg)
                     if not bool(getattr(cfg.agent, "web_search_enabled", False)):
                         return "Web search is disabled. Set agent.web_search_enabled=true in config."
                     try:
-                        reply = web_search_google(
+                        reply = web_search(
                             query=routed_arg,
                             cache_dir=cache_dir,
                             proxy=str(getattr(cfg.agent, "web_search_proxy", "") or ""),
                             timeout_sec=int(getattr(cfg.agent, "web_search_timeout_sec", 20) or 20),
                             ttl_sec=int(getattr(cfg.agent, "web_search_cache_ttl_sec", 3600) or 3600),
                             max_results=int(getattr(cfg.agent, "web_search_max_results", 5) or 5),
+                            fallback_to_ddg=bool(getattr(cfg.agent, "web_search_fallback_to_ddg", True)),
                         )
                     except Exception as e:
                         return f"Web search failed: {e}"
@@ -630,12 +684,21 @@ def _handle_comment(
                             enable_publish=enable_publish,
                             dry_run=dry_run,
                             max_attempts=int(getattr(cfg.agent, "circuit_max_attempts", 3) or 3),
+                            publish_max_elements=int(getattr(cfg.agent, "publish_max_elements", 5000) or 5000),
                             title=title,
                             introduction=introduction,
                         )
                     except Exception as e:
                         return safe_reply(
                             f"Sorry, I couldn't compile the circuit after multiple attempts. Error: {e}",
+                            max_chars=cfg.agent.max_reply_chars,
+                        )
+
+                    if enable_publish and not res.published and res.publish_block_reason == "too_large":
+                        limit = int(getattr(cfg.agent, "publish_max_elements", 5000) or 5000)
+                        return safe_reply(
+                            f"I generated the circuit, but I cannot publish it because the .sav is too large for Physics Lab (elements={res.plsav_elements}, limit={limit}). "
+                            "Please simplify the design and try again.",
                             max_chars=cfg.agent.max_reply_chars,
                         )
 
@@ -688,12 +751,21 @@ def _handle_comment(
                             enable_publish=enable_publish,
                             dry_run=dry_run,
                             max_attempts=int(getattr(cfg.agent, "circuit_max_attempts", 3) or 3),
+                            publish_max_elements=int(getattr(cfg.agent, "publish_max_elements", 5000) or 5000),
                             title=title,
                             introduction=introduction,
                         )
                     except Exception as e:
                         return safe_reply(
                             f"Sorry, I couldn't compile the circuit after multiple attempts. Error: {e}",
+                            max_chars=cfg.agent.max_reply_chars,
+                        )
+
+                    if enable_publish and not res.published and res.publish_block_reason == "too_large":
+                        limit = int(getattr(cfg.agent, "publish_max_elements", 5000) or 5000)
+                        return safe_reply(
+                            f"I generated the circuit, but I cannot publish it because the .sav is too large for Physics Lab (elements={res.plsav_elements}, limit={limit}). "
+                            "Please simplify the design and try again.",
                             max_chars=cfg.agent.max_reply_chars,
                         )
 
@@ -738,15 +810,18 @@ def _handle_comment(
                 use_web, query = False, ""
 
             if use_web:
+                if _looks_political_sensitive(query or arg):
+                    return _political_refusal_message(query or arg)
                 logger.info("Auto web search triggered (query=%r)", truncate(query, max_chars=200))
                 try:
-                    search_txt = web_search_google(
+                    search_txt = web_search(
                         query=query,
                         cache_dir=cache_dir,
                         proxy=str(getattr(cfg.agent, "web_search_proxy", "") or ""),
                         timeout_sec=int(getattr(cfg.agent, "web_search_timeout_sec", 20) or 20),
                         ttl_sec=int(getattr(cfg.agent, "web_search_cache_ttl_sec", 3600) or 3600),
                         max_results=int(getattr(cfg.agent, "web_search_max_results", 5) or 5),
+                        fallback_to_ddg=bool(getattr(cfg.agent, "web_search_fallback_to_ddg", True)),
                     )
                     messages.append(
                         {
@@ -800,17 +875,20 @@ def _handle_comment(
     if cmd in ("google", "web", "websearch"):
         if not arg:
             return "Provide a query string."
+        if _looks_political_sensitive(arg):
+            return _political_refusal_message(arg)
         if not bool(getattr(cfg.agent, "web_search_enabled", False)):
             return "Web search is disabled. Set agent.web_search_enabled=true in config."
         logger.debug("Tool google invoked (query=%r)", arg[:200])
         try:
-            reply = web_search_google(
+            reply = web_search(
                 query=arg,
                 cache_dir=cache_dir,
                 proxy=str(getattr(cfg.agent, "web_search_proxy", "") or ""),
                 timeout_sec=int(getattr(cfg.agent, "web_search_timeout_sec", 20) or 20),
                 ttl_sec=int(getattr(cfg.agent, "web_search_cache_ttl_sec", 3600) or 3600),
                 max_results=int(getattr(cfg.agent, "web_search_max_results", 5) or 5),
+                fallback_to_ddg=bool(getattr(cfg.agent, "web_search_fallback_to_ddg", True)),
             )
         except Exception as e:
             return f"Web search failed: {e}"
@@ -851,11 +929,20 @@ def _handle_comment(
                 enable_publish=bool(cfg.agent.enable_publish),
                 dry_run=dry_run,
                 max_attempts=int(getattr(cfg.agent, "circuit_max_attempts", 3) or 3),
+                publish_max_elements=int(getattr(cfg.agent, "publish_max_elements", 5000) or 5000),
                 title=title,
                 introduction=introduction,
             )
         except Exception as e:
             return f"Circuit generation failed: {e}"
+
+        if bool(cfg.agent.enable_publish) and not res.published and res.publish_block_reason == "too_large":
+            limit = int(getattr(cfg.agent, "publish_max_elements", 5000) or 5000)
+            return safe_reply(
+                f"I generated the circuit, but I cannot publish it because the .sav is too large for Physics Lab (elements={res.plsav_elements}, limit={limit}). "
+                "Please simplify the design and try again.",
+                max_chars=cfg.agent.max_reply_chars,
+            )
 
         if res.published:
             return safe_reply(

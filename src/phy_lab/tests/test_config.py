@@ -26,9 +26,11 @@ class TestConfig(unittest.TestCase):
                     "web_search_enabled": True,
                     "auto_web_search": True,
                     "web_search_proxy": "http://127.0.0.1:7897",
+                    "web_search_fallback_to_ddg": True,
                     "auto_tool_routing": True,
                     "auto_publish": True,
                     "circuit_max_attempts": 3,
+                    "publish_max_elements": 5000,
                     "overload_protection_enabled": True,
                     "overload_window_sec": 600,
                     "overload_max_requests": 40,
@@ -45,9 +47,11 @@ class TestConfig(unittest.TestCase):
         self.assertEqual(cfg.agent.web_search_enabled, True)
         self.assertEqual(cfg.agent.auto_web_search, True)
         self.assertEqual(cfg.agent.web_search_proxy, "http://127.0.0.1:7897")
+        self.assertEqual(cfg.agent.web_search_fallback_to_ddg, True)
         self.assertEqual(cfg.agent.auto_tool_routing, True)
         self.assertEqual(cfg.agent.auto_publish, True)
         self.assertEqual(cfg.agent.circuit_max_attempts, 3)
+        self.assertEqual(cfg.agent.publish_max_elements, 5000)
         self.assertEqual(cfg.agent.overload_protection_enabled, True)
         self.assertEqual(cfg.agent.overload_window_sec, 600)
         self.assertEqual(cfg.agent.overload_max_requests, 40)

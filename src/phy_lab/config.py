@@ -42,6 +42,7 @@ Political content (strict)
 - This includes: elections, parties, government propaganda, geopolitical conflicts, political persuasion/advocacy, and any content that would be considered politically sensitive.
 - If asked, respond with a brief refusal in the user's language and offer to help with Physics Lab AR community topics instead.
 - Do not use web search for political content.
+- If the user asks you to search the web for political content, refuse (do not perform any web lookup).
 """
 
 
@@ -104,9 +105,11 @@ class AgentConfig:
     web_search_timeout_sec: int = 20
     web_search_cache_ttl_sec: int = 3600
     web_search_max_results: int = 5
+    web_search_fallback_to_ddg: bool = True
     auto_tool_routing: bool = True
     auto_publish: bool = False
     circuit_max_attempts: int = 3
+    publish_max_elements: int = 5000
     overload_protection_enabled: bool = True
     overload_window_sec: int = 600
     overload_max_requests: int = 40
@@ -353,6 +356,10 @@ def parse_config(data: dict[str, Any], *, source: str) -> Config:
     web_search_max_results = _optional_int(
         agent_obj.get("web_search_max_results"), where="agent.web_search_max_results"
     )
+    web_search_fallback_to_ddg = _optional_bool(
+        agent_obj.get("web_search_fallback_to_ddg"),
+        where="agent.web_search_fallback_to_ddg",
+    )
     auto_tool_routing = _optional_bool(
         agent_obj.get("auto_tool_routing"), where="agent.auto_tool_routing"
     )
@@ -361,6 +368,9 @@ def parse_config(data: dict[str, Any], *, source: str) -> Config:
     )
     circuit_max_attempts = _optional_int(
         agent_obj.get("circuit_max_attempts"), where="agent.circuit_max_attempts"
+    )
+    publish_max_elements = _optional_int(
+        agent_obj.get("publish_max_elements"), where="agent.publish_max_elements"
     )
     overload_protection_enabled = _optional_bool(
         agent_obj.get("overload_protection_enabled"),
@@ -439,6 +449,9 @@ def parse_config(data: dict[str, Any], *, source: str) -> Config:
         web_search_max_results=web_search_max_results
         if web_search_max_results is not None
         else AgentConfig.web_search_max_results,
+        web_search_fallback_to_ddg=web_search_fallback_to_ddg
+        if web_search_fallback_to_ddg is not None
+        else AgentConfig.web_search_fallback_to_ddg,
         auto_tool_routing=auto_tool_routing
         if auto_tool_routing is not None
         else AgentConfig.auto_tool_routing,
@@ -446,6 +459,9 @@ def parse_config(data: dict[str, Any], *, source: str) -> Config:
         circuit_max_attempts=circuit_max_attempts
         if circuit_max_attempts is not None
         else AgentConfig.circuit_max_attempts,
+        publish_max_elements=publish_max_elements
+        if publish_max_elements is not None
+        else AgentConfig.publish_max_elements,
         overload_protection_enabled=overload_protection_enabled
         if overload_protection_enabled is not None
         else AgentConfig.overload_protection_enabled,
@@ -544,9 +560,11 @@ def write_config(path: str, config: Config) -> None:
             "web_search_timeout_sec": config.agent.web_search_timeout_sec,
             "web_search_cache_ttl_sec": config.agent.web_search_cache_ttl_sec,
             "web_search_max_results": config.agent.web_search_max_results,
+            "web_search_fallback_to_ddg": config.agent.web_search_fallback_to_ddg,
             "auto_tool_routing": config.agent.auto_tool_routing,
             "auto_publish": config.agent.auto_publish,
             "circuit_max_attempts": config.agent.circuit_max_attempts,
+            "publish_max_elements": config.agent.publish_max_elements,
             "overload_protection_enabled": config.agent.overload_protection_enabled,
             "overload_window_sec": config.agent.overload_window_sec,
             "overload_max_requests": config.agent.overload_max_requests,

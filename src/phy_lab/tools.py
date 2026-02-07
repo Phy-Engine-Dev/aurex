@@ -15,6 +15,7 @@ from typing import Any
 import requests
 
 from ollama import OllamaClient
+from plsav import PlSavError, load_plsav_counts
 from pe_sim import PhyEngineLib, SeriesVdcResistorsSpec
 from phy_engine import (
     Verilog2PlSavOptions,
@@ -293,6 +294,33 @@ _GOOGLE_RESULT_RE = re.compile(
     re.IGNORECASE,
 )
 
+_GOOGLE_H3_RE = re.compile(
+    r'<a[^>]+href="/url\\?q=(?P<url>[^"&]+)[^"]*"[^>]*>\\s*<h3[^>]*>(?P<title>.*?)</h3>',
+    re.IGNORECASE | re.DOTALL,
+)
+
+
+def _strip_tags(s: str) -> str:
+    s = re.sub(r"<[^>]+>", " ", s or "")
+    s = html.unescape(s)
+    s = re.sub(r"\\s+", " ", s).strip()
+    return s
+
+
+def _looks_like_google_block(html_text: str) -> bool:
+    t = (html_text or "").casefold()
+    return any(
+        x in t
+        for x in (
+            "our systems have detected unusual traffic",
+            "/sorry/",
+            "recaptcha",
+            "captcha",
+            "consent.google.com",
+            "unusual traffic",
+        )
+    )
+
 
 def _cache_get(path: str, *, ttl_sec: int) -> str | None:
     try:
@@ -345,12 +373,16 @@ def web_search_google(
     digest = hashlib.sha256(url.encode("utf-8")).hexdigest()
     cache_path = os.path.join(cache_root, f"{digest}.html")
     cached = _cache_get(cache_path, ttl_sec=int(ttl_sec))
-    if cached is None:
+    if cached is None or _looks_like_google_block(cached):
         proxies = None
         p = (proxy or "").strip()
         if p:
             if "://" not in p:
                 p = "http://" + p
+            if p.lower().startswith("socks"):
+                raise RuntimeError(
+                    "SOCKS proxy requires requests[socks]. Use an HTTP proxy URL or install requests[socks]."
+                )
             proxies = {"http": p, "https": p}
 
         headers = {
@@ -362,12 +394,13 @@ def web_search_google(
         r = requests.get(url, headers=headers, timeout=float(timeout_sec), proxies=proxies)
         r.raise_for_status()
         cached = r.text
-        _cache_put(cache_path, cached)
+        if not _looks_like_google_block(cached):
+            _cache_put(cache_path, cached)
 
     results: list[tuple[str, str]] = []
-    for m in _GOOGLE_RESULT_RE.finditer(cached):
+    for m in _GOOGLE_H3_RE.finditer(cached):
         raw_url = m.group("url") or ""
-        title = html.unescape((m.group("title") or "").strip())
+        title = _strip_tags(m.group("title") or "")
         try:
             target_url = urllib.parse.unquote(raw_url)
         except Exception:
@@ -381,6 +414,27 @@ def web_search_google(
             break
 
     if not results:
+        for m in _GOOGLE_RESULT_RE.finditer(cached):
+            raw_url = m.group("url") or ""
+            title = _strip_tags(m.group("title") or "")
+            try:
+                target_url = urllib.parse.unquote(raw_url)
+            except Exception:
+                target_url = raw_url
+            if not target_url.startswith("http"):
+                continue
+            if not title:
+                continue
+            results.append((title, target_url))
+            if len(results) >= max_results:
+                break
+
+    if not results:
+        if _looks_like_google_block(cached):
+            return (
+                "Google blocked this automated request (captcha/consent/unusual-traffic).\n"
+                "Try: enable proxy, change IP, reduce frequency, or use the DuckDuckGo fallback."
+            )
         return (
             "No results parsed. Google may have returned a blocked/captcha page or changed markup.\n"
             f"Query: {query}"
@@ -393,6 +447,112 @@ def web_search_google(
     return "\n".join(lines)
 
 
+def web_search_duckduckgo(
+    *,
+    query: str,
+    cache_dir: str,
+    proxy: str = "",
+    timeout_sec: int = 20,
+    ttl_sec: int = 3600,
+    max_results: int = 5,
+) -> str:
+    query = (query or "").strip()
+    if not query:
+        return "Provide a query string."
+    if max_results <= 0:
+        max_results = 5
+    if max_results > 10:
+        max_results = 10
+
+    url = "https://duckduckgo.com/html/?" + urllib.parse.urlencode({"q": query})
+
+    cache_root = os.path.join(cache_dir, "web_cache", "duckduckgo")
+    digest = hashlib.sha256(url.encode("utf-8")).hexdigest()
+    cache_path = os.path.join(cache_root, f"{digest}.html")
+    cached = _cache_get(cache_path, ttl_sec=int(ttl_sec))
+    if cached is None:
+        proxies = None
+        p = (proxy or "").strip()
+        if p:
+            if "://" not in p:
+                p = "http://" + p
+            if p.lower().startswith("socks"):
+                raise RuntimeError(
+                    "SOCKS proxy requires requests[socks]. Use an HTTP proxy URL or install requests[socks]."
+                )
+            proxies = {"http": p, "https": p}
+        headers = {
+            "User-Agent": (
+                "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                "(KHTML, like Gecko) Chrome/120.0 Safari/537.36"
+            )
+        }
+        r = requests.get(url, headers=headers, timeout=float(timeout_sec), proxies=proxies)
+        r.raise_for_status()
+        cached = r.text
+        _cache_put(cache_path, cached)
+
+    a_re = re.compile(
+        r'<a[^>]+class="result__a"[^>]+href="(?P<url>[^"]+)"[^>]*>(?P<title>.*?)</a>',
+        re.IGNORECASE | re.DOTALL,
+    )
+    results: list[tuple[str, str]] = []
+    for m in a_re.finditer(cached):
+        u = html.unescape((m.group("url") or "").strip())
+        t = _strip_tags(m.group("title") or "")
+        if not u.startswith("http"):
+            continue
+        if not t:
+            continue
+        results.append((t, u))
+        if len(results) >= max_results:
+            break
+
+    if not results:
+        return f"No results parsed from DuckDuckGo.\nQuery: {query}"
+
+    lines = ["DuckDuckGo results:"]
+    for i, (t, u) in enumerate(results, start=1):
+        lines.append(f"{i}. {truncate(t, max_chars=120)}")
+        lines.append(f"   {u}")
+    return "\n".join(lines)
+
+
+def web_search(
+    *,
+    query: str,
+    cache_dir: str,
+    proxy: str = "",
+    timeout_sec: int = 20,
+    ttl_sec: int = 3600,
+    max_results: int = 5,
+    fallback_to_ddg: bool = True,
+) -> str:
+    res = web_search_google(
+        query=query,
+        cache_dir=cache_dir,
+        proxy=proxy,
+        timeout_sec=timeout_sec,
+        ttl_sec=ttl_sec,
+        max_results=max_results,
+    )
+    if fallback_to_ddg and (
+        "Google blocked this automated request" in res or "No results parsed." in res
+    ):
+        try:
+            return web_search_duckduckgo(
+                query=query,
+                cache_dir=cache_dir,
+                proxy=proxy,
+                timeout_sec=timeout_sec,
+                ttl_sec=ttl_sec,
+                max_results=max_results,
+            )
+        except Exception:
+            return res
+    return res
+
+
 @dataclass(frozen=True)
 class CircuitBuildResult:
     published: bool
@@ -400,6 +560,8 @@ class CircuitBuildResult:
     artifact_dir: str | None = None
     artifact_verilog_path: str | None = None
     artifact_sav_path: str | None = None
+    publish_block_reason: str | None = None
+    plsav_elements: int | None = None
 
 
 def _write_artifacts(
@@ -435,6 +597,7 @@ def build_and_maybe_publish_circuit(
     enable_publish: bool,
     dry_run: bool,
     max_attempts: int = 3,
+    publish_max_elements: int = 5000,
     title: str,
     introduction: str,
 ) -> CircuitBuildResult:
@@ -504,6 +667,34 @@ def build_and_maybe_publish_circuit(
         artifact_verilog = None
         artifact_sav = None
 
+        counts = None
+        try:
+            counts = load_plsav_counts(out_sav)
+        except PlSavError:
+            counts = None
+
+        plsav_elements = counts.elements if counts is not None else None
+        too_large = (
+            isinstance(plsav_elements, int)
+            and publish_max_elements > 0
+            and plsav_elements > publish_max_elements
+        )
+
+        if too_large:
+            artifact_dir, artifact_verilog, artifact_sav = _write_artifacts(
+                cache_dir=cache_dir,
+                verilog_text=verilog,
+                sav_path=out_sav,
+            )
+            return CircuitBuildResult(
+                published=False,
+                artifact_dir=artifact_dir,
+                artifact_verilog_path=artifact_verilog,
+                artifact_sav_path=artifact_sav,
+                publish_block_reason="too_large",
+                plsav_elements=plsav_elements,
+            )
+
         if keep_temp or (not enable_publish) or dry_run:
             artifact_dir, artifact_verilog, artifact_sav = _write_artifacts(
                 cache_dir=cache_dir,
@@ -517,6 +708,7 @@ def build_and_maybe_publish_circuit(
                 artifact_dir=artifact_dir,
                 artifact_verilog_path=artifact_verilog,
                 artifact_sav_path=artifact_sav,
+                plsav_elements=plsav_elements,
             )
 
         info = upload_sav_as_experiment(
@@ -534,6 +726,7 @@ def build_and_maybe_publish_circuit(
             artifact_dir=artifact_dir,
             artifact_verilog_path=artifact_verilog,
             artifact_sav_path=artifact_sav,
+            plsav_elements=plsav_elements,
         )
 
 

@@ -83,6 +83,7 @@ python src/phy_lab/agent.py run --config .phy_lab/config.json
 - `agent.enable_publish=true`
 - `agent.auto_publish=true`
 - `agent.circuit_max_attempts=3`（编译失败最多重试次数）
+- `agent.publish_max_elements=5000`（超过此元件数量将拒绝发布；物实社区发布上限）
 
 如果你担心短时间内请求过多导致负载过高，可以启用“过载保护”。当 10 分钟内请求数量超过阈值时，新请求会直接回复英文忙碌提示：
 
