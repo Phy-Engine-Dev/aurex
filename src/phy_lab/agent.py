@@ -286,6 +286,81 @@ def _read_password(cfg: Any) -> str | None:
     return None
 
 
+def _format_exception_brief(e: BaseException) -> str:
+    msg = str(e) or e.__class__.__name__
+    msg = msg.replace("\n", " ").strip()
+    if len(msg) > 300:
+        msg = msg[:299] + "…"
+    return f"{e.__class__.__name__}: {msg}".rstrip(": ").strip()
+
+
+def _guess_simulation_issue_codes(lines: list[str]) -> list[str]:
+    """Return stable, user-facing issue codes based on collected debug lines."""
+    blob = "\n".join(lines).casefold()
+    codes: list[str] = []
+    if any(x in blob for x in ("connection refused", "failed to establish", "timeout", "timed out", "connectionerror")):
+        codes.append("OLLAMA_UNREACHABLE_OR_TIMEOUT")
+    if any(x in blob for x in ("ensure_phyengine_lib", "cmake", "libphyengine", "phyengine_lib_path", "not found")):
+        codes.append("PHYENGINE_LIB_MISSING_OR_BUILD_FAILED")
+    if any(x in blob for x in ("i couldn't parse the command script", "命令脚本解析", "pe-script", "pescripterror")):
+        codes.append("AI_SCRIPT_PARSE_FAILED")
+    if any(x in blob for x in ("jsondecodeerror", "invalid json", "parse json", "strict json")):
+        codes.append("AI_JSON_SPEC_INVALID")
+    if any(x in blob for x in ("statussave", "plsav missing statussave", "get_experiment", "get_summary")):
+        codes.append("STATUSSAVE_FETCH_FAILED")
+    return codes[:4]
+
+
+def _is_probable_user_not_found_error(e: BaseException) -> bool:
+    msg = (str(e) or "").casefold()
+    return ("status=404" in msg) or ("notfound" in msg) or ("not found" in msg)
+
+
+def _render_simulation_failure(
+    *,
+    sim_text: str,
+    cfg: Any,
+    failures: list[str],
+    ai_parse_failure: str | None = None,
+) -> str:
+    is_cjk = any("\u4e00" <= ch <= "\u9fff" for ch in (sim_text or ""))
+    codes = _guess_simulation_issue_codes(failures + ([ai_parse_failure] if ai_parse_failure else []))
+    header = "仿真失败（诊断信息）" if is_cjk else "Simulation failed (diagnostics)"
+
+    cfg_lines = [
+        f"ollama.base_url={getattr(getattr(cfg, 'ollama', None), 'base_url', '')}",
+        f"ollama.model={getattr(getattr(cfg, 'ollama', None), 'model', '')}",
+        f"agent.simulation_enabled={bool(getattr(getattr(cfg, 'agent', None), 'simulation_enabled', True))}",
+        f"agent.simulation_ai_enabled={bool(getattr(getattr(cfg, 'agent', None), 'simulation_ai_enabled', True))}",
+        f"phy_engine.auto_build={bool(getattr(getattr(cfg, 'phy_engine', None), 'auto_build', False))}",
+        f"phy_engine.phyengine_lib_path={getattr(getattr(cfg, 'phy_engine', None), 'phyengine_lib_path', '')}",
+        f"phy_engine.cmake_source_dir={getattr(getattr(cfg, 'phy_engine', None), 'cmake_source_dir', '')}",
+        f"phy_engine.cmake_build_dir={getattr(getattr(cfg, 'phy_engine', None), 'cmake_build_dir', '')}",
+    ]
+
+    out: list[str] = [header]
+    if codes:
+        out.append(("- 可能问题编号: " if is_cjk else "- Possible issue codes: ") + ", ".join(codes))
+    out.append(("- 配置快照:" if is_cjk else "- Config snapshot:"))
+    out.extend([f"  - {x}" for x in cfg_lines if str(x).strip()])
+    out.append(("- 尝试路径/错误:" if is_cjk else "- Attempts/errors:"))
+    for ln in failures[:10]:
+        out.append(f"  - {ln}")
+
+    if ai_parse_failure:
+        out.append(("- AI 构建电路失败细节（截断）:" if is_cjk else "- AI circuit build details (truncated):"))
+        out.append(truncate(ai_parse_failure, max_chars=900))
+
+    out.append(
+        (
+            "你可以直接把上面内容发给我，我会按“问题编号”继续定位。"
+            if is_cjk
+            else "Paste the diagnostics above and I’ll pinpoint the root cause by the issue codes."
+        )
+    )
+    return "\n".join(out)
+
+
 def _try_parse_json_object(text: str) -> dict[str, Any] | None:
     text = (text or "").strip()
     if not text:
@@ -765,9 +840,33 @@ def _handle_comment(
                         return "Provide a query string."
                     if _looks_political_sensitive(routed_arg):
                         return _political_refusal_message(routed_arg)
-                    q = routed_arg.strip()
-                    if q.startswith("@"):
+                    q_raw = routed_arg.strip()
+                    q = q_raw
+                    is_at_user = q.startswith(("@", "＠"))
+                    if is_at_user:
                         q = q[1:].strip()
+                        if q:
+                            try:
+                                data = get_user_by_name(user, name=q)
+                            except Exception as e:
+                                if _is_probable_user_not_found_error(e):
+                                    return "No user found."
+                                return f"Search failed: {e}"
+                            u = data.get("User") if isinstance(data, dict) else None
+                            if not isinstance(u, dict):
+                                return "No user found."
+                            uid = best_effort_extract_text(u.get("ID")) or best_effort_extract_text(
+                                u.get("UserID")
+                            )
+                            nick = best_effort_extract_text(u.get("Nickname")) or "(no nickname)"
+                            ver = best_effort_extract_text(u.get("Verification"))
+                            lines = ["User:", f"- Nickname: {nick}", f"- ID: {uid or '(unknown)'}"]
+                            if ver:
+                                lines.append(f"- Verification: {ver}")
+                            return safe_reply(
+                                "\n".join(lines),
+                                max_chars=cfg.agent.max_reply_chars,
+                            )
                     if q.casefold().startswith(("user:", "user ", "用户:", "用户 ")):
                         name = q.split(None, 1)[1].strip() if " " in q else q.split(":", 1)[1].strip()
                         try:
@@ -797,6 +896,27 @@ def _handle_comment(
                         logger.warning("Local search failed: %s", _public_error_text(e, max_chars=2000))
                         return f"Search failed: {e}"
                     if not hits:
+                        # If no experiment hits, try a last-chance user lookup for simple nicknames.
+                        q2 = q_raw.lstrip("@＠").strip()
+                        if q2 and (" " not in q2) and (":" not in q2) and (2 <= len(q2) <= 32):
+                            try:
+                                data = get_user_by_name(user, name=q2)
+                                u = data.get("User") if isinstance(data, dict) else None
+                                if isinstance(u, dict):
+                                    uid = best_effort_extract_text(u.get("ID")) or best_effort_extract_text(
+                                        u.get("UserID")
+                                    )
+                                    nick = best_effort_extract_text(u.get("Nickname")) or "(no nickname)"
+                                    ver = best_effort_extract_text(u.get("Verification"))
+                                    lines = ["User:", f"- Nickname: {nick}", f"- ID: {uid or '(unknown)'}"]
+                                    if ver:
+                                        lines.append(f"- Verification: {ver}")
+                                    return safe_reply(
+                                        "\n".join(lines),
+                                        max_chars=cfg.agent.max_reply_chars,
+                                    )
+                            except Exception:
+                                pass
                         return safe_reply(
                             format_experiment_hits(hits),
                             max_chars=cfg.agent.max_reply_chars,
@@ -885,6 +1005,8 @@ def _handle_comment(
 
                 if action == "simulate":
                     sim_text = routed_arg or arg
+                    failures: list[str] = []
+                    ai_parse_failure: str | None = None
                     # Prefer: LLM builds PE-SCRIPT -> simulate -> LLM interprets results.
                     if bool(getattr(cfg.agent, "simulation_ai_enabled", True)):
                         try:
@@ -905,6 +1027,7 @@ def _handle_comment(
                                 return safe_reply(reply, max_chars=cfg.agent.max_reply_chars)
 
                             # Script parse failed; try legacy JSON-spec LLM path before other fallbacks.
+                            ai_parse_failure = reply
                             try:
                                 reply2 = simulate_ai_circuit_with_phyengine(
                                     ollama=ollama,
@@ -921,9 +1044,13 @@ def _handle_comment(
                                 )
                                 return safe_reply(reply2, max_chars=cfg.agent.max_reply_chars)
                             except Exception as e:
+                                failures.append(f"ai_json_spec_failed: {_format_exception_brief(e)}")
                                 logger.info("AI JSON-spec simulation failed; falling back: %s", e)
                         except Exception as e:
+                            failures.append(f"ai_pe_script_failed: {_format_exception_brief(e)}")
                             logger.info("AI PE-SCRIPT simulation failed; falling back: %s", e)
+                    else:
+                        failures.append("ai_sim_disabled: agent.simulation_ai_enabled=false")
 
                     if (
                         bool(getattr(cfg.agent, "simulation_enabled", True))
@@ -950,7 +1077,10 @@ def _handle_comment(
                             )
                             return safe_reply(reply, max_chars=cfg.agent.max_reply_chars)
                         except Exception as e:
+                            failures.append(f"status_save_sim_failed: {_format_exception_brief(e)}")
                             logger.info("StatusSave simulation failed; falling back to demo: %s", e)
+                    else:
+                        failures.append("status_save_not_attempted: no experiment_context (summary_id/category)")
                     try:
                         reply = simulate_series_vdc_resistors(
                             text=sim_text,
@@ -959,17 +1089,20 @@ def _handle_comment(
                         )
                         if not _looks_like_series_demo_prompt(reply) or _looks_like_series_demo_request(sim_text):
                             return safe_reply(reply, max_chars=cfg.agent.max_reply_chars)
+                        failures.append("series_demo_not_applicable: needs V and resistor values")
                     except Exception as e:
+                        failures.append(f"series_demo_failed: {_format_exception_brief(e)}")
                         logger.info("Fallback demo simulation failed: %s", e)
 
-                    is_cjk = any("\u4e00" <= ch <= "\u9fff" for ch in (sim_text or ""))
                     return safe_reply(
-                        (
-                            "仿真失败：我没法为这个请求构建可运行的电路。\n"
-                            "请确认：Ollama 正常运行、agent.simulation_ai_enabled=true，或提供更明确的电路/规格。"
-                            if is_cjk
-                            else "Simulation failed: unable to build a circuit for this request. "
-                            "Ensure Ollama is running and simulation_ai_enabled=true, or provide an explicit circuit/spec to simulate."
+                        _render_simulation_failure(
+                            sim_text=sim_text,
+                            cfg=cfg,
+                            failures=failures
+                            or [
+                                "no_details: all simulation paths returned 'not applicable' without exceptions"
+                            ],
+                            ai_parse_failure=ai_parse_failure,
                         ),
                         max_chars=cfg.agent.max_reply_chars,
                     )
@@ -1318,9 +1451,37 @@ def _handle_comment(
             return "Provide a query string."
         if _looks_political_sensitive(arg):
             return _political_refusal_message(arg)
-        q = arg.strip()
-        if q.startswith("@"):
-            q = q[1:].strip()
+        q_raw = arg.strip()
+        q = q_raw
+        is_at_user = q.startswith(("@", "＠"))
+        if is_at_user:
+            name = q[1:].strip()
+            if not name:
+                return "Provide a username after '@'."
+            logger.debug("Tool search(@user) invoked (name=%r)", name[:80])
+            try:
+                data = get_user_by_name(user, name=name)
+            except Exception as e:
+                if _is_probable_user_not_found_error(e):
+                    return "No user found."
+                logger.warning("User search failed: %s", _public_error_text(e, max_chars=2000))
+                return f"Search failed: {e}"
+            u = data.get("User") if isinstance(data, dict) else None
+            if not isinstance(u, dict):
+                return "No user found."
+            uid = best_effort_extract_text(u.get("ID")) or best_effort_extract_text(u.get("UserID"))
+            nick = best_effort_extract_text(u.get("Nickname")) or "(no nickname)"
+            ver = best_effort_extract_text(u.get("Verification"))
+            sig = best_effort_extract_text(u.get("Signature"))
+            lines = ["User:"]
+            lines.append(f"- Nickname: {nick}")
+            if uid:
+                lines.append(f"- ID: {uid}")
+            if ver:
+                lines.append(f"- Verification: {ver}")
+            if sig:
+                lines.append(f"- Signature: {truncate(sig, max_chars=120)}")
+            return safe_reply("\n".join(lines), max_chars=cfg.agent.max_reply_chars)
         if q.casefold().startswith(("user:", "user ", "用户:", "用户 ")):
             name = q.split(None, 1)[1].strip() if " " in q else q.split(":", 1)[1].strip()
             logger.debug("Tool search(user) invoked (name=%r)", name[:80])
@@ -1352,6 +1513,30 @@ def _handle_comment(
             logger.warning("Local search failed: %s", _public_error_text(e, max_chars=2000))
             return f"Search failed: {e}"
         if not hits:
+            # If no experiment hits, try a last-chance user lookup for simple nicknames.
+            q2 = q_raw.lstrip("@＠").strip()
+            if q2 and (" " not in q2) and (":" not in q2) and (2 <= len(q2) <= 32):
+                try:
+                    data = get_user_by_name(user, name=q2)
+                    u = data.get("User") if isinstance(data, dict) else None
+                    if isinstance(u, dict):
+                        uid = best_effort_extract_text(u.get("ID")) or best_effort_extract_text(
+                            u.get("UserID")
+                        )
+                        nick = best_effort_extract_text(u.get("Nickname")) or "(no nickname)"
+                        ver = best_effort_extract_text(u.get("Verification"))
+                        sig = best_effort_extract_text(u.get("Signature"))
+                        lines = ["User:"]
+                        lines.append(f"- Nickname: {nick}")
+                        if uid:
+                            lines.append(f"- ID: {uid}")
+                        if ver:
+                            lines.append(f"- Verification: {ver}")
+                        if sig:
+                            lines.append(f"- Signature: {truncate(sig, max_chars=120)}")
+                        return safe_reply("\n".join(lines), max_chars=cfg.agent.max_reply_chars)
+                except Exception:
+                    pass
             return safe_reply(format_experiment_hits(hits), max_chars=cfg.agent.max_reply_chars)
 
         packed: list[dict[str, Any]] = []
@@ -1439,6 +1624,14 @@ def _handle_comment(
         if not arg:
             return "Provide a circuit specification after the command."
 
+        publish_category_value = _infer_publish_category(
+            arg, default_category=getattr(cfg.agent, "publish_category", "Discussion")
+        )
+        publish_tags = getattr(cfg.agent, "publish_tags", None)
+        publish_tags_list = None
+        if isinstance(publish_tags, list) and all(isinstance(x, str) for x in publish_tags):
+            publish_tags_list = [x.strip() for x in publish_tags if x.strip()]
+
         title = truncate(f"Auto Circuit: {arg}", max_chars=60)
         requested_by = nickname or author_id or "unknown"
         mentions = []
@@ -1473,6 +1666,8 @@ def _handle_comment(
                 publish_max_elements=int(getattr(cfg.agent, "publish_max_elements", 5000) or 5000),
                 title=title,
                 introduction=introduction,
+                publish_category_value=publish_category_value,
+                publish_tags=publish_tags_list,
             )
         except Exception as e:
             return f"Circuit generation failed: {e}"
@@ -1500,6 +1695,8 @@ def _handle_comment(
 
     if cmd in ("simulate", "sim"):
         logger.debug("Tool simulate invoked (len=%d)", len(arg))
+        failures: list[str] = []
+        ai_parse_failure: str | None = None
         if bool(getattr(cfg.agent, "simulation_ai_enabled", True)):
             try:
                 reply = simulate_ai_script_circuit_with_phyengine(
@@ -1512,6 +1709,7 @@ def _handle_comment(
                     max_probes=int(getattr(cfg.agent, "simulation_ai_max_probes", 20) or 20),
                 )
                 if _looks_like_pe_script_parse_failure(reply):
+                    ai_parse_failure = reply
                     reply = simulate_ai_circuit_with_phyengine(
                         ollama=ollama,
                         text=arg or text,
@@ -1525,7 +1723,10 @@ def _handle_comment(
                     )
                 return safe_reply(reply, max_chars=cfg.agent.max_reply_chars)
             except Exception as e:
+                failures.append(f"ai_sim_failed: {_format_exception_brief(e)}")
                 logger.info("AI simulation failed; falling back to demo: %s", e)
+        else:
+            failures.append("ai_sim_disabled: agent.simulation_ai_enabled=false")
 
         try:
             reply = simulate_series_vdc_resistors(
@@ -1534,16 +1735,24 @@ def _handle_comment(
                 config_base_dir=config_base_dir,
             )
         except Exception as e:
-            return f"Simulation failed: {e}"
-        if _looks_like_series_demo_prompt(reply) and not _looks_like_series_demo_request(arg or text):
+            failures.append(f"series_demo_failed: {_format_exception_brief(e)}")
             return safe_reply(
-                (
-                    "仿真失败：这个请求不匹配内置的“串联电阻演示仿真器”。\n"
-                    "请启用 AI 仿真（agent.simulation_ai_enabled=true）并确认 Ollama 正常运行，或提供更具体的电路/规格。"
-                    if any("\u4e00" <= ch <= "\u9fff" for ch in (arg or text or ""))
-                    else "Simulation failed: this request doesn't match the built-in series-resistor demo simulator. "
-                    "Enable AI simulation (simulation_ai_enabled=true) and ensure Ollama is running, "
-                    "or provide a concrete circuit/spec."
+                _render_simulation_failure(
+                    sim_text=(arg or text),
+                    cfg=cfg,
+                    failures=failures,
+                    ai_parse_failure=ai_parse_failure,
+                ),
+                max_chars=cfg.agent.max_reply_chars,
+            )
+        if _looks_like_series_demo_prompt(reply) and not _looks_like_series_demo_request(arg or text):
+            failures.append("series_demo_not_applicable: needs V and resistor values")
+            return safe_reply(
+                _render_simulation_failure(
+                    sim_text=(arg or text),
+                    cfg=cfg,
+                    failures=failures,
+                    ai_parse_failure=ai_parse_failure,
                 ),
                 max_chars=cfg.agent.max_reply_chars,
             )

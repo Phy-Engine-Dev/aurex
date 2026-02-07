@@ -1961,7 +1961,7 @@ def build_and_maybe_publish_circuit(
     publish_max_elements: int = 5000,
     title: str,
     introduction: str,
-    publish_category_value: str = "Experiment",
+    publish_category_value: str = "Discussion",
     publish_tags: list[str] | None = None,
 ) -> CircuitBuildResult:
     os.makedirs(cache_dir, exist_ok=True)

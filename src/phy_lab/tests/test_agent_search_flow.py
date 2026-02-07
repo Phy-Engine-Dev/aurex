@@ -111,6 +111,102 @@ class TestAgentSearchFlow(unittest.TestCase):
         self.assertIn("Nickname: abc", out)
         self.assertIn("ID: u1", out)
 
+    def test_search_command_at_user_queries_user_api(self):
+        class _Cfg3:
+            class _Agent:
+                system_prompt = "sys"
+                max_reply_chars = 2000
+                mention_tag = "@aurex"
+                commands_enabled = True
+                command_prefix = "!"
+                auto_tool_routing = False
+                require_mention = False
+                user_targets_require_mention = False
+                web_search_enabled = False
+                simulation_enabled = False
+
+            agent = _Agent()
+
+        def _fake_get_user(_user, *, name):
+            return {"User": {"ID": "u9", "Nickname": name, "Signature": "sig"}}
+
+        with mock.patch.object(agent_mod, "get_user_by_name", side_effect=_fake_get_user):
+            out = agent_mod._handle_comment(
+                comment={"Content": "!search @abc"},
+                user=object(),
+                ollama=_FakeOllama(),
+                cache_dir="cache",
+                config_base_dir=".",
+                cfg=_Cfg3(),
+                dry_run=True,
+                logger=agent_mod.logging.getLogger("t"),
+                conversation_key=None,
+                experiment_context=None,
+                history=[],
+            )
+        self.assertIn("Nickname: abc", out)
+        self.assertIn("ID: u9", out)
+
+    def test_circuit_command_defaults_to_discussion_category(self):
+        class _Cfg4:
+            class _Agent:
+                system_prompt = "sys"
+                max_reply_chars = 2000
+                mention_tag = "@aurex"
+                commands_enabled = True
+                command_prefix = "!"
+                auto_tool_routing = False
+                require_mention = False
+                user_targets_require_mention = False
+                web_search_enabled = False
+                simulation_enabled = False
+                enable_publish = True
+                publish_category = "Discussion"
+                publish_tags = ["SmallProject"]
+                circuit_max_attempts = 1
+                publish_max_elements = 5000
+
+            class _Storage:
+                keep_temp = False
+
+            class _Phy:
+                pass
+
+            agent = _Agent()
+            storage = _Storage()
+            phy_engine = _Phy()
+
+        captured = {}
+
+        def _fake_build(**kwargs):
+            captured.update(kwargs)
+
+            class _Res:
+                published = True
+                summary_id = "sid"
+                publish_block_reason = None
+                plsav_elements = 1
+
+            return _Res()
+
+        with mock.patch.object(agent_mod, "build_and_maybe_publish_circuit", side_effect=_fake_build):
+            out = agent_mod._handle_comment(
+                comment={"Content": "!circuit make a counter"},
+                user=object(),
+                ollama=_FakeOllama(),
+                cache_dir="cache",
+                config_base_dir=".",
+                cfg=_Cfg4(),
+                dry_run=True,
+                logger=agent_mod.logging.getLogger("t"),
+                conversation_key=None,
+                experiment_context=None,
+                history=[],
+            )
+
+        self.assertIn("SummaryID", out)
+        self.assertEqual(captured.get("publish_category_value"), "Discussion")
+
 
 if __name__ == "__main__":
     unittest.main()
