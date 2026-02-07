@@ -17,7 +17,7 @@ from typing import Any
 
 from ollama import OllamaClient
 from plsav import PlSavError, load_plsav_counts
-from pe_sim import AnalyzeType, PhyEngineLib, SeriesVdcResistorsSpec
+from pe_sim import AnalyzeType, PESimError, PhyEngineLib, SeriesVdcResistorsSpec
 from pe_builder import (
     PEBuilderError,
     build_circuit,
@@ -28,6 +28,7 @@ from pe_builder import (
 from pe_cmd import PEScriptError, parse_pe_script_to_spec_obj
 from pe_tool import evaluate_probes, run_and_sample
 from plsav_sim import PlSavSimError, build_pe_circuit_input_from_status_save
+from proc_timeout import ProcRemoteError, ProcTimeoutError, run_with_timeout
 from phy_engine import (
     PhyEngineError,
     Verilog2PlSavOptions,
@@ -160,7 +161,16 @@ def llm_build_pe_sim_spec_json(
         )
     prompt = (
         "Convert the user's request into a strict JSON specification for a Phy-Engine circuit simulation.\n"
-        "You MUST follow this JSON schema exactly:\n"
+        "\n"
+        "CRITICAL TYPE RULES (common failures):\n"
+        "- The top-level output MUST be ONE JSON OBJECT (not an array).\n"
+        "- `analysis` MUST be an object.\n"
+        "- `components` MUST be a JSON ARRAY ([]) even if there is only 1 component.\n"
+        "- `probes` MUST be a JSON ARRAY ([]). If none, use [] (not null).\n"
+        "- `nodes` MUST be an array of exactly 2 strings.\n"
+        "- `params` MUST be an object; ALL values MUST be numbers (no strings like \"1k\" / \"10u\").\n"
+        "\n"
+        "You MUST follow this JSON schema exactly (no extra keys):\n"
         "{\n"
         '  "analysis": {\n'
         '    "type": "dc" | "ac" | "tr",\n'
@@ -173,7 +183,7 @@ def llm_build_pe_sim_spec_json(
         '      "id": "R1",\n'
         '      "type": "resistor" | "capacitor" | "inductor" | "vdc" | "idc" | "vac" | "iac",\n'
         '      "nodes": ["n1", "n2"],\n'
-        '      "params": { "r_ohm"/"c_f"/"l_h"/"v_v"/"i_a"/("vp_v","freq_hz","phase_deg") : number }\n'
+        '      "params": { ...numbers... }\n'
         "    }\n"
         "  ],\n"
         '  "probes": [\n'
@@ -181,28 +191,40 @@ def llm_build_pe_sim_spec_json(
         "  ]\n"
         "}\n"
         "\n"
+        "Component param rules:\n"
+        "- resistor: params MUST contain {\"r_ohm\": <number>}\n"
+        "- capacitor: params MUST contain {\"c_f\": <number>}\n"
+        "- inductor: params MUST contain {\"l_h\": <number>}\n"
+        "- vdc: params MUST contain {\"v_v\": <number>}\n"
+        "- idc: params MUST contain {\"i_a\": <number>}\n"
+        "- vac: params MUST contain {\"vp_v\": <number>, \"freq_hz\": <number>, \"phase_deg\": <number>}\n"
+        "- iac: params MUST contain {\"ip_a\": <number>, \"freq_hz\": <number>, \"phase_deg\": <number>}\n"
+        "\n"
         "Hard constraints:\n"
-        f"- components.length MUST be between 1 and {int(max_components)}.\n"
-        f"- probes.length MUST be between 0 and {int(max_probes)}.\n"
-        "- Every component must be a 2-terminal element (nodes length exactly 2).\n"
-        "- You MUST include a ground node named exactly 'gnd'.\n"
+        f"- 1 <= components.length <= {int(max_components)}\n"
+        f"- 0 <= probes.length <= {int(max_probes)}\n"
+        "- You MUST include a ground node named exactly \"gnd\" connected to the circuit.\n"
+        "- Include at least ONE source component: vdc|idc|vac|iac.\n"
         "- Use simple node names like: gnd, n1, n2, vin, vout.\n"
-        "- Use SI units (Ohm, Farad, Henry, Volt, Ampere).\n"
         "\n"
         "Analysis selection rules:\n"
-        "- Use 'dc' for pure resistive/source circuits.\n"
-        "- Use 'tr' if the user asks about time behavior, or if capacitors/inductors are present.\n"
-        "- Use 'ac' only if the user asks about frequency response; if so, set ac_omega_rad_s.\n"
-        "- For 'tr', set tr_t_step_s and tr_t_stop_s (use reasonable defaults if not provided).\n"
+        "- Use \"dc\" for static results.\n"
+        "- Use \"tr\" if the user asks about timing / charging / oscillation, or if capacitors/inductors are present.\n"
+        "- Use \"ac\" only if the user asks about frequency response; if so, set ac_omega_rad_s.\n"
+        "- For \"tr\": set BOTH tr_t_step_s and tr_t_stop_s (e.g. 1e-6 and 1e-3).\n"
         "\n"
-        "Probe rules:\n"
-        "- If the user asks 'what is the current' include component_current for a resistor.\n"
-        "- If the user asks for a node voltage, include node_voltage.\n"
-        "- If the user asks for voltage drop across a component, include component_vdrop.\n"
-        "- If user does not specify probes, you may leave probes empty.\n"
+        "Minimal example (format only):\n"
+        "{\n"
+        '  \"analysis\": {\"type\":\"dc\",\"ac_omega_rad_s\":null,\"tr_t_step_s\":null,\"tr_t_stop_s\":null},\n'
+        '  \"components\": [\n'
+        '    {\"id\":\"V1\",\"type\":\"vdc\",\"nodes\":[\"vin\",\"gnd\"],\"params\":{\"v_v\":5}},\n'
+        '    {\"id\":\"R1\",\"type\":\"resistor\",\"nodes\":[\"vin\",\"gnd\"],\"params\":{\"r_ohm\":1000}}\n'
+        "  ],\n"
+        '  \"probes\": [{\"kind\":\"node_voltage\",\"target\":\"vin\"}]\n'
+        "}\n"
         "\n"
         "Output rules:\n"
-        "- Output ONLY valid JSON (no markdown, no comments).\n"
+        "- Output ONLY valid JSON (no markdown/code fences, no explanations).\n"
         "- Do NOT include any extra keys.\n"
         "\n"
         + context_blob
@@ -254,6 +276,14 @@ def llm_fix_pe_sim_spec_json(
         "You previously produced a JSON specification for a Phy-Engine circuit simulation, but it failed validation.\n"
         "Fix the JSON so it passes the validator.\n"
         "\n"
+        "CRITICAL TYPE RULES (common failures):\n"
+        "- Output MUST be ONE JSON OBJECT.\n"
+        "- `analysis` MUST be an object.\n"
+        "- `components` MUST be a JSON ARRAY ([]), not an object.\n"
+        "- `probes` MUST be a JSON ARRAY ([]), not null.\n"
+        "- `nodes` MUST be an array of exactly 2 strings.\n"
+        "- `params` MUST be an object; ALL values MUST be numbers (no strings like \"1k\").\n"
+        "\n"
         "You MUST follow this JSON schema exactly:\n"
         "{\n"
         '  "analysis": {\n'
@@ -282,6 +312,7 @@ def llm_fix_pe_sim_spec_json(
         "- You MUST include a ground node named exactly 'gnd'.\n"
         "- Use simple node names like: gnd, n1, n2, vin, vout.\n"
         "- Use SI units (Ohm, Farad, Henry, Volt, Ampere).\n"
+        "- Include at least ONE source component: vdc|idc|vac|iac.\n"
         "\n"
         "Output rules:\n"
         "- Output ONLY valid JSON (no markdown, no comments).\n"
@@ -388,7 +419,7 @@ def simulate_ai_circuit_with_phyengine(
     config_base_dir: str,
     max_components: int = 30,
     max_probes: int = 20,
-    max_attempts: int = 2,
+    max_attempts: int = 3,
 ) -> str:
     lang_zh = _looks_like_zh(text)
     if max_attempts <= 0:
@@ -454,44 +485,29 @@ def simulate_ai_circuit_with_phyengine(
             else f"我没能从你的描述里构建出可仿真的电路规格。错误：{last_err}"
         )
 
-    pe = PhyEngineLib(lib_path)
-    circuit, vec_pos, chunk_pos, comp_size = pe.create_circuit(
-        element_codes=built.element_codes,
-        wires=built.wires,
-        properties=built.properties,
-    )
+    timeout_sec = _pe_sim_timeout_sec(phy_engine_cfg, default_sec=5.0)
     try:
-        if spec.analysis_type == "dc":
-            pe.set_analyze_type(circuit=circuit, analyze_type=AnalyzeType.DC)
-        elif spec.analysis_type == "ac":
-            pe.set_analyze_type(circuit=circuit, analyze_type=AnalyzeType.AC)
-            omega = float(spec.ac_omega_rad_s or 0.0)
-            if omega <= 0.0:
-                omega = 2.0 * 3.141592653589793 * 1000.0  # default 1kHz
-            pe.set_ac_omega(circuit=circuit, omega=omega)
-        else:
-            pe.set_analyze_type(circuit=circuit, analyze_type=AnalyzeType.TR)
-            t_step = float(spec.tr_t_step_s or 1e-4)
-            t_stop = float(spec.tr_t_stop_s or 5e-3)
-            if t_step <= 0.0:
-                t_step = 1e-4
-            if t_stop <= 0.0:
-                t_stop = 5e-3
-            if t_step > t_stop:
-                t_step = t_stop
-            pe.set_tr(circuit=circuit, t_step=t_step, t_stop=t_stop)
-
-        pe.analyze(circuit=circuit)
-        voltage, voltage_ord, current, current_ord, _dig, _dig_ord = pe.sample(
-            circuit=circuit,
-            vec_pos=vec_pos,
-            chunk_pos=chunk_pos,
-            comp_size=comp_size,
+        sample = run_and_sample(
+            lib_path=lib_path,
+            spec=spec,
+            built=built,
             max_pins_per_comp=16,
             max_branches_per_comp=8,
+            timeout_sec=timeout_sec,
         )
-    finally:
-        pe.destroy_circuit(circuit=circuit, vec_pos=vec_pos, chunk_pos=chunk_pos)
+    except Exception as e:
+        msg = str(e)
+        return (
+            f"Phy-Engine simulation failed: {msg}"
+            if not lang_zh
+            else f"Phy-Engine 仿真失败：{msg}"
+        )
+
+    comp_size = int(sample.comp_size)
+    voltage = list(sample.voltage)
+    voltage_ord = list(sample.voltage_ord)
+    current = list(sample.current)
+    current_ord = list(sample.current_ord)
 
     # Helpers for extracting values.
     def comp_index_for_element_index(element_index: int) -> int | None:
@@ -649,7 +665,16 @@ def simulate_ai_script_circuit_with_phyengine(
         for comp in spec.components[: max(0, max_probes // 2)]:
             probes.append(PEProbe(kind="component_current", target=comp.id))
 
-    sample = run_and_sample(lib_path=lib_path, spec=spec, built=built)
+    timeout_sec = _pe_sim_timeout_sec(phy_engine_cfg, default_sec=5.0)
+    try:
+        sample = run_and_sample(lib_path=lib_path, spec=spec, built=built, timeout_sec=timeout_sec)
+    except Exception as e:
+        msg = str(e)
+        return (
+            f"Phy-Engine 仿真失败：{msg}"
+            if lang_zh
+            else f"Phy-Engine simulation failed: {msg}"
+        )
     evaluated = evaluate_probes(
         built=built,
         sample=sample,
@@ -1164,6 +1189,92 @@ def _looks_like_zh(text: str) -> bool:
     return any("\u4e00" <= ch <= "\u9fff" for ch in (text or ""))
 
 
+def _pe_sim_timeout_sec(phy_engine_cfg: Any, *, default_sec: float = 5.0) -> float:
+    v = getattr(phy_engine_cfg, "sim_timeout_sec", None)
+    if v is None:
+        v = default_sec
+    try:
+        v = float(v)
+    except Exception:
+        v = float(default_sec)
+    if v <= 0.0:
+        v = float(default_sec)
+    # Keep it bounded to avoid runaway settings.
+    return min(60.0, max(1.0, v))
+
+
+def _pe_status_save_adapter_worker(
+    *,
+    lib_path: str,
+    status_save: dict[str, Any],
+    analyze_type: int,
+    tr_t_step_s: float,
+    tr_t_stop_s: float,
+    ac_omega_rad_s: float,
+) -> dict[str, Any]:
+    lib = PhyEngineLib(lib_path)
+    return lib.simulate_status_save(
+        status_save=status_save,
+        analyze_type=int(analyze_type),
+        tr_t_step_s=float(tr_t_step_s),
+        tr_t_stop_s=float(tr_t_stop_s),
+        ac_omega_rad_s=float(ac_omega_rad_s),
+        indent=0,
+    )
+
+
+def _pe_analyze_and_sample_worker(
+    *,
+    lib_path: str,
+    element_codes: list[int],
+    wires: list[int],
+    properties: list[float],
+    analyze_type: int,
+    tr_t_step_s: float,
+    tr_t_stop_s: float,
+    ac_omega_rad_s: float,
+    max_pins_per_comp: int,
+    max_branches_per_comp: int,
+) -> dict[str, Any]:
+    pe = PhyEngineLib(lib_path)
+    circuit, vec_pos, chunk_pos, comp_size = pe.create_circuit(
+        element_codes=element_codes,
+        wires=wires,
+        properties=properties,
+    )
+    try:
+        pe.set_analyze_type(circuit=circuit, analyze_type=int(analyze_type))
+        if int(analyze_type) in (AnalyzeType.TR, AnalyzeType.TROP):
+            pe.set_tr(
+                circuit=circuit,
+                t_step=float(tr_t_step_s),
+                t_stop=float(tr_t_stop_s),
+            )
+        elif int(analyze_type) in (AnalyzeType.AC, AnalyzeType.ACOP):
+            pe.set_ac_omega(
+                circuit=circuit,
+                omega=float(ac_omega_rad_s),
+            )
+        pe.analyze(circuit=circuit)
+        voltage, voltage_ord, current, current_ord, _digital, _digital_ord = pe.sample(
+            circuit=circuit,
+            vec_pos=vec_pos,
+            chunk_pos=chunk_pos,
+            comp_size=comp_size,
+            max_pins_per_comp=int(max_pins_per_comp),
+            max_branches_per_comp=int(max_branches_per_comp),
+        )
+        return {
+            "comp_size": int(comp_size),
+            "voltage": voltage,
+            "voltage_ord": voltage_ord,
+            "current": current,
+            "current_ord": current_ord,
+        }
+    finally:
+        pe.destroy_circuit(circuit=circuit, vec_pos=vec_pos, chunk_pos=chunk_pos)
+
+
 def simulate_status_save_with_phyengine(
     *,
     text: str,
@@ -1189,11 +1300,6 @@ def simulate_status_save_with_phyengine(
             "Please provide a smaller circuit (R/C/L/sources/ground only) or isolate the critical sub-circuit."
         )
 
-    try:
-        pe_input = build_pe_circuit_input_from_status_save(status_save, strict=True)
-    except PlSavSimError as e:
-        return str(e)
-
     cmake_source_dir = _resolve_existing_path(
         str(getattr(phy_engine_cfg, "cmake_source_dir", "")),
         base_dir=config_base_dir,
@@ -1213,6 +1319,7 @@ def simulate_status_save_with_phyengine(
         build_timeout_sec=int(getattr(phy_engine_cfg, "build_timeout_sec", 900)),
     )
     lib = PhyEngineLib(lib_path)
+    timeout_sec = _pe_sim_timeout_sec(phy_engine_cfg, default_sec=5.0)
 
     t_stop = _parse_time_seconds(text)
     wants_tr = t_stop is not None or any(
@@ -1226,28 +1333,184 @@ def simulate_status_save_with_phyengine(
     if t_stop is not None:
         t_step = min(1e-3, max(1e-9, t_stop / 2000.0))
 
-    circuit, vec_pos, chunk_pos, comp_size = lib.create_circuit(
-        element_codes=pe_input.element_codes,
-        wires=pe_input.wires,
-        properties=pe_input.properties,
-    )
-    try:
-        if wants_tr:
-            lib.set_analyze_type(circuit=circuit, analyze_type=4)
-            lib.set_tr(circuit=circuit, t_step=float(t_step or 1e-6), t_stop=float(t_stop or 1e-6))
+    analyze_type = 4 if wants_tr else 1
+    adapter_err = ""
+    if lib.can_simulate_status_save():
+        try:
+            out_status = run_with_timeout(
+                fn=_pe_status_save_adapter_worker,
+                kwargs={
+                    "lib_path": lib_path,
+                    "status_save": status_save,
+                    "analyze_type": int(analyze_type),
+                    "tr_t_step_s": float(t_step or 1e-6) if wants_tr else 0.0,
+                    "tr_t_stop_s": float(t_stop or 1e-6) if wants_tr else 0.0,
+                    "ac_omega_rad_s": 0.0,
+                },
+                timeout_sec=float(timeout_sec),
+                label="Phy-Engine StatusSave simulation",
+            )
+        except (PESimError, ProcRemoteError) as e:
+            # Fall back to the Python mapper for simple circuits if the adapter fails.
+            out_status = None
+            adapter_err = str(e)
+        except ProcTimeoutError as e:
+            if lang_zh:
+                return f"Phy-Engine 仿真超时（>{timeout_sec:g}s），已中止以避免卡住后续任务。"
+            return f"Phy-Engine simulation timed out (>{timeout_sec:g}s); aborted to avoid blocking later tasks."
         else:
-            lib.set_analyze_type(circuit=circuit, analyze_type=1)
-        lib.analyze(circuit=circuit)
-        voltage, voltage_ord, current, current_ord, _digital, _digital_ord = lib.sample(
-            circuit=circuit,
-            vec_pos=vec_pos,
-            chunk_pos=chunk_pos,
-            comp_size=comp_size,
-            max_pins_per_comp=8,
-            max_branches_per_comp=4,
+            adapter_err = ""
+
+        if isinstance(out_status, dict):
+            wants_caps = ("capacitor" in (text or "").lower()) or ("电容" in (text or ""))
+            wants_res = ("resistor" in (text or "").lower()) or ("电阻" in (text or ""))
+            wants_ind = ("inductor" in (text or "").lower()) or ("电感" in (text or ""))
+
+            def _pick(model_id: str) -> bool:
+                if wants_caps:
+                    return "Capacitor" in model_id
+                if wants_res:
+                    return "Resistor" in model_id
+                if wants_ind:
+                    return "Inductor" in model_id
+                return True
+
+            if lang_zh:
+                header = "仿真结果" + ("（TR）" if wants_tr else "（DC）")
+                if wants_tr and t_stop is not None:
+                    header += f"  t_stop={t_stop:g}s"
+            else:
+                header = "Simulation result" + (" (TR)" if wants_tr else " (DC)")
+                if wants_tr and t_stop is not None:
+                    header += f"  t_stop={t_stop:g}s"
+
+            els = out_status.get("Elements")
+            if not isinstance(els, list):
+                return header + ("\nStatusSave.Elements missing." if not lang_zh else "\nStatusSave.Elements 缺失。")
+
+            rows: list[dict[str, Any]] = []
+            for el in els:
+                if not isinstance(el, dict):
+                    continue
+                model_id = el.get("ModelID") if isinstance(el.get("ModelID"), str) else ""
+                if model_id and not _pick(model_id):
+                    continue
+                st = el.get("Statistics") if isinstance(el.get("Statistics"), dict) else {}
+                props = el.get("Properties") if isinstance(el.get("Properties"), dict) else {}
+                ident = el.get("Identifier") if isinstance(el.get("Identifier"), str) else ""
+                label = el.get("Label") if isinstance(el.get("Label"), str) else ""
+                rows.append(
+                    {
+                        "identifier": ident.strip(),
+                        "label": label.strip(),
+                        "model_id": model_id.strip(),
+                        "v": st.get("电压"),
+                        "i": st.get("电流"),
+                        "p": st.get("功率"),
+                        "state": props.get("状态"),
+                    }
+                )
+
+            if not rows:
+                rows = []
+                for el in els:
+                    if not isinstance(el, dict):
+                        continue
+                    model_id = el.get("ModelID") if isinstance(el.get("ModelID"), str) else ""
+                    st = el.get("Statistics") if isinstance(el.get("Statistics"), dict) else {}
+                    props = el.get("Properties") if isinstance(el.get("Properties"), dict) else {}
+                    ident = el.get("Identifier") if isinstance(el.get("Identifier"), str) else ""
+                    label = el.get("Label") if isinstance(el.get("Label"), str) else ""
+                    rows.append(
+                        {
+                            "identifier": ident.strip(),
+                            "label": label.strip(),
+                            "model_id": model_id.strip(),
+                            "v": st.get("电压"),
+                            "i": st.get("电流"),
+                            "p": st.get("功率"),
+                            "state": props.get("状态"),
+                        }
+                    )
+
+            lines: list[str] = [header]
+            limit = 20
+            shown = 0
+            for r in rows:
+                if shown >= limit:
+                    break
+                name_bits = [b for b in [r.get("identifier"), r.get("label"), r.get("model_id")] if isinstance(b, str) and b]
+                name = " ".join(name_bits) if name_bits else "(element)"
+                v = r.get("v")
+                i = r.get("i")
+                p = r.get("p")
+                state = r.get("state")
+                parts: list[str] = []
+                if isinstance(v, (int, float)):
+                    parts.append(f"V≈{float(v):.6g}V")
+                if isinstance(i, (int, float)):
+                    parts.append(f"I≈{float(i):.6g}A")
+                if isinstance(p, (int, float)):
+                    parts.append(f"P≈{float(p):.6g}W")
+                if isinstance(state, (int, float)):
+                    parts.append(f"state={int(state)}")
+                if not parts:
+                    continue
+                lines.append(f"- {name}: " + " ".join(parts))
+                shown += 1
+
+            if len(rows) > shown:
+                remaining = len(rows) - shown
+                if lang_zh:
+                    lines.append(f"(还有 {remaining} 个元件未展示；你可以在问题里点名例如 '电容'/'电阻' 来筛选)")
+                else:
+                    lines.append(f"({remaining} more elements not shown; mention 'capacitor'/'resistor' to filter)")
+
+            if adapter_err:
+                # Keep the adapter error for debugging only if we showed something useful.
+                pass
+            return "\n".join(lines)
+
+    try:
+        pe_input = build_pe_circuit_input_from_status_save(status_save, strict=True)
+    except PlSavSimError as e:
+        if adapter_err:
+            if lang_zh:
+                return f"StatusSave→Phy-Engine 适配器失败：{adapter_err}\n回退到简化映射也失败：{e}"
+            return f"StatusSave→Phy-Engine adapter failed: {adapter_err}\nFallback mapper also failed: {e}"
+        return str(e)
+
+    try:
+        sim_out = run_with_timeout(
+            fn=_pe_analyze_and_sample_worker,
+            kwargs={
+                "lib_path": lib_path,
+                "element_codes": pe_input.element_codes,
+                "wires": pe_input.wires,
+                "properties": pe_input.properties,
+                "analyze_type": int(analyze_type),
+                "tr_t_step_s": float(t_step or 1e-6) if wants_tr else 0.0,
+                "tr_t_stop_s": float(t_stop or 1e-6) if wants_tr else 0.0,
+                "ac_omega_rad_s": 0.0,
+                "max_pins_per_comp": 8,
+                "max_branches_per_comp": 4,
+            },
+            timeout_sec=float(timeout_sec),
+            label="Phy-Engine simulation",
         )
-    finally:
-        lib.destroy_circuit(circuit=circuit, vec_pos=vec_pos, chunk_pos=chunk_pos)
+    except ProcTimeoutError:
+        if lang_zh:
+            return f"Phy-Engine 仿真超时（>{timeout_sec:g}s），已中止以避免卡住后续任务。"
+        return f"Phy-Engine simulation timed out (>{timeout_sec:g}s); aborted to avoid blocking later tasks."
+    except ProcRemoteError as e:
+        if lang_zh:
+            return f"Phy-Engine 仿真失败：{e}"
+        return f"Phy-Engine simulation failed: {e}"
+
+    voltage = list(sim_out.get("voltage") or [])
+    voltage_ord = list(sim_out.get("voltage_ord") or [])
+    current = list(sim_out.get("current") or [])
+    current_ord = list(sim_out.get("current_ord") or [])
 
     wants_caps = ("capacitor" in (text or "").lower()) or ("电容" in (text or ""))
     wants_res = ("resistor" in (text or "").lower()) or ("电阻" in (text or ""))

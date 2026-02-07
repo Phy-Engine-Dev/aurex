@@ -5,6 +5,7 @@ from typing import Any
 
 from pe_builder import BuiltCircuit, PESimSpec
 from pe_sim import AnalyzeType, PhyEngineLib
+from proc_timeout import ProcRemoteError, ProcTimeoutError, run_with_timeout
 
 
 class PEToolError(RuntimeError):
@@ -20,7 +21,7 @@ class PESample:
     comp_size: int
 
 
-def run_and_sample(
+def _run_and_sample_inner(
     *,
     lib_path: str,
     spec: PESimSpec,
@@ -73,6 +74,34 @@ def run_and_sample(
         )
     finally:
         pe.destroy_circuit(circuit=circuit, vec_pos=vec_pos, chunk_pos=chunk_pos)
+
+
+def run_and_sample(
+    *,
+    lib_path: str,
+    spec: PESimSpec,
+    built: BuiltCircuit,
+    max_pins_per_comp: int = 16,
+    max_branches_per_comp: int = 8,
+    timeout_sec: float | None = 5.0,
+) -> PESample:
+    try:
+        return run_with_timeout(
+            fn=_run_and_sample_inner,
+            kwargs={
+                "lib_path": lib_path,
+                "spec": spec,
+                "built": built,
+                "max_pins_per_comp": max_pins_per_comp,
+                "max_branches_per_comp": max_branches_per_comp,
+            },
+            timeout_sec=float(timeout_sec or 0.0),
+            label="Phy-Engine simulation",
+        )
+    except ProcTimeoutError as e:
+        raise PEToolError(str(e)) from e
+    except ProcRemoteError as e:
+        raise PEToolError(str(e)) from e
 
 
 def _comp_index_for_element_index(element_index: int) -> int | None:
@@ -162,4 +191,3 @@ def evaluate_probes(
         else:
             out.append({"kind": kind, "target": target, "value": None, "error": "unknown_probe_kind"})
     return out
-

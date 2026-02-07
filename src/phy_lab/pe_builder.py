@@ -138,7 +138,11 @@ def parse_pe_sim_spec(
     if tr_stop is not None and not _is_finite_number(tr_stop):
         raise PEBuilderError("spec.analysis.tr_t_stop_s must be a number")
 
-    comps_raw = _require_list(root.get("components"), where="spec.components")
+    comps_raw = root.get("components")
+    # Best-effort normalization: some LLMs emit a single component object instead of a list.
+    if isinstance(comps_raw, dict):
+        comps_raw = [comps_raw]
+    comps_raw = _require_list(comps_raw, where="spec.components")
     if max_components > 0 and len(comps_raw) > max_components:
         raise PEBuilderError(
             f"Too many components (count={len(comps_raw)}, limit={max_components})"
@@ -215,6 +219,8 @@ def parse_pe_sim_spec(
     probes_raw = root.get("probes", [])
     if probes_raw is None:
         probes_raw = []
+    if isinstance(probes_raw, dict):
+        probes_raw = [probes_raw]
     probes_list = _require_list(probes_raw, where="spec.probes")
     if max_probes > 0 and len(probes_list) > max_probes:
         raise PEBuilderError(f"Too many probes (count={len(probes_list)}, limit={max_probes})")

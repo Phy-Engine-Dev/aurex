@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ctypes
+import json
 from dataclasses import dataclass
 from typing import Iterable
 
@@ -70,6 +71,9 @@ class PhyEngineLib:
         if not lib_path:
             raise PESimError("Missing lib_path")
         self._lib = ctypes.CDLL(lib_path)
+        self._plw_last_error = None
+        self._plw_string_free = None
+        self._plw_pe_simulate_status_save = None
         self._bind()
 
     def _bind(self) -> None:
@@ -84,6 +88,8 @@ class PhyEngineLib:
         c_uint32 = ctypes.c_uint32
         c_double = ctypes.c_double
         c_uint8 = ctypes.c_uint8
+        c_char_p = ctypes.c_char_p
+        c_int = ctypes.c_int
 
         self._lib.create_circuit.argtypes = [
             c_int_p,
@@ -157,6 +163,82 @@ class PhyEngineLib:
             c_uint8,
         ]
         self._lib.circuit_set_model_digital.restype = ctypes.c_int
+
+        # Optional: PhysicsLab StatusSave -> PE adapter (compiled into libphyengine.so if available).
+        try:
+            self._plw_last_error = getattr(self._lib, "plw_last_error")
+            self._plw_last_error.argtypes = []
+            self._plw_last_error.restype = c_char_p
+        except Exception:
+            self._plw_last_error = None
+
+        try:
+            self._plw_string_free = getattr(self._lib, "plw_string_free")
+            self._plw_string_free.argtypes = [c_void_p]
+            self._plw_string_free.restype = None
+        except Exception:
+            self._plw_string_free = None
+
+        try:
+            self._plw_pe_simulate_status_save = getattr(self._lib, "plw_pe_simulate_status_save")
+            self._plw_pe_simulate_status_save.argtypes = [
+                c_char_p,  # json bytes
+                c_size_t,  # byte length
+                c_uint32,  # analyze_type
+                c_double,  # tr_t_step_s
+                c_double,  # tr_t_stop_s
+                c_double,  # ac_omega_rad_s
+                c_int,  # indent
+            ]
+            self._plw_pe_simulate_status_save.restype = c_void_p
+        except Exception:
+            self._plw_pe_simulate_status_save = None
+
+    def can_simulate_status_save(self) -> bool:
+        return bool(self._plw_pe_simulate_status_save and self._plw_string_free)
+
+    def simulate_status_save(
+        self,
+        *,
+        status_save: dict,
+        analyze_type: int,
+        tr_t_step_s: float = 0.0,
+        tr_t_stop_s: float = 0.0,
+        ac_omega_rad_s: float = 0.0,
+        indent: int = 0,
+    ) -> dict:
+        if not self.can_simulate_status_save():
+            raise PESimError("Phy-Engine library does not export plw_pe_simulate_status_save")
+        payload = json.dumps(status_save, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        ptr = self._plw_pe_simulate_status_save(
+            payload,
+            ctypes.c_size_t(len(payload)),
+            ctypes.c_uint32(int(analyze_type)),
+            ctypes.c_double(float(tr_t_step_s)),
+            ctypes.c_double(float(tr_t_stop_s)),
+            ctypes.c_double(float(ac_omega_rad_s)),
+            ctypes.c_int(int(indent)),
+        )
+        if not ptr:
+            msg = None
+            if self._plw_last_error is not None:
+                try:
+                    raw = self._plw_last_error()
+                    msg = raw.decode("utf-8", errors="replace") if isinstance(raw, (bytes, bytearray)) else str(raw)
+                except Exception:
+                    msg = None
+            raise PESimError(msg or "plw_pe_simulate_status_save failed")
+        try:
+            out_text = ctypes.string_at(ptr).decode("utf-8", errors="replace")
+        finally:
+            self._plw_string_free(ctypes.c_void_p(ptr))
+        try:
+            obj = json.loads(out_text)
+        except json.JSONDecodeError as e:
+            raise PESimError(f"plw_pe_simulate_status_save returned invalid JSON: {e}") from e
+        if not isinstance(obj, dict):
+            raise PESimError("plw_pe_simulate_status_save returned non-object JSON")
+        return obj
 
     def create_circuit(
         self,
