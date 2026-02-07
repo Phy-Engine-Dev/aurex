@@ -13,6 +13,11 @@ _ID_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_]{0,31}$")
 _NODE_RE = re.compile(r"^[A-Za-z0-9_:+.-]{1,32}$")
 _PIN_REF_RE = re.compile(r"^(?P<id>[A-Za-z][A-Za-z0-9_]{0,31})\.(?P<pin>[01])$")
 _PARAM_KEY_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_]{0,31}$")
+_ENG_NUM_RE = re.compile(
+    r"^\s*(?P<num>[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?)"
+    r"(?P<suffix>meg|[pnumkKMGµ]?)"
+    r"(?P<unit>[A-Za-zΩ]*)\s*$"
+)
 
 
 def _node_key(name: str) -> str:
@@ -42,10 +47,36 @@ def _require_node(value: str, *, where: str) -> str:
 
 
 def _parse_float(token: str, *, where: str) -> float:
+    token = (token or "").strip()
+    if not token:
+        raise PEScriptError(f"{where} must be a number (got {token!r})")
+
     try:
         v = float(token)
-    except Exception as e:
-        raise PEScriptError(f"{where} must be a number (got {token!r})") from e
+    except Exception:
+        m = _ENG_NUM_RE.match(token)
+        if not m:
+            raise PEScriptError(f"{where} must be a number (got {token!r})")
+        try:
+            base = float(m.group("num"))
+        except Exception as e:
+            raise PEScriptError(f"{where} must be a number (got {token!r})") from e
+
+        suf = (m.group("suffix") or "").strip()
+        suf_low = suf.casefold()
+        scale_map = {
+            "p": 1e-12,
+            "n": 1e-9,
+            "u": 1e-6,
+            "µ": 1e-6,
+            "m": 1e-3,
+            "k": 1e3,
+            "K": 1e3,
+            "M": 1e6,
+            "G": 1e9,
+        }
+        scale = 1e6 if suf_low == "meg" else scale_map.get(suf, 1.0)
+        v = base * float(scale)
     if v != v or v in (float("inf"), float("-inf")):
         raise PEScriptError(f"{where} must be finite (got {token!r})")
     return v

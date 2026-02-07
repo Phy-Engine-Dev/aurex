@@ -48,3 +48,21 @@ class TestPEScript(unittest.TestCase):
         with self.assertRaises(PEScriptError):
             parse_pe_script_to_spec_obj("HACK rm -rf /")
 
+    def test_parses_engineering_suffixes(self):
+        script = "\n".join(
+            [
+                "ANALYSIS tr",
+                "SET TR 1ms 10ms",
+                "ADD V1 vdc vin gnd v=5V",
+                "ADD R1 r vin n1 r=1k",
+                "ADD C1 c n1 gnd c=100nF",
+                "PROBE NODE n1",
+            ]
+        )
+        obj = parse_pe_script_to_spec_obj(script, max_components=10, max_probes=10)
+        self.assertEqual(obj["analysis"]["type"], "tr")
+        self.assertAlmostEqual(obj["analysis"]["tr_t_step_s"], 1e-3)
+        self.assertAlmostEqual(obj["analysis"]["tr_t_stop_s"], 1e-2)
+        comps = {c["id"]: c for c in obj["components"]}
+        self.assertAlmostEqual(comps["R1"]["params"]["r_ohm"], 1000.0)
+        self.assertAlmostEqual(comps["C1"]["params"]["c_f"], 100e-9)
