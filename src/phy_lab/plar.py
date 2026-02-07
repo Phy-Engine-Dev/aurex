@@ -137,17 +137,25 @@ def query_experiments(
 ) -> list[dict[str, Any]]:
     qe = getattr(user, "query_experiments", None)
     if callable(qe):
-        result = qe(
-            category=category,
-            tags=None,
-            exclude_tags=None,
-            languages=[],
-            exclude_languages=[],
-            user_id=None,
-            take=take,
-            skip=skip,
-            from_skip=from_skip,
-        )
+        # NOTE: The upstream API expects `Query.Tags` to be an array. Passing null can
+        # cause `Input.Field.Invalid` (400). plweb2 always sends an array, even when
+        # it's empty.
+        try:
+            result = qe(
+                category=category,
+                tags=[],
+                exclude_tags=[],
+                languages=[],
+                exclude_languages=[],
+                user_id=None,
+                take=take,
+                skip=skip,
+                from_skip=from_skip,
+            )
+        except Exception:
+            # Fall back to a direct HTTP call (below) if the wrapper is buggy or
+            # rejects the request for any reason.
+            result = None
     else:
         # Defensive fallback: some wrappers/mocks may expose a non-callable attribute with the
         # same name. In that case, call the underlying HTTP API directly using the user's
@@ -173,8 +181,55 @@ def query_experiments(
                     "Category": cat_val,
                     "Languages": [],
                     "ExcludeLanguages": [],
-                    "Tags": None,
-                    "ExcludeTags": None,
+                    "Tags": [],
+                    "ExcludeTags": [],
+                    "ModelTags": None,
+                    "ModelID": None,
+                    "ParentID": None,
+                    "UserID": None,
+                    "Special": None,
+                    "From": from_skip,
+                    "Skip": int(skip),
+                    "Take": int(take),
+                    "Days": 0,
+                    "Sort": 0,
+                    "ShowAnnouncement": False,
+                }
+            },
+            headers={
+                "Content-Type": "application/json",
+                "x-API-Token": token,
+                "x-API-AuthCode": auth_code,
+            },
+            timeout=_requests_default_timeout_sec,
+        )
+        resp.raise_for_status()
+        result = resp.json()
+    if result is None:
+        # Wrapper call failed; retry with a direct HTTP request.
+        token = getattr(user, "token", None)
+        auth_code = getattr(user, "auth_code", None)
+        if not isinstance(token, str) or not token.strip() or not isinstance(auth_code, str) or not auth_code.strip():
+            raise PLARError(
+                "query_experiments wrapper failed, and token/auth_code are missing for a direct retry."
+            )
+        cat_val = getattr(category, "value", category)
+        try:
+            import requests  # type: ignore
+        except ImportError as e:  # pragma: no cover
+            raise PLARError(
+                "Missing dependency: requests (required for Physics Lab API calls). "
+                "Install it with pip (e.g. 'pip install requests')."
+            ) from e
+        resp = requests.post(
+            "https://physics-api-cn.turtlesim.com/Contents/QueryExperiments",
+            json={
+                "Query": {
+                    "Category": cat_val,
+                    "Languages": [],
+                    "ExcludeLanguages": [],
+                    "Tags": [],
+                    "ExcludeTags": [],
                     "ModelTags": None,
                     "ModelID": None,
                     "ParentID": None,
