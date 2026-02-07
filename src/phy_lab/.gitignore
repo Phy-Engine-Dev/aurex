@@ -1,0 +1,8 @@
+/.cache/
+/.data/
+/config.json
+/state.json
+*.state.json
+/cache/
+*.log
+__pycache__/

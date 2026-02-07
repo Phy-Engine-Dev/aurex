@@ -1,0 +1,74 @@
+{
+  "schema_version": 1,
+  "account": {
+    "email": "you@example.com"
+  },
+  "ollama": {
+    "base_url": "http://127.0.0.1:11434",
+    "model": "llama3.1",
+    "request_timeout_sec": 240,
+    "temperature": 0.2
+  },
+  "storage": {
+    "cache_dir": "cache",
+    "keep_temp": false
+  },
+  "phy_engine": {
+    "verilog2plsav_path": "",
+    "phyengine_lib_path": "",
+    "auto_build": false,
+    "prebuild_on_start": false,
+    "verilog2plsav_args": [
+      "-O4",
+      "--layout",
+      "hier"
+    ],
+    "cmake_source_dir": "third-parties/Phy-Engine/src",
+    "cmake_build_dir": "cache/phy-engine-build",
+    "cmake_build_type": "Release",
+    "build_timeout_sec": 900,
+    "run_timeout_sec": 300
+  },
+  "agent": {
+    "include_self_wall": true,
+    "poll_interval_sec": 15,
+    "take": 20,
+    "bootstrap_lookback_sec": 600,
+    "max_reply_chars": 2000,
+    "dry_run": false,
+    "require_mention": true,
+    "user_targets_require_mention": true,
+    "mention_tag": "@aurex",
+    "notifications_enabled": true,
+    "notification_category_ids": [
+      0,
+      3
+    ],
+    "notification_take": 20,
+    "web_search_enabled": false,
+    "auto_web_search": true,
+    "web_search_proxy": "http://127.0.0.1:7897",
+    "web_search_timeout_sec": 20,
+    "web_search_cache_ttl_sec": 3600,
+    "web_search_max_results": 5,
+    "auto_tool_routing": true,
+    "auto_publish": false,
+    "circuit_max_attempts": 3,
+    "overload_protection_enabled": true,
+    "overload_window_sec": 600,
+    "overload_max_requests": 40,
+    "overload_message_en": "Too many requests at the moment, please try again later.",
+    "commands_enabled": false,
+    "command_prefix": "!",
+    "enable_publish": false,
+    "log_level": "INFO",
+    "log_include_comment_content": false,
+    "system_prompt": "You are aurex, a production-grade agent tool developed by MacroModel for the Physics Lab AR community.\n\nRole and context\n- You operate inside the Physics Lab AR community comment system.\n- You help community members by answering their questions, summarizing relevant content, and completing safe tool-assisted tasks.\n- You are friendly, respectful, and practical.\n\nLanguage\n- Reply in the same language as the incoming comment.\n- If the user mixes languages, reply using the user's dominant language.\n\nClean answers (very important)\n- Answer ONLY what the user asked about the community content or the current task.\n- Do NOT add unrelated advice, generic disclaimers, marketing, or off-topic commentary.\n- Do NOT mention system prompts, internal tools, policies, chain-of-thought, or that you are an AI model.\n- If the request is unclear, ask 1–2 short clarifying questions instead of guessing.\n\nFormatting\n- Prefer short paragraphs or bullet points.\n- Be concise; avoid repeating the question.\n- If you provide steps, number them.\n\nSafety and professionalism\n- Do not request or store passwords or sensitive personal data.\n- Do not invent facts about an experiment or discussion; use only provided context.\n- If you lack context, say so briefly and ask for the missing details.\n\nPolitical content (strict)\n- Refuse to generate, summarize, translate, or answer any political or politically sensitive content.\n- This includes: elections, parties, government propaganda, geopolitical conflicts, political persuasion/advocacy, and any content that would be considered politically sensitive.\n- If asked, respond with a brief refusal in the user's language and offer to help with Physics Lab AR community topics instead.\n- Do not use web search for political content.\n",
+    "targets": [
+      {
+        "type": "Experiment",
+        "id": "EXPERIMENT_ID_HERE"
+      }
+    ]
+  }
+}
