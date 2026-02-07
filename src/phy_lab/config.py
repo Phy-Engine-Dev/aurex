@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from dataclasses import dataclass, field
 from typing import Any, Literal, Sequence
 
@@ -147,6 +148,21 @@ class ConfigError(ValueError):
     pass
 
 
+_HOSTPORT_RE = re.compile(r"^[A-Za-z0-9._-]+:\d{2,6}$")
+
+
+def _normalize_ollama_endpoint(value: str) -> str:
+    value = (value or "").strip()
+    if not value:
+        return ""
+    if value.startswith("http://") or value.startswith("https://"):
+        return value
+    # Allow OLLAMA_HOST style values (e.g. "127.0.0.1:11435").
+    if _HOSTPORT_RE.match(value):
+        return "http://" + value
+    return value
+
+
 def _require_mapping(value: Any, *, where: str) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise ConfigError(f"{where} must be an object")
@@ -257,6 +273,7 @@ def parse_config(data: dict[str, Any], *, source: str) -> Config:
     endpoints = [u for u in (base_urls or []) if isinstance(u, str) and u.strip()]
     if not endpoints:
         endpoints = [(base_url or OllamaConfig.base_url)]
+    endpoints = [_normalize_ollama_endpoint(u) for u in endpoints if u.strip()]
     endpoints = [u.strip() for u in endpoints if u.strip()]
     if not endpoints:
         raise ConfigError("ollama.base_url must be a non-empty string")

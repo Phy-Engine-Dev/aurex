@@ -4,9 +4,9 @@
     "email": "you@example.com"
   },
   "ollama": {
-    "base_url": "http://127.0.0.1:11434",
+    "base_url": "127.0.0.1:11434",
     "base_urls": [
-      "http://127.0.0.1:11434"
+      "127.0.0.1:11434"
     ],
     "model": "llama3.1",
     "request_timeout_sec": 240,

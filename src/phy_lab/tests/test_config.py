@@ -66,7 +66,7 @@ class TestConfig(unittest.TestCase):
                 "schema_version": 1,
                 "account": {"email": "user@example.com"},
                 "ollama": {
-                    "base_urls": ["http://127.0.0.1:11434", "http://127.0.0.1:11435"],
+                    "base_urls": ["127.0.0.1:11434", "127.0.0.1:11435"],
                     "model": "gpt-oss:latest",
                     "max_parallel_requests": 2,
                 },
