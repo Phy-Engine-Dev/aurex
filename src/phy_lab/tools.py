@@ -1147,6 +1147,107 @@ def web_search_duckduckgo(
     max_results: int = 5,
     user_agent: str = "",
 ) -> str:
+    def _try_ddgsearch() -> str | None:
+        """DuckDuckGo via the `duckduckgo-search` library (preferred).
+
+        Returns:
+            - str: formatted results
+            - None: if dependency is missing (so caller can fall back)
+        """
+        try:
+            from duckduckgo_search import DDGS  # type: ignore
+        except Exception:
+            return None
+
+        import inspect
+
+        q = (query or "").strip()
+        if not q:
+            return "Provide a query string."
+
+        if max_results <= 0:
+            n = 5
+        else:
+            n = int(max_results)
+        if n > 10:
+            n = 10
+
+        cache_root = os.path.join(cache_dir, "web_cache", "duckduckgo_search")
+        digest = hashlib.sha256(
+            json.dumps({"q": q, "n": n}, ensure_ascii=False, sort_keys=True).encode("utf-8")
+        ).hexdigest()
+        cache_path = os.path.join(cache_root, f"{digest}.json")
+        cached = _cache_get(cache_path, ttl_sec=int(ttl_sec))
+        if cached is not None:
+            try:
+                data = json.loads(cached)
+                if isinstance(data, list):
+                    items = [x for x in data if isinstance(x, dict)]
+                else:
+                    items = []
+            except Exception:
+                items = []
+        else:
+            kwargs: dict[str, Any] = {}
+            try:
+                sig = inspect.signature(DDGS)
+                params = sig.parameters
+            except Exception:
+                params = {}
+
+            p = (proxy or "").strip()
+            if p:
+                if "://" not in p:
+                    p = "http://" + p
+                if "proxy" in params:
+                    kwargs["proxy"] = p
+                elif "proxies" in params:
+                    kwargs["proxies"] = {"http": p, "https": p}
+
+            ua = (user_agent or "").strip() or _default_user_agent()
+            if "headers" in params:
+                kwargs["headers"] = {"User-Agent": ua}
+
+            if "timeout" in params:
+                kwargs["timeout"] = float(timeout_sec)
+
+            ddgs = DDGS(**kwargs) if kwargs else DDGS()
+            try:
+                results = ddgs.text(q, max_results=n)  # type: ignore[call-arg]
+            except TypeError:
+                results = ddgs.text(q, n)  # type: ignore[misc]
+
+            try:
+                raw_items = list(results)
+            except TypeError:
+                raw_items = results if isinstance(results, list) else []
+
+            items = [x for x in raw_items if isinstance(x, dict)]
+            _cache_put(cache_path, json.dumps(items, ensure_ascii=False))
+
+        pairs: list[tuple[str, str]] = []
+        seen: set[str] = set()
+        for it in items:
+            title = str(it.get("title") or it.get("heading") or it.get("name") or "").strip()
+            url = str(it.get("href") or it.get("url") or it.get("link") or "").strip()
+            if not title or not url or not url.startswith("http"):
+                continue
+            if url in seen:
+                continue
+            seen.add(url)
+            pairs.append((title, url))
+            if len(pairs) >= n:
+                break
+
+        if not pairs:
+            return f"No results parsed from DuckDuckGo (duckduckgo-search).\nQuery: {q}"
+
+        lines = ["DuckDuckGo results:"]
+        for i, (t, u) in enumerate(pairs, start=1):
+            lines.append(f"{i}. {truncate(t, max_chars=120)}")
+            lines.append(f"   {u}")
+        return "\n".join(lines)
+
     query = (query or "").strip()
     if not query:
         return "Provide a query string."
@@ -1154,6 +1255,10 @@ def web_search_duckduckgo(
         max_results = 5
     if max_results > 10:
         max_results = 10
+
+    ddgsearch_res = _try_ddgsearch()
+    if ddgsearch_res is not None:
+        return ddgsearch_res
 
     # Prefer the lightweight HTML endpoint (often less blocked than the main site).
     url = "https://html.duckduckgo.com/html/?" + urllib.parse.urlencode({"q": query})
@@ -1385,7 +1490,7 @@ def web_search(
     searxng_base_url: str = "",
 ) -> str:
     provider = (provider or "google").strip().lower()
-    if provider == "ddg":
+    if provider in ("ddg", "duckduckgo-search", "duckduckgo_search", "ddg-search", "ddg_search", "ddgsearch"):
         provider = "duckduckgo"
 
     if provider == "baidu":

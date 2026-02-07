@@ -53,7 +53,7 @@
     ],
     "notification_take": 20,
     "web_search_enabled": false,
-    "web_search_provider": "bing",
+    "web_search_provider": "duckduckgo-search",
     "auto_web_search": true,
     "web_search_user_agent": "",
     "web_search_proxy": "http://127.0.0.1:7897",

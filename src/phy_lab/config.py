@@ -491,11 +491,32 @@ def parse_config(data: dict[str, Any], *, source: str) -> Config:
         raise ConfigError("agent.publish_category must be 'Experiment' or 'Discussion'")
 
     web_search_provider_final = (web_search_provider or AgentConfig.web_search_provider).strip().lower()
-    if web_search_provider_final not in ("google", "duckduckgo", "ddg", "baidu", "bing", "bing_html", "searxng", "searx"):
+    if web_search_provider_final not in (
+        "google",
+        "duckduckgo",
+        "duckduckgo-search",
+        "duckduckgo_search",
+        "ddg",
+        "ddg-search",
+        "ddg_search",
+        "ddgsearch",
+        "baidu",
+        "bing",
+        "bing_html",
+        "searxng",
+        "searx",
+    ):
         raise ConfigError(
-            "agent.web_search_provider must be one of: google, baidu, duckduckgo, bing, searxng"
+            "agent.web_search_provider must be one of: duckduckgo-search, duckduckgo, google, baidu, bing, searxng"
         )
-    if web_search_provider_final == "ddg":
+    if web_search_provider_final in (
+        "ddg",
+        "duckduckgo-search",
+        "duckduckgo_search",
+        "ddg-search",
+        "ddg_search",
+        "ddgsearch",
+    ):
         web_search_provider_final = "duckduckgo"
     if web_search_provider_final == "bing_html":
         web_search_provider_final = "bing"

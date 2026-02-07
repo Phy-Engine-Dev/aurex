@@ -76,7 +76,7 @@ Key settings:
 - `agent.notifications_enabled`: poll the Notifications API and auto-discover targets (default: `true`)
 - `agent.notification_category_ids`: which notification categories to poll (default: `[0, 3]`)
 - `agent.web_search_enabled`: enable web search (default: `false`)
-- `agent.web_search_provider`: `google` | `bing` | `duckduckgo` | `baidu` | `searxng` (default: `google`)
+- `agent.web_search_provider`: `duckduckgo-search` | `google` | `bing` | `duckduckgo` | `baidu` | `searxng` (default: `google`; `duckduckgo-search` requires installing `duckduckgo-search`)
 - `agent.web_search_searxng_base_url`: SearXNG base URL (example: `http://127.0.0.1:8080`)
 - `agent.web_search_user_agent`: optional custom User-Agent string
 - `agent.web_search_proxy`: optional HTTP(S) proxy (example: `http://127.0.0.1:7897`)
@@ -181,7 +181,7 @@ This context is injected into the LLM prompt for `@mention`/command-triggered re
 - `Missing dependency: requests`: run `python -m pip install -r src/phy_lab/requirements.txt`
 - `Failed to reach Ollama`: confirm `ollama serve` is running and `ollama.base_url` is correct
 - `Login failed`: verify the account email/password and ensure the API is reachable
-- Web search returns no results / captcha: try `agent.web_search_provider=bing`, or run a local SearXNG and set `agent.web_search_provider=searxng` + `agent.web_search_searxng_base_url=http://127.0.0.1:8080`
+- Web search returns no results / captcha: try `agent.web_search_provider=duckduckgo-search` or `agent.web_search_provider=bing`, or run a local SearXNG and set `agent.web_search_provider=searxng` + `agent.web_search_searxng_base_url=http://127.0.0.1:8080`
 - Web search diagnostics (no login required): `python src/phy_lab/agent.py webtest --config .phy_lab/config.json --all --query "your query"`
 - Circuit build failures: set `phy_engine.auto_build=true` (or point to a working `verilog2plsav`) and check CMake output in the cache directory
 - Circuit compile keeps failure artifacts under `storage.cache_dir/artifacts/<artifact_id>/` (includes `design.v` and `compile_error.txt`)

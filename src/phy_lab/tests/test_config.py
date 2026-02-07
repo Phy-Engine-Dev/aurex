@@ -78,6 +78,17 @@ class TestConfig(unittest.TestCase):
         self.assertEqual(cfg.ollama.base_urls, ["http://127.0.0.1:11434", "http://127.0.0.1:11435"])
         self.assertEqual(cfg.ollama.max_parallel_requests, 2)
 
+    def test_parse_web_search_provider_duckduckgo_search_alias(self):
+        cfg = parse_config(
+            {
+                "schema_version": 1,
+                "account": {"email": "user@example.com"},
+                "agent": {"targets": [], "web_search_provider": "duckduckgo-search"},
+            },
+            source="in-memory",
+        )
+        self.assertEqual(cfg.agent.web_search_provider, "duckduckgo")
+
     def test_parse_invalid_schema_version(self):
         with self.assertRaises(ConfigError):
             parse_config(

@@ -3028,7 +3028,7 @@ def main(argv: list[str] | None = None) -> int:
     p_web.add_argument(
         "--provider",
         default=None,
-        help="Override provider (google|bing|duckduckgo|baidu|searxng). Defaults to config.",
+        help="Override provider (duckduckgo-search|duckduckgo|google|bing|baidu|searxng). Defaults to config.",
     )
     p_web.add_argument(
         "--all",
