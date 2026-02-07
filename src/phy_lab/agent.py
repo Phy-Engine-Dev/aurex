@@ -1035,6 +1035,7 @@ def _handle_comment(
                                     context_json=experiment_context,
                                     phy_engine_cfg=cfg.phy_engine,
                                     config_base_dir=config_base_dir,
+                                    max_attempts=1,
                                     max_components=int(
                                         getattr(cfg.agent, "simulation_ai_max_components", 30) or 30
                                     ),
@@ -1221,6 +1222,7 @@ def _handle_comment(
                                     context_json=experiment_context,
                                     phy_engine_cfg=cfg.phy_engine,
                                     config_base_dir=config_base_dir,
+                                    max_attempts=1,
                                     max_components=int(
                                         getattr(cfg.agent, "simulation_ai_max_components", 30) or 30
                                     ),
@@ -1716,6 +1718,7 @@ def _handle_comment(
                         context_json=experiment_context,
                         phy_engine_cfg=cfg.phy_engine,
                         config_base_dir=config_base_dir,
+                        max_attempts=1,
                         max_components=int(
                             getattr(cfg.agent, "simulation_ai_max_components", 30) or 30
                         ),

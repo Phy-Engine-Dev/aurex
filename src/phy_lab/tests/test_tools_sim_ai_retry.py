@@ -48,14 +48,13 @@ class TestSimAiRetry(unittest.TestCase):
                             context_json=None,
                             phy_engine_cfg=_PhyCfg(),
                             config_base_dir=".",
-                            max_attempts=3,
+                            max_attempts=2,
                         )
 
         self.assertIn("我没能从你的描述里构建出可仿真的电路规格", out)
         self.assertEqual(m_build.call_count, 1)
-        self.assertEqual(m_fix.call_count, 2)
+        self.assertEqual(m_fix.call_count, 1)
 
 
 if __name__ == "__main__":
     unittest.main()
-

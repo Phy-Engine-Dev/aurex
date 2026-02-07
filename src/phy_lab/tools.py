@@ -388,7 +388,7 @@ def simulate_ai_circuit_with_phyengine(
     config_base_dir: str,
     max_components: int = 30,
     max_probes: int = 20,
-    max_attempts: int = 3,
+    max_attempts: int = 2,
 ) -> str:
     lang_zh = _looks_like_zh(text)
     if max_attempts <= 0:
