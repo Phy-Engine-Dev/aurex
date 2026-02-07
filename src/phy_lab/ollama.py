@@ -45,36 +45,55 @@ class OllamaClient:
             "options": {"temperature": self.temperature, "num_predict": int(self.num_predict)},
         }
 
+        # Avoid accidentally proxying localhost (common when users set HTTP_PROXY for web search).
+        session = requests.Session()
+        if _is_local_base_url(self.base_url):
+            session.trust_env = False
+
+        # Some Ollama builds/models can occasionally return an empty message.content.
+        # Treat it as a transient server-side failure and retry once.
+        max_attempts = 2
+        last_data: Any = None
+        for attempt in range(1, max_attempts + 1):
+            try:
+                resp = session.post(url, json=payload, timeout=self.timeout_sec)
+            except requests.RequestException as e:
+                raise OllamaError(f"Failed to reach Ollama at {url}: {e}") from e
+
+            if not resp.ok:
+                body = resp.text
+                if len(body) > 2000:
+                    body = body[:2000] + "...(truncated)"
+                raise OllamaError(f"Ollama error {resp.status_code}: {body}")
+
+            try:
+                data = resp.json()
+            except json.JSONDecodeError as e:
+                raise OllamaError(f"Invalid JSON response from Ollama: {e}") from e
+
+            last_data = data
+            message = data.get("message")
+            if not isinstance(message, dict):
+                raise OllamaError("Ollama response missing 'message' object")
+            content = message.get("content")
+            if not isinstance(content, str):
+                raise OllamaError("Ollama response missing 'message.content' string")
+            content = content.strip()
+            if content:
+                return content
+            if attempt < max_attempts:
+                continue
+
+        # If we get here, every attempt returned empty content.
+        preview = ""
         try:
-            # Avoid accidentally proxying localhost (common when users set HTTP_PROXY for web search).
-            session = requests.Session()
-            if _is_local_base_url(self.base_url):
-                session.trust_env = False
-            resp = session.post(url, json=payload, timeout=self.timeout_sec)
-        except requests.RequestException as e:
-            raise OllamaError(f"Failed to reach Ollama at {url}: {e}") from e
-
-        if not resp.ok:
-            body = resp.text
-            if len(body) > 2000:
-                body = body[:2000] + "...(truncated)"
-            raise OllamaError(f"Ollama error {resp.status_code}: {body}")
-
-        try:
-            data = resp.json()
-        except json.JSONDecodeError as e:
-            raise OllamaError(f"Invalid JSON response from Ollama: {e}") from e
-
-        message = data.get("message")
-        if not isinstance(message, dict):
-            raise OllamaError("Ollama response missing 'message' object")
-        content = message.get("content")
-        if not isinstance(content, str):
-            raise OllamaError("Ollama response missing 'message.content' string")
-        content = content.strip()
-        if not content:
-            raise OllamaError("Ollama returned empty 'message.content'")
-        return content
+            preview = json.dumps(last_data, ensure_ascii=False)[:500]
+        except Exception:
+            preview = str(last_data)[:500]
+        raise OllamaError(
+            "Ollama returned empty 'message.content' (after retry). "
+            + (f"Response preview: {preview}" if preview else "")
+        )
 
 
 class OllamaPool:

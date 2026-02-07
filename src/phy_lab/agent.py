@@ -300,6 +300,8 @@ def _guess_simulation_issue_codes(lines: list[str]) -> list[str]:
     codes: list[str] = []
     if any(x in blob for x in ("connection refused", "failed to establish", "timeout", "timed out", "connectionerror")):
         codes.append("OLLAMA_UNREACHABLE_OR_TIMEOUT")
+    if "empty 'message.content'" in blob:
+        codes.append("OLLAMA_EMPTY_CONTENT")
     if any(x in blob for x in ("ensure_phyengine_lib", "cmake", "libphyengine", "phyengine_lib_path", "not found")):
         codes.append("PHYENGINE_LIB_MISSING_OR_BUILD_FAILED")
     if any(x in blob for x in ("i couldn't parse the command script", "命令脚本解析", "pe-script", "pescripterror")):

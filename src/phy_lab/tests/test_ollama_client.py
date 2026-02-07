@@ -66,7 +66,36 @@ class TestOllamaClient(unittest.TestCase):
             with self.assertRaises(OllamaError):
                 c.chat(messages=[{"role": "user", "content": "x"}])
 
+    def test_empty_content_retries_once(self):
+        calls = {"n": 0}
+
+        class _Resp:
+            ok = True
+
+            def __init__(self, content):
+                self._content = content
+
+            def json(self):
+                return {"message": {"content": self._content}}
+
+        class _Session:
+            def __init__(self):
+                self.trust_env = True
+
+            def post(self, *_a, **_kw):
+                calls["n"] += 1
+                return _Resp("   " if calls["n"] == 1 else "OK")
+
+        fake_requests = types.ModuleType("requests")
+        fake_requests.Session = _Session  # type: ignore[attr-defined]
+        fake_requests.RequestException = Exception  # type: ignore[attr-defined]
+
+        with mock.patch.dict(sys.modules, {"requests": fake_requests}):
+            c = OllamaClient(base_url="http://127.0.0.1:11434", model="m")
+            out = c.chat(messages=[{"role": "user", "content": "x"}])
+        self.assertEqual(out, "OK")
+        self.assertEqual(calls["n"], 2)
+
 
 if __name__ == "__main__":
     unittest.main()
-
