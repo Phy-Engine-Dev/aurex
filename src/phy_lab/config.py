@@ -55,9 +55,12 @@ class AccountConfig:
 @dataclass(frozen=True)
 class OllamaConfig:
     base_url: str = "http://127.0.0.1:11434"
+    base_urls: list[str] = field(default_factory=list)
     model: str = "llama3.1"
     request_timeout_sec: int = 240
     temperature: float = 0.2
+    num_predict: int = 2048
+    max_parallel_requests: int = 1
 
 
 @dataclass(frozen=True)
@@ -101,6 +104,7 @@ class AgentConfig:
     notification_category_ids: list[int] = field(default_factory=lambda: list(DEFAULT_NOTIFICATION_CATEGORY_IDS))
     notification_take: int = 20
     web_search_enabled: bool = False
+    web_search_provider: str = "google"
     auto_web_search: bool = True
     web_search_proxy: str = ""
     web_search_timeout_sec: int = 20
@@ -114,6 +118,8 @@ class AgentConfig:
     publish_max_elements: int = 5000
     publish_category: str = "Discussion"
     publish_tags: list[str] = field(default_factory=lambda: list(DEFAULT_PUBLISH_TAGS))
+    simulation_enabled: bool = True
+    simulation_max_elements: int = 300
     overload_protection_enabled: bool = True
     overload_window_sec: int = 600
     overload_max_requests: int = 40
@@ -235,6 +241,7 @@ def parse_config(data: dict[str, Any], *, source: str) -> Config:
 
     ollama_obj = _require_mapping(data.get("ollama", {}), where="ollama")
     base_url = _optional_str(ollama_obj.get("base_url"), where="ollama.base_url")
+    base_urls = _optional_str_list(ollama_obj.get("base_urls"), where="ollama.base_urls")
     model = _optional_str(ollama_obj.get("model"), where="ollama.model")
     request_timeout_sec = _optional_int(
         ollama_obj.get("request_timeout_sec"), where="ollama.request_timeout_sec"
@@ -242,13 +249,31 @@ def parse_config(data: dict[str, Any], *, source: str) -> Config:
     temperature = _optional_float(
         ollama_obj.get("temperature"), where="ollama.temperature"
     )
+    num_predict = _optional_int(ollama_obj.get("num_predict"), where="ollama.num_predict")
+    max_parallel_requests = _optional_int(
+        ollama_obj.get("max_parallel_requests"), where="ollama.max_parallel_requests"
+    )
+
+    endpoints = [u for u in (base_urls or []) if isinstance(u, str) and u.strip()]
+    if not endpoints:
+        endpoints = [(base_url or OllamaConfig.base_url)]
+    endpoints = [u.strip() for u in endpoints if u.strip()]
+    if not endpoints:
+        raise ConfigError("ollama.base_url must be a non-empty string")
+
+    max_parallel_final = max_parallel_requests if max_parallel_requests is not None else OllamaConfig.max_parallel_requests
+    if max_parallel_final <= 0:
+        raise ConfigError("ollama.max_parallel_requests must be >= 1")
     ollama = OllamaConfig(
-        base_url=base_url or OllamaConfig.base_url,
+        base_url=endpoints[0],
+        base_urls=endpoints,
         model=model or OllamaConfig.model,
         request_timeout_sec=request_timeout_sec
         if request_timeout_sec is not None
         else OllamaConfig.request_timeout_sec,
         temperature=temperature if temperature is not None else OllamaConfig.temperature,
+        num_predict=num_predict if num_predict is not None else OllamaConfig.num_predict,
+        max_parallel_requests=max_parallel_final,
     )
 
     storage_obj = _require_mapping(data.get("storage", {}), where="storage")
@@ -345,6 +370,9 @@ def parse_config(data: dict[str, Any], *, source: str) -> Config:
     web_search_enabled = _optional_bool(
         agent_obj.get("web_search_enabled"), where="agent.web_search_enabled"
     )
+    web_search_provider = _optional_str(
+        agent_obj.get("web_search_provider"), where="agent.web_search_provider"
+    )
     auto_web_search = _optional_bool(
         agent_obj.get("auto_web_search"), where="agent.auto_web_search"
     )
@@ -420,6 +448,21 @@ def parse_config(data: dict[str, Any], *, source: str) -> Config:
     if publish_category_final not in ("Experiment", "Discussion"):
         raise ConfigError("agent.publish_category must be 'Experiment' or 'Discussion'")
 
+    web_search_provider_final = (web_search_provider or AgentConfig.web_search_provider).strip().lower()
+    if web_search_provider_final not in ("google", "duckduckgo", "ddg", "baidu"):
+        raise ConfigError("agent.web_search_provider must be one of: google, baidu, duckduckgo")
+    if web_search_provider_final == "ddg":
+        web_search_provider_final = "duckduckgo"
+
+    simulation_enabled = _optional_bool(
+        agent_obj.get("simulation_enabled"), where="agent.simulation_enabled"
+    )
+    simulation_max_elements = _optional_int(
+        agent_obj.get("simulation_max_elements"), where="agent.simulation_max_elements"
+    )
+    if simulation_max_elements is not None and simulation_max_elements < 0:
+        raise ConfigError("agent.simulation_max_elements must be >= 0")
+
     agent = AgentConfig(
         include_self_wall=include_self_wall
         if include_self_wall is not None
@@ -454,6 +497,7 @@ def parse_config(data: dict[str, Any], *, source: str) -> Config:
         web_search_enabled=web_search_enabled
         if web_search_enabled is not None
         else AgentConfig.web_search_enabled,
+        web_search_provider=web_search_provider_final,
         auto_web_search=auto_web_search
         if auto_web_search is not None
         else AgentConfig.auto_web_search,
@@ -485,6 +529,12 @@ def parse_config(data: dict[str, Any], *, source: str) -> Config:
         else AgentConfig.publish_max_elements,
         publish_category=publish_category_final,
         publish_tags=publish_tags if publish_tags is not None else list(DEFAULT_PUBLISH_TAGS),
+        simulation_enabled=simulation_enabled
+        if simulation_enabled is not None
+        else AgentConfig.simulation_enabled,
+        simulation_max_elements=simulation_max_elements
+        if simulation_max_elements is not None
+        else AgentConfig.simulation_max_elements,
         overload_protection_enabled=overload_protection_enabled
         if overload_protection_enabled is not None
         else AgentConfig.overload_protection_enabled,
@@ -544,9 +594,12 @@ def write_config(path: str, config: Config) -> None:
         "account": {"email": config.account.email},
         "ollama": {
             "base_url": config.ollama.base_url,
+            "base_urls": list(config.ollama.base_urls),
             "model": config.ollama.model,
             "request_timeout_sec": config.ollama.request_timeout_sec,
             "temperature": config.ollama.temperature,
+            "num_predict": config.ollama.num_predict,
+            "max_parallel_requests": config.ollama.max_parallel_requests,
         },
         "storage": {
             "cache_dir": config.storage.cache_dir,
@@ -578,6 +631,7 @@ def write_config(path: str, config: Config) -> None:
             "notification_category_ids": list(config.agent.notification_category_ids),
             "notification_take": config.agent.notification_take,
             "web_search_enabled": config.agent.web_search_enabled,
+            "web_search_provider": config.agent.web_search_provider,
             "auto_web_search": config.agent.auto_web_search,
             "web_search_proxy": config.agent.web_search_proxy,
             "web_search_timeout_sec": config.agent.web_search_timeout_sec,
@@ -591,6 +645,8 @@ def write_config(path: str, config: Config) -> None:
             "publish_max_elements": config.agent.publish_max_elements,
             "publish_category": config.agent.publish_category,
             "publish_tags": list(config.agent.publish_tags),
+            "simulation_enabled": config.agent.simulation_enabled,
+            "simulation_max_elements": config.agent.simulation_max_elements,
             "overload_protection_enabled": config.agent.overload_protection_enabled,
             "overload_window_sec": config.agent.overload_window_sec,
             "overload_max_requests": config.agent.overload_max_requests,

@@ -30,7 +30,7 @@ from config import (  # noqa: E402
     pick_state_path,
     resolve_path,
 )
-from ollama import OllamaClient  # noqa: E402
+from ollama import OllamaClient, OllamaPool  # noqa: E402
 from phy_engine import (  # noqa: E402
     PhyEngineError,
     ensure_phyengine_lib,
@@ -43,6 +43,7 @@ from plar import (  # noqa: E402
     get_comments,
     get_experiment_context,
     get_messages,
+    get_status_save,
     post_comment,
 )
 from state import (  # noqa: E402
@@ -73,6 +74,7 @@ from tools import (  # noqa: E402
     safe_reply,
     search_recent_experiments,
     simulate_series_vdc_two_resistors,
+    simulate_status_save_with_phyengine,
     web_search,
 )
 
@@ -306,6 +308,30 @@ def _fallback_route_for_circuit(user_text: str) -> tuple[bool, bool]:
     if looks_like_circuit and (looks_like_build or wants_experiment):
         return True, publish_intent
     return False, publish_intent
+
+
+def _looks_like_simulation_request(user_text: str) -> bool:
+    t = (user_text or "").casefold()
+    if not t:
+        return False
+    return any(
+        x in t
+        for x in (
+            "simulate",
+            "simulation",
+            "transient",
+            "dc analysis",
+            "ac analysis",
+            "time=",
+            "t=",
+            "仿真",
+            "模拟",
+            "瞬态",
+            "时域",
+            "直流分析",
+            "交流分析",
+        )
+    )
 
 
 def _setup_logging(
@@ -643,6 +669,7 @@ def _handle_comment(
                         reply = web_search(
                             query=routed_arg,
                             cache_dir=cache_dir,
+                            provider=str(getattr(cfg.agent, "web_search_provider", "google") or "google"),
                             proxy=str(getattr(cfg.agent, "web_search_proxy", "") or ""),
                             timeout_sec=int(getattr(cfg.agent, "web_search_timeout_sec", 20) or 20),
                             ttl_sec=int(getattr(cfg.agent, "web_search_cache_ttl_sec", 3600) or 3600),
@@ -654,9 +681,36 @@ def _handle_comment(
                     return safe_reply(reply, max_chars=cfg.agent.max_reply_chars)
 
                 if action == "simulate":
+                    sim_text = routed_arg or arg
+                    if (
+                        bool(getattr(cfg.agent, "simulation_enabled", True))
+                        and experiment_context is not None
+                        and isinstance(experiment_context.get("summary_id"), str)
+                        and isinstance(experiment_context.get("category"), str)
+                    ):
+                        summary_id = str(experiment_context.get("summary_id"))
+                        category_value = str(experiment_context.get("category"))
+                        try:
+                            status = get_status_save(
+                                user,
+                                summary_id=summary_id,
+                                category_value=category_value,
+                                cache_dir=cache_dir,
+                                ttl_sec=300,
+                            )
+                            reply = simulate_status_save_with_phyengine(
+                                text=sim_text,
+                                status_save=status,
+                                phy_engine_cfg=cfg.phy_engine,
+                                config_base_dir=config_base_dir,
+                                max_elements=int(getattr(cfg.agent, "simulation_max_elements", 300) or 300),
+                            )
+                            return safe_reply(reply, max_chars=cfg.agent.max_reply_chars)
+                        except Exception as e:
+                            logger.info("StatusSave simulation failed; falling back to demo: %s", e)
                     try:
                         reply = simulate_series_vdc_two_resistors(
-                            text=routed_arg or arg,
+                            text=sim_text,
                             phy_engine_cfg=cfg.phy_engine,
                             config_base_dir=config_base_dir,
                         )
@@ -745,6 +799,44 @@ def _handle_comment(
                         max_chars=cfg.agent.max_reply_chars,
                     )
             else:
+                if _looks_like_simulation_request(arg) and bool(
+                    getattr(cfg.agent, "simulation_enabled", True)
+                ):
+                    if (
+                        experiment_context is not None
+                        and isinstance(experiment_context.get("summary_id"), str)
+                        and isinstance(experiment_context.get("category"), str)
+                    ):
+                        try:
+                            status = get_status_save(
+                                user,
+                                summary_id=str(experiment_context.get("summary_id")),
+                                category_value=str(experiment_context.get("category")),
+                                cache_dir=cache_dir,
+                                ttl_sec=300,
+                            )
+                            reply = simulate_status_save_with_phyengine(
+                                text=arg,
+                                status_save=status,
+                                phy_engine_cfg=cfg.phy_engine,
+                                config_base_dir=config_base_dir,
+                                max_elements=int(
+                                    getattr(cfg.agent, "simulation_max_elements", 300) or 300
+                                ),
+                            )
+                            return safe_reply(reply, max_chars=cfg.agent.max_reply_chars)
+                        except Exception as e:
+                            logger.info("Fallback simulation failed: %s", e)
+                    try:
+                        reply = simulate_series_vdc_two_resistors(
+                            text=arg,
+                            phy_engine_cfg=cfg.phy_engine,
+                            config_base_dir=config_base_dir,
+                        )
+                        return safe_reply(reply, max_chars=cfg.agent.max_reply_chars)
+                    except Exception as e:
+                        logger.info("Fallback demo simulation failed: %s", e)
+
                 looks_like_circuit, explicit_publish = _fallback_route_for_circuit(arg)
                 if looks_like_circuit:
                     logger.info(
@@ -864,6 +956,7 @@ def _handle_comment(
                     search_txt = web_search(
                         query=query,
                         cache_dir=cache_dir,
+                        provider=str(getattr(cfg.agent, "web_search_provider", "google") or "google"),
                         proxy=str(getattr(cfg.agent, "web_search_proxy", "") or ""),
                         timeout_sec=int(getattr(cfg.agent, "web_search_timeout_sec", 20) or 20),
                         ttl_sec=int(getattr(cfg.agent, "web_search_cache_ttl_sec", 3600) or 3600),
@@ -931,6 +1024,7 @@ def _handle_comment(
             reply = web_search(
                 query=arg,
                 cache_dir=cache_dir,
+                provider=str(getattr(cfg.agent, "web_search_provider", "google") or "google"),
                 proxy=str(getattr(cfg.agent, "web_search_proxy", "") or ""),
                 timeout_sec=int(getattr(cfg.agent, "web_search_timeout_sec", 20) or 20),
                 ttl_sec=int(getattr(cfg.agent, "web_search_cache_ttl_sec", 3600) or 3600),
@@ -1751,15 +1845,36 @@ def _cmd_run(args: argparse.Namespace) -> int:
         return 0
 
     dry_run = bool(args.dry_run or cfg.agent.dry_run)
-    ollama = OllamaClient(
-        base_url=cfg.ollama.base_url,
-        model=cfg.ollama.model,
-        timeout_sec=cfg.ollama.request_timeout_sec,
-        temperature=cfg.ollama.temperature,
-    )
+    endpoints = list(getattr(cfg.ollama, "base_urls", None) or []) or [cfg.ollama.base_url]
+    max_parallel = int(getattr(cfg.ollama, "max_parallel_requests", 1) or 1)
+    if max_parallel < 1:
+        max_parallel = 1
+    clients: list[OllamaClient] = []
+    for i in range(max_parallel):
+        url = str(endpoints[i % len(endpoints)]).strip() if endpoints else cfg.ollama.base_url
+        if not url:
+            url = cfg.ollama.base_url
+        clients.append(
+            OllamaClient(
+                base_url=url,
+                model=cfg.ollama.model,
+                timeout_sec=cfg.ollama.request_timeout_sec,
+                temperature=cfg.ollama.temperature,
+                num_predict=int(getattr(cfg.ollama, "num_predict", 2048) or 2048),
+            )
+        )
+    ollama: Any = OllamaPool(clients) if len(clients) > 1 else clients[0]
 
     logger.info("Targets: %s", format_targets(targets))
-    logger.info("Ollama: %s (model=%s)", cfg.ollama.base_url, cfg.ollama.model)
+    if len(clients) > 1:
+        logger.info(
+            "Ollama pool: endpoints=%s model=%s max_parallel=%d",
+            ", ".join(sorted(set(endpoints))),
+            cfg.ollama.model,
+            max_parallel,
+        )
+    else:
+        logger.info("Ollama: %s (model=%s)", cfg.ollama.base_url, cfg.ollama.model)
     logger.info("Mode: %s", "DRY RUN" if dry_run else "LIVE")
     logger.info(
         "Trigger: mention=%r require_mention=%s commands_enabled=%s prefix=%r",

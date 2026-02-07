@@ -51,6 +51,7 @@ class PhyEngineLib:
         c_double_p = ctypes.POINTER(ctypes.c_double)
         c_bool_p = ctypes.POINTER(ctypes.c_bool)
         c_uint32 = ctypes.c_uint32
+        c_double = ctypes.c_double
 
         self._lib.create_circuit.argtypes = [
             c_int_p,
@@ -70,6 +71,9 @@ class PhyEngineLib:
         self._lib.circuit_set_analyze_type.argtypes = [c_void_p, c_uint32]
         self._lib.circuit_set_analyze_type.restype = ctypes.c_int
 
+        self._lib.circuit_set_tr.argtypes = [c_void_p, c_double, c_double]
+        self._lib.circuit_set_tr.restype = ctypes.c_int
+
         self._lib.circuit_analyze.argtypes = [c_void_p]
         self._lib.circuit_analyze.restype = ctypes.c_int
 
@@ -86,6 +90,107 @@ class PhyEngineLib:
             c_size_t_p,
         ]
         self._lib.circuit_sample.restype = ctypes.c_int
+
+    def create_circuit(
+        self,
+        *,
+        element_codes: list[int],
+        wires: list[int],
+        properties: list[float],
+    ) -> tuple[int, ctypes.POINTER(ctypes.c_size_t), ctypes.POINTER(ctypes.c_size_t), int]:
+        if not element_codes:
+            raise PESimError("element_codes is empty")
+        elements = _as_int_array(element_codes)
+        wires_arr = _as_int_array(wires)
+        props_arr = _as_double_array(properties)
+
+        vec_pos = ctypes.POINTER(ctypes.c_size_t)()
+        chunk_pos = ctypes.POINTER(ctypes.c_size_t)()
+        comp_size = ctypes.c_size_t(0)
+
+        circuit = self._lib.create_circuit(
+            ctypes.cast(elements, ctypes.POINTER(ctypes.c_int)),
+            ctypes.c_size_t(len(elements)),
+            ctypes.cast(wires_arr, ctypes.POINTER(ctypes.c_int)),
+            ctypes.c_size_t(len(wires_arr)),
+            ctypes.cast(props_arr, ctypes.POINTER(ctypes.c_double)),
+            ctypes.byref(vec_pos),
+            ctypes.byref(chunk_pos),
+            ctypes.byref(comp_size),
+        )
+        if not circuit:
+            raise PESimError("create_circuit failed")
+        return int(circuit), vec_pos, chunk_pos, int(comp_size.value)
+
+    def destroy_circuit(
+        self,
+        *,
+        circuit: int,
+        vec_pos: ctypes.POINTER(ctypes.c_size_t),
+        chunk_pos: ctypes.POINTER(ctypes.c_size_t),
+    ) -> None:
+        self._lib.destroy_circuit(ctypes.c_void_p(circuit), vec_pos, chunk_pos)
+
+    def set_analyze_type(self, *, circuit: int, analyze_type: int) -> None:
+        if self._lib.circuit_set_analyze_type(ctypes.c_void_p(circuit), ctypes.c_uint32(analyze_type)) != 0:
+            raise PESimError("circuit_set_analyze_type failed")
+
+    def set_tr(self, *, circuit: int, t_step: float, t_stop: float) -> None:
+        if self._lib.circuit_set_tr(ctypes.c_void_p(circuit), ctypes.c_double(t_step), ctypes.c_double(t_stop)) != 0:
+            raise PESimError("circuit_set_tr failed")
+
+    def analyze(self, *, circuit: int) -> None:
+        if self._lib.circuit_analyze(ctypes.c_void_p(circuit)) != 0:
+            raise PESimError("circuit_analyze failed")
+
+    def sample(
+        self,
+        *,
+        circuit: int,
+        vec_pos: ctypes.POINTER(ctypes.c_size_t),
+        chunk_pos: ctypes.POINTER(ctypes.c_size_t),
+        comp_size: int,
+        max_pins_per_comp: int = 4,
+        max_branches_per_comp: int = 2,
+    ) -> tuple[list[float], list[int], list[float], list[int], list[bool], list[int]]:
+        if comp_size <= 0:
+            return ([], [0], [], [0], [], [0])
+        if max_pins_per_comp <= 0:
+            max_pins_per_comp = 4
+        if max_branches_per_comp <= 0:
+            max_branches_per_comp = 2
+
+        v_len = comp_size * max_pins_per_comp
+        i_len = comp_size * max_branches_per_comp
+        voltage = (ctypes.c_double * max(1, v_len))()
+        voltage_ord = (ctypes.c_size_t * (comp_size + 1))()
+        current = (ctypes.c_double * max(1, i_len))()
+        current_ord = (ctypes.c_size_t * (comp_size + 1))()
+        digital = (ctypes.c_bool * max(1, v_len))()
+        digital_ord = (ctypes.c_size_t * (comp_size + 1))()
+
+        rc = self._lib.circuit_sample(
+            ctypes.c_void_p(circuit),
+            vec_pos,
+            chunk_pos,
+            ctypes.c_size_t(comp_size),
+            voltage,
+            voltage_ord,
+            current,
+            current_ord,
+            digital,
+            digital_ord,
+        )
+        if rc != 0:
+            raise PESimError("circuit_sample failed")
+
+        v = [float(voltage[i]) for i in range(min(v_len, int(voltage_ord[comp_size])))]
+        vord = [int(voltage_ord[i]) for i in range(comp_size + 1)]
+        cur = [float(current[i]) for i in range(min(i_len, int(current_ord[comp_size])))]
+        cord = [int(current_ord[i]) for i in range(comp_size + 1)]
+        dig = [bool(digital[i]) for i in range(min(v_len, int(digital_ord[comp_size])))]
+        dord = [int(digital_ord[i]) for i in range(comp_size + 1)]
+        return v, vord, cur, cord, dig, dord
 
     def simulate_series_vdc_two_resistors(
         self,
@@ -126,58 +231,28 @@ class PhyEngineLib:
             ]
         )
 
-        vec_pos = ctypes.POINTER(ctypes.c_size_t)()
-        chunk_pos = ctypes.POINTER(ctypes.c_size_t)()
-        comp_size = ctypes.c_size_t(0)
-
-        circuit = self._lib.create_circuit(
-            ctypes.cast(elements, ctypes.POINTER(ctypes.c_int)),
-            ctypes.c_size_t(len(elements)),
-            ctypes.cast(wires, ctypes.POINTER(ctypes.c_int)),
-            ctypes.c_size_t(len(wires)),
-            ctypes.cast(properties, ctypes.POINTER(ctypes.c_double)),
-            ctypes.byref(vec_pos),
-            ctypes.byref(chunk_pos),
-            ctypes.byref(comp_size),
+        circuit, vec_pos, chunk_pos, n = self.create_circuit(
+            element_codes=list(elements),
+            wires=list(wires),
+            properties=list(properties),
         )
-        if not circuit:
-            raise PESimError("create_circuit failed")
 
         try:
             # analyze_type::DC == 1
-            if self._lib.circuit_set_analyze_type(circuit, ctypes.c_uint32(1)) != 0:
-                raise PESimError("circuit_set_analyze_type failed")
-            if self._lib.circuit_analyze(circuit) != 0:
-                raise PESimError("circuit_analyze failed")
-
-            n = int(comp_size.value)
+            self.set_analyze_type(circuit=circuit, analyze_type=1)
+            self.analyze(circuit=circuit)
             if n != 3:
                 raise PESimError(f"Unexpected comp_size={n} (expected 3)")
 
             # For VDC + 2 resistors, pin views are expected to be small; allocate conservatively.
-            voltage = (ctypes.c_double * 64)()
-            voltage_ord = (ctypes.c_size_t * (n + 1))()
-            current = (ctypes.c_double * 64)()
-            current_ord = (ctypes.c_size_t * (n + 1))()
-            digital = (ctypes.c_bool * 64)()
-            digital_ord = (ctypes.c_size_t * (n + 1))()
-
-            if (
-                self._lib.circuit_sample(
-                    circuit,
-                    vec_pos,
-                    chunk_pos,
-                    ctypes.c_size_t(n),
-                    voltage,
-                    voltage_ord,
-                    current,
-                    current_ord,
-                    digital,
-                    digital_ord,
-                )
-                != 0
-            ):
-                raise PESimError("circuit_sample failed")
+            voltage, voltage_ord, current, current_ord, _digital, _digital_ord = self.sample(
+                circuit=circuit,
+                vec_pos=vec_pos,
+                chunk_pos=chunk_pos,
+                comp_size=n,
+                max_pins_per_comp=8,
+                max_branches_per_comp=4,
+            )
 
             if int(voltage_ord[1] - voltage_ord[0]) < 2:
                 raise PESimError("Unexpected VDC pin count (expected >= 2)")
@@ -202,4 +277,4 @@ class PhyEngineLib:
                 r_total_ohm=(r1 + r2),
             )
         finally:
-            self._lib.destroy_circuit(circuit, vec_pos, chunk_pos)
+            self.destroy_circuit(circuit=circuit, vec_pos=vec_pos, chunk_pos=chunk_pos)

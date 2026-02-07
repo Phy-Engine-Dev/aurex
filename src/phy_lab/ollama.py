@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import threading
+from queue import Queue
 from dataclasses import dataclass
 from typing import Any
 
@@ -15,6 +17,7 @@ class OllamaClient:
     model: str
     timeout_sec: int = 120
     temperature: float = 0.2
+    num_predict: int = 2048
 
     def chat(self, *, messages: list[dict[str, str]]) -> str:
         try:
@@ -29,7 +32,7 @@ class OllamaClient:
             "model": self.model,
             "messages": messages,
             "stream": False,
-            "options": {"temperature": self.temperature},
+            "options": {"temperature": self.temperature, "num_predict": int(self.num_predict)},
         }
 
         try:
@@ -56,3 +59,30 @@ class OllamaClient:
             raise OllamaError("Ollama response missing 'message.content' string")
         return content.strip()
 
+
+class OllamaPool:
+    """A simple client pool to allow concurrent Ollama requests.
+
+    This is useful when running multiple Ollama servers (e.g. one per GPU) or when you
+    want to increase throughput on a single server.
+    """
+
+    def __init__(self, clients: list[OllamaClient]):
+        if not clients:
+            raise OllamaError("OllamaPool requires at least one client")
+        self._q: "Queue[OllamaClient]" = Queue()
+        for c in clients:
+            self._q.put(c)
+        self._lock = threading.Lock()
+        self._size = len(clients)
+
+    @property
+    def size(self) -> int:
+        return self._size
+
+    def chat(self, *, messages: list[dict[str, str]]) -> str:
+        client = self._q.get()
+        try:
+            return client.chat(messages=messages)
+        finally:
+            self._q.put(client)

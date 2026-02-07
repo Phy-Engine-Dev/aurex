@@ -489,6 +489,84 @@ def get_experiment_context(
     return context
 
 
+def get_status_save(
+    user: Any,
+    *,
+    summary_id: str,
+    category_value: str,
+    cache_dir: str,
+    ttl_sec: int = 300,
+) -> dict[str, Any]:
+    """Fetch and parse the experiment's StatusSave JSON (Elements/Wires).
+
+    This is used for local Phy-Engine simulation. Cached under cache_dir to reduce API calls.
+    """
+    os.makedirs(cache_dir, exist_ok=True)
+    cache_root = os.path.join(cache_dir, "plar_cache")
+    os.makedirs(cache_root, exist_ok=True)
+    cache_path = os.path.join(cache_root, f"status_{category_value.lower()}_{summary_id}.json")
+
+    now = time.time()
+    if os.path.exists(cache_path):
+        try:
+            st = os.stat(cache_path)
+            if now - st.st_mtime <= ttl_sec:
+                with open(cache_path, "r", encoding="utf-8") as f:
+                    cached = json.load(f)
+                if isinstance(cached, dict) and cached.get("summary_id") == summary_id:
+                    data = cached.get("status_save")
+                    if isinstance(data, dict):
+                        return data
+        except Exception:
+            pass
+
+    ensure_physicslab_importable(cache_dir=cache_dir)
+    try:
+        from physicsLab import Category as PLCategory
+        from physicsLab import Experiment, OpenMode
+    except Exception as e:  # pragma: no cover
+        raise PLARError(f"Failed to import physicsLab Experiment helpers: {e}") from e
+
+    if category_value == "Experiment":
+        category = PLCategory.Experiment
+    elif category_value == "Discussion":
+        category = PLCategory.Discussion
+    else:
+        raise PLARError("category_value must be 'Experiment' or 'Discussion'")
+
+    exp = Experiment(OpenMode.load_by_plar_app, summary_id, category, user=user)
+    plsav = exp.PlSav if isinstance(getattr(exp, "PlSav", None), dict) else None
+    if not isinstance(plsav, dict):
+        raise PLARError("Failed to load PlSav for this content")
+
+    exp_obj = plsav.get("Experiment")
+    if isinstance(exp_obj, dict):
+        status_str = exp_obj.get("StatusSave")
+    else:
+        status_str = plsav.get("StatusSave")
+    if not isinstance(status_str, str) or not status_str.strip():
+        raise PLARError("PlSav missing StatusSave")
+
+    try:
+        status = json.loads(status_str)
+    except Exception as e:
+        raise PLARError(f"Failed to parse StatusSave JSON: {e}") from e
+    if not isinstance(status, dict):
+        raise PLARError("StatusSave JSON is not an object")
+
+    to_cache = {"summary_id": summary_id, "status_save": status}
+    try:
+        tmp = cache_path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(to_cache, f, ensure_ascii=False)
+            f.write("\n")
+        os.replace(tmp, cache_path)
+    except Exception:
+        pass
+
+    return status
+
+
 def best_effort_extract_text(value: Any) -> str:
     if value is None:
         return ""

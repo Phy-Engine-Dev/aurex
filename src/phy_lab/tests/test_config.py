@@ -60,6 +60,24 @@ class TestConfig(unittest.TestCase):
             "Too many requests at the moment, please try again later.",
         )
 
+    def test_parse_ollama_pool_config(self):
+        cfg = parse_config(
+            {
+                "schema_version": 1,
+                "account": {"email": "user@example.com"},
+                "ollama": {
+                    "base_urls": ["http://127.0.0.1:11434", "http://127.0.0.1:11435"],
+                    "model": "gpt-oss:latest",
+                    "max_parallel_requests": 2,
+                },
+                "agent": {"targets": []},
+            },
+            source="in-memory",
+        )
+        self.assertEqual(cfg.ollama.base_url, "http://127.0.0.1:11434")
+        self.assertEqual(cfg.ollama.base_urls, ["http://127.0.0.1:11434", "http://127.0.0.1:11435"])
+        self.assertEqual(cfg.ollama.max_parallel_requests, 2)
+
     def test_parse_invalid_schema_version(self):
         with self.assertRaises(ConfigError):
             parse_config(

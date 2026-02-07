@@ -7,7 +7,8 @@
     "base_url": "http://127.0.0.1:11434",
     "model": "llama3.1",
     "request_timeout_sec": 240,
-    "temperature": 0.2
+    "temperature": 0.2,
+    "num_predict": 2048
   },
   "storage": {
     "cache_dir": "cache",
@@ -46,6 +47,7 @@
     ],
     "notification_take": 20,
     "web_search_enabled": false,
+    "web_search_provider": "google",
     "auto_web_search": true,
     "web_search_proxy": "http://127.0.0.1:7897",
     "web_search_timeout_sec": 20,
@@ -61,6 +63,8 @@
     "publish_tags": [
       "SmallProject"
     ],
+    "simulation_enabled": true,
+    "simulation_max_elements": 300,
     "overload_protection_enabled": true,
     "overload_window_sec": 600,
     "overload_max_requests": 40,

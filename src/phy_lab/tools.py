@@ -17,6 +17,7 @@ import requests
 from ollama import OllamaClient
 from plsav import PlSavError, load_plsav_counts
 from pe_sim import PhyEngineLib, SeriesVdcResistorsSpec
+from plsav_sim import PlSavSimError, build_pe_circuit_input_from_status_save
 from phy_engine import (
     Verilog2PlSavOptions,
     ensure_phyengine_lib,
@@ -289,6 +290,176 @@ def simulate_series_vdc_two_resistors(
     )
 
 
+_TIME_RE = re.compile(
+    r"(?i)(?:time|t)\\s*=\\s*(?P<value>[0-9]+(?:\\.[0-9]+)?)\\s*(?P<unit>ms|us|µs|ns|s|sec|secs|second|seconds)?"
+)
+
+
+def _parse_time_seconds(text: str) -> float | None:
+    text = (text or "").strip()
+    if not text:
+        return None
+    m = _TIME_RE.search(text)
+    if not m:
+        return None
+    v = float(m.group("value"))
+    unit = (m.group("unit") or "s").lower()
+    if unit in ("s", "sec", "secs", "second", "seconds"):
+        return v
+    if unit == "ms":
+        return v / 1000.0
+    if unit in ("us", "µs"):
+        return v / 1_000_000.0
+    if unit == "ns":
+        return v / 1_000_000_000.0
+    return v
+
+
+def _looks_like_zh(text: str) -> bool:
+    return any("\u4e00" <= ch <= "\u9fff" for ch in (text or ""))
+
+
+def simulate_status_save_with_phyengine(
+    *,
+    text: str,
+    status_save: dict[str, Any],
+    phy_engine_cfg: Any,
+    config_base_dir: str,
+    max_elements: int = 300,
+) -> str:
+    lang_zh = _looks_like_zh(text)
+    elements = status_save.get("Elements")
+    wires = status_save.get("Wires")
+    if not isinstance(elements, list) or not isinstance(wires, list):
+        return "StatusSave is missing Elements/Wires."
+
+    if max_elements > 0 and len(elements) > max_elements:
+        if lang_zh:
+            return (
+                f"该实验电路规模过大（elements={len(elements)}，limit={max_elements}），为安全起见我不会本地仿真。\n"
+                "请提供一个更小的电路（仅包含电阻/电容/电感/电源/地），或者把关键部分单独做成小实验。"
+            )
+        return (
+            f"This experiment is too large to simulate safely (elements={len(elements)}, limit={max_elements}).\n"
+            "Please provide a smaller circuit (R/C/L/sources/ground only) or isolate the critical sub-circuit."
+        )
+
+    try:
+        pe_input = build_pe_circuit_input_from_status_save(status_save, strict=True)
+    except PlSavSimError as e:
+        return str(e)
+
+    cmake_source_dir = _resolve_existing_path(
+        str(getattr(phy_engine_cfg, "cmake_source_dir", "")),
+        base_dir=config_base_dir,
+    )
+    lib_cfg_path = _resolve_existing_path(
+        str(getattr(phy_engine_cfg, "phyengine_lib_path", "")),
+        base_dir=config_base_dir,
+    )
+    lib_path = ensure_phyengine_lib(
+        phyengine_lib_path=lib_cfg_path,
+        auto_build=bool(getattr(phy_engine_cfg, "auto_build", False)),
+        cmake_source_dir=cmake_source_dir,
+        cmake_build_dir=os.path.abspath(
+            os.path.join(config_base_dir, str(getattr(phy_engine_cfg, "cmake_build_dir", "")))
+        ),
+        cmake_build_type=str(getattr(phy_engine_cfg, "cmake_build_type", "Release")),
+        build_timeout_sec=int(getattr(phy_engine_cfg, "build_timeout_sec", 900)),
+    )
+    lib = PhyEngineLib(lib_path)
+
+    t_stop = _parse_time_seconds(text)
+    wants_tr = t_stop is not None or any(
+        x in (text or "").lower() for x in ("transient", "tr", "瞬态", "时域")
+    )
+    if t_stop is None and wants_tr:
+        t_stop = 1e-3
+    if t_stop is not None and t_stop <= 0:
+        t_stop = 1e-3
+    t_step = None
+    if t_stop is not None:
+        t_step = min(1e-3, max(1e-9, t_stop / 2000.0))
+
+    circuit, vec_pos, chunk_pos, comp_size = lib.create_circuit(
+        element_codes=pe_input.element_codes,
+        wires=pe_input.wires,
+        properties=pe_input.properties,
+    )
+    try:
+        if wants_tr:
+            lib.set_analyze_type(circuit=circuit, analyze_type=4)
+            lib.set_tr(circuit=circuit, t_step=float(t_step or 1e-6), t_stop=float(t_stop or 1e-6))
+        else:
+            lib.set_analyze_type(circuit=circuit, analyze_type=1)
+        lib.analyze(circuit=circuit)
+        voltage, voltage_ord, current, current_ord, _digital, _digital_ord = lib.sample(
+            circuit=circuit,
+            vec_pos=vec_pos,
+            chunk_pos=chunk_pos,
+            comp_size=comp_size,
+            max_pins_per_comp=8,
+            max_branches_per_comp=4,
+        )
+    finally:
+        lib.destroy_circuit(circuit=circuit, vec_pos=vec_pos, chunk_pos=chunk_pos)
+
+    wants_caps = ("capacitor" in (text or "").lower()) or ("电容" in (text or ""))
+    wants_res = ("resistor" in (text or "").lower()) or ("电阻" in (text or ""))
+    wants_ind = ("inductor" in (text or "").lower()) or ("电感" in (text or ""))
+
+    def _pick(model_id: str) -> bool:
+        if wants_caps:
+            return "Capacitor" in model_id
+        if wants_res:
+            return "Resistor" in model_id
+        if wants_ind:
+            return "Inductor" in model_id
+        return True
+
+    metas = [m for m in pe_input.non_ground_meta if _pick(m.model_id)]
+    if not metas:
+        metas = list(pe_input.non_ground_meta)
+
+    if lang_zh:
+        header = "仿真结果" + ("（TR）" if wants_tr else "（DC）")
+        if wants_tr and t_stop is not None:
+            header += f"  t_stop={t_stop:g}s"
+    else:
+        header = "Simulation result" + (" (TR)" if wants_tr else " (DC)")
+        if wants_tr and t_stop is not None:
+            header += f"  t_stop={t_stop:g}s"
+
+    lines: list[str] = [header]
+    limit = 20
+    for meta in metas[:limit]:
+        comp_id = int(getattr(meta, "comp_index", 0))
+        if comp_id < 0 or comp_id + 1 >= len(voltage_ord) or comp_id + 1 >= len(current_ord):
+            continue
+        pin0 = voltage_ord[comp_id]
+        pin1 = voltage_ord[comp_id + 1]
+        cur0 = current_ord[comp_id]
+        cur1 = current_ord[comp_id + 1]
+        vs = voltage[pin0:pin1]
+        cs = current[cur0:cur1]
+        label = f"{meta.label} " if meta.label else ""
+        name = f"{label}{meta.model_id}"
+        v_str = ", ".join(f"{v:.6g}V" for v in vs[:4])
+        c_str = ", ".join(f"{c:.6g}A" for c in cs[:2])
+        lines.append(f"- {name}: V=[{v_str}] I=[{c_str}]")
+
+    if len(metas) > limit:
+        remaining = len(metas) - limit
+        if lang_zh:
+            lines.append(f"(还有 {remaining} 个元件未展示；你可以在问题里点名例如 'C1' 或 'Resistor' 来筛选)")
+        else:
+            lines.append(
+                f"({remaining} more components not shown; mention a label like 'C1' or a type like 'Resistor' to filter)"
+            )
+
+    return "\n".join(lines)
+
+
 _GOOGLE_RESULT_RE = re.compile(
     r'href="/url\\?q=(?P<url>[^"&]+)[^"]*"[^>]*>(?P<title>[^<]{3,200})<',
     re.IGNORECASE,
@@ -522,12 +693,52 @@ def web_search(
     *,
     query: str,
     cache_dir: str,
+    provider: str = "google",
     proxy: str = "",
     timeout_sec: int = 20,
     ttl_sec: int = 3600,
     max_results: int = 5,
     fallback_to_ddg: bool = True,
 ) -> str:
+    provider = (provider or "google").strip().lower()
+    if provider == "ddg":
+        provider = "duckduckgo"
+
+    if provider == "baidu":
+        res = web_search_baidu(
+            query=query,
+            cache_dir=cache_dir,
+            proxy=proxy,
+            timeout_sec=timeout_sec,
+            ttl_sec=ttl_sec,
+            max_results=max_results,
+        )
+        if fallback_to_ddg and (
+            "Baidu blocked" in res or "No results parsed." in res or "captcha" in res.casefold()
+        ):
+            try:
+                return web_search_duckduckgo(
+                    query=query,
+                    cache_dir=cache_dir,
+                    proxy=proxy,
+                    timeout_sec=timeout_sec,
+                    ttl_sec=ttl_sec,
+                    max_results=max_results,
+                )
+            except Exception:
+                return res
+        return res
+
+    if provider == "duckduckgo":
+        return web_search_duckduckgo(
+            query=query,
+            cache_dir=cache_dir,
+            proxy=proxy,
+            timeout_sec=timeout_sec,
+            ttl_sec=ttl_sec,
+            max_results=max_results,
+        )
+
     res = web_search_google(
         query=query,
         cache_dir=cache_dir,
@@ -551,6 +762,109 @@ def web_search(
         except Exception:
             return res
     return res
+
+
+def _looks_like_baidu_block(html_text: str) -> bool:
+    t = (html_text or "").casefold()
+    return any(
+        x in t
+        for x in (
+            "百度安全验证",
+            "请输入验证码",
+            "验证码",
+            "verify.baidu.com",
+            "wappass.baidu.com",
+            "captcha",
+        )
+    )
+
+
+_BAIDU_H3_RE = re.compile(
+    r'<h3[^>]*class="[^"]*(?:t|c-title)[^"]*"[^>]*>\\s*<a[^>]+href="(?P<url>[^"]+)"[^>]*>(?P<title>.*?)</a>',
+    re.IGNORECASE | re.DOTALL,
+)
+
+
+def web_search_baidu(
+    *,
+    query: str,
+    cache_dir: str,
+    proxy: str = "",
+    timeout_sec: int = 20,
+    ttl_sec: int = 3600,
+    max_results: int = 5,
+) -> str:
+    query = (query or "").strip()
+    if not query:
+        return "Provide a query string."
+    if max_results <= 0:
+        max_results = 5
+    if max_results > 10:
+        max_results = 10
+
+    url = "https://www.baidu.com/s?" + urllib.parse.urlencode(
+        {
+            "wd": query,
+            "rn": str(max_results),
+        }
+    )
+
+    cache_root = os.path.join(cache_dir, "web_cache", "baidu")
+    digest = hashlib.sha256(url.encode("utf-8")).hexdigest()
+    cache_path = os.path.join(cache_root, f"{digest}.html")
+    cached = _cache_get(cache_path, ttl_sec=int(ttl_sec))
+    if cached is None or _looks_like_baidu_block(cached):
+        proxies = None
+        p = (proxy or "").strip()
+        if p:
+            if "://" not in p:
+                p = "http://" + p
+            if p.lower().startswith("socks"):
+                raise RuntimeError(
+                    "SOCKS proxy requires requests[socks]. Use an HTTP proxy URL or install requests[socks]."
+                )
+            proxies = {"http": p, "https": p}
+
+        headers = {
+            "User-Agent": (
+                "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                "(KHTML, like Gecko) Chrome/120.0 Safari/537.36"
+            )
+        }
+        r = requests.get(url, headers=headers, timeout=float(timeout_sec), proxies=proxies)
+        r.raise_for_status()
+        cached = r.text
+        if not _looks_like_baidu_block(cached):
+            _cache_put(cache_path, cached)
+
+    results: list[tuple[str, str]] = []
+    for m in _BAIDU_H3_RE.finditer(cached):
+        href = html.unescape((m.group("url") or "").strip())
+        title = _strip_tags(m.group("title") or "")
+        if not href or not title:
+            continue
+        if href.startswith("//"):
+            href = "https:" + href
+        results.append((title, href))
+        if len(results) >= max_results:
+            break
+
+    if not results:
+        if _looks_like_baidu_block(cached):
+            return (
+                "Baidu blocked this automated request (captcha/verification).\n"
+                "Try: enable proxy, change IP, reduce frequency, or use the DuckDuckGo fallback."
+            )
+        return (
+            "No results parsed. Baidu may have returned a blocked/captcha page or changed markup.\n"
+            f"Query: {query}"
+        )
+
+    lines = ["Baidu results:"]
+    for i, (t, u) in enumerate(results, start=1):
+        lines.append(f"{i}. {truncate(t, max_chars=120)}")
+        lines.append(f"   {u}")
+    return "\n".join(lines)
 
 
 @dataclass(frozen=True)
