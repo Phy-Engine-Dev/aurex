@@ -60,6 +60,18 @@ class TestConfig(unittest.TestCase):
             "Too many requests at the moment, please try again later.",
         )
 
+    def test_parse_account_password_optional(self):
+        cfg = parse_config(
+            {
+                "schema_version": 1,
+                "account": {"email": "user@example.com", "password": "pw"},
+                "agent": {"targets": []},
+            },
+            source="in-memory",
+        )
+        self.assertEqual(cfg.account.email, "user@example.com")
+        self.assertEqual(cfg.account.password, "pw")
+
     def test_parse_ollama_pool_config(self):
         cfg = parse_config(
             {

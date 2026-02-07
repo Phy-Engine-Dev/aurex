@@ -51,6 +51,8 @@ Political content (strict)
 @dataclass(frozen=True)
 class AccountConfig:
     email: str
+    # Optional: for non-interactive testing only. Prefer env vars in production.
+    password: str | None = None
 
 
 @dataclass(frozen=True)
@@ -261,6 +263,7 @@ def parse_config(data: dict[str, Any], *, source: str) -> Config:
 
     account_obj = _require_mapping(data.get("account"), where="account")
     email = _require_str(account_obj.get("email"), where="account.email")
+    password = _optional_str(account_obj.get("password"), where="account.password")
 
     ollama_obj = _require_mapping(data.get("ollama", {}), where="ollama")
     base_url = _optional_str(ollama_obj.get("base_url"), where="ollama.base_url")
@@ -667,7 +670,7 @@ def parse_config(data: dict[str, Any], *, source: str) -> Config:
 
     return Config(
         schema_version=1,
-        account=AccountConfig(email=email),
+        account=AccountConfig(email=email, password=password),
         ollama=ollama,
         storage=storage,
         phy_engine=phy_engine,
@@ -696,7 +699,14 @@ def _atomic_write_json(path: str, data: dict[str, Any]) -> None:
 def write_config(path: str, config: Config) -> None:
     data: dict[str, Any] = {
         "schema_version": config.schema_version,
-        "account": {"email": config.account.email},
+        "account": {
+            "email": config.account.email,
+            **(
+                {"password": config.account.password}
+                if isinstance(config.account.password, str) and config.account.password.strip()
+                else {}
+            ),
+        },
         "ollama": {
             "base_url": config.ollama.base_url,
             "base_urls": list(config.ollama.base_urls),
@@ -792,7 +802,7 @@ def init_config_interactive(path: str, *, overwrite: bool = False) -> None:
 
     config = Config(
         schema_version=1,
-        account=AccountConfig(email=email),
+        account=AccountConfig(email=email, password=None),
         ollama=OllamaConfig(base_url=base_url, model=model),
         agent=AgentConfig(mention_tag=mention_tag),
     )

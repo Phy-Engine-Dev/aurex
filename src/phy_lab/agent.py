@@ -42,13 +42,19 @@ from phy_engine import (  # noqa: E402
 )
 from plar import (  # noqa: E402
     PLARError,
+    best_effort_extract_text,
     email_login,
     get_comments,
     get_experiment_context,
     get_messages,
+    get_user_by_id,
+    get_user_by_name,
     get_status_save,
     post_comment,
+    query_experiments,
+    upload_sav_as_experiment,
 )
+from plsav import load_plsav_counts  # noqa: E402
 from state import (  # noqa: E402
     AgentState,
     StateError,
@@ -77,6 +83,7 @@ from tools import (  # noqa: E402
     safe_reply,
     search_recent_experiments,
     simulate_ai_circuit_with_phyengine,
+    simulate_ai_script_circuit_with_phyengine,
     simulate_series_vdc_resistors,
     simulate_series_vdc_two_resistors,
     simulate_status_save_with_phyengine,
@@ -235,6 +242,48 @@ def _political_refusal_message(user_text: str) -> str:
     if is_cjk:
         return "抱歉，我不能处理或搜索任何政治相关内容。我可以帮助你解决物理实验室社区相关问题。"
     return "Sorry, I can't help with political content or political web searches. I can help with Physics Lab AR community questions."
+
+def _looks_like_pe_script_parse_failure(text: str) -> bool:
+    t = (text or "").strip()
+    return t.startswith("I couldn't parse the command script") or t.startswith(
+        "我没能把命令脚本解析成可仿真的电路"
+    )
+
+def _looks_like_series_demo_prompt(text: str) -> bool:
+    t = (text or "").strip()
+    return t.startswith("To simulate a series circuit") or t.startswith(
+        "I can simulate it, but I need the VDC voltage value."
+    ) or t.startswith("要进行串联直流仿真") or t.startswith("我可以仿真，但需要你给出 VDC")
+
+def _looks_like_series_demo_request(text: str) -> bool:
+    t = (text or "").casefold()
+    return any(x in t for x in ("串联", "series", "resistor", "电阻", "ohm", "ω", "v="))
+
+def _read_password_from_env(email: str) -> str | None:
+    # Do not store passwords in config files. Use an env var if you need non-interactive runs.
+    for key in ("PHY_LAB_PASSWORD", "PHYSICSLAB_PASSWORD"):
+        v = os.environ.get(key)
+        if isinstance(v, str) and v.strip():
+            return v
+    # Optional per-email override (avoid collisions when running multiple accounts).
+    if isinstance(email, str) and email.strip():
+        sanitized = email.strip().upper().replace("@", "_AT_").replace(".", "_")
+        v = os.environ.get(f"PHY_LAB_PASSWORD_{sanitized}")
+        if isinstance(v, str) and v.strip():
+            return v
+    return None
+
+
+def _read_password(cfg: Any) -> str | None:
+    email = getattr(getattr(cfg, "account", None), "email", "")
+    pw = _read_password_from_env(str(email or ""))
+    if pw is not None:
+        return pw
+    # Optional fallback for testing: allow account.password in config.json.
+    cfg_pw = getattr(getattr(cfg, "account", None), "password", None)
+    if isinstance(cfg_pw, str) and cfg_pw.strip():
+        return cfg_pw.strip()
+    return None
 
 
 def _try_parse_json_object(text: str) -> dict[str, Any] | None:
@@ -714,6 +763,32 @@ def _handle_comment(
                 if action == "search_plar":
                     if not routed_arg:
                         return "Provide a query string."
+                    if _looks_political_sensitive(routed_arg):
+                        return _political_refusal_message(routed_arg)
+                    q = routed_arg.strip()
+                    if q.startswith("@"):
+                        q = q[1:].strip()
+                    if q.casefold().startswith(("user:", "user ", "用户:", "用户 ")):
+                        name = q.split(None, 1)[1].strip() if " " in q else q.split(":", 1)[1].strip()
+                        try:
+                            data = get_user_by_name(user, name=name)
+                        except Exception as e:
+                            return f"Search failed: {e}"
+                        u = data.get("User") if isinstance(data, dict) else None
+                        if not isinstance(u, dict):
+                            return "No user found."
+                        uid = best_effort_extract_text(u.get("ID")) or best_effort_extract_text(
+                            u.get("UserID")
+                        )
+                        nick = best_effort_extract_text(u.get("Nickname")) or "(no nickname)"
+                        ver = best_effort_extract_text(u.get("Verification"))
+                        lines = ["User:", f"- Nickname: {nick}", f"- ID: {uid or '(unknown)'}"]
+                        if ver:
+                            lines.append(f"- Verification: {ver}")
+                        return safe_reply(
+                            "\n".join(lines),
+                            max_chars=cfg.agent.max_reply_chars,
+                        )
                     try:
                         hits = search_recent_experiments(
                             user=user, query=routed_arg, max_scan=200, max_results=5
@@ -721,7 +796,50 @@ def _handle_comment(
                     except Exception as e:
                         logger.warning("Local search failed: %s", _public_error_text(e, max_chars=2000))
                         return f"Search failed: {e}"
-                    return safe_reply(format_experiment_hits(hits), max_chars=cfg.agent.max_reply_chars)
+                    if not hits:
+                        return safe_reply(
+                            format_experiment_hits(hits),
+                            max_chars=cfg.agent.max_reply_chars,
+                        )
+
+                    # AI整理搜索结果 -> 输出给用户（更贴近“先搜再整理”的流程）。
+                    packed: list[dict[str, Any]] = []
+                    for item in hits[:5]:
+                        packed.append(
+                            {
+                                "id": best_effort_extract_text(item.get("ID"))
+                                or best_effort_extract_text(item.get("Id")),
+                                "subject": best_effort_extract_text(item.get("Subject")),
+                                "title": best_effort_extract_text(item.get("Title")),
+                                "summary": best_effort_extract_text(item.get("Summary")),
+                                "description": best_effort_extract_text(item.get("Description")),
+                                "category": best_effort_extract_text(item.get("Category")),
+                                "user_id": best_effort_extract_text(item.get("UserID")),
+                            }
+                        )
+
+                    messages: list[dict[str, str]] = [{"role": "system", "content": cfg.agent.system_prompt}]
+                    messages.append(
+                        {
+                            "role": "system",
+                            "content": "Internal Physics Lab search results (top matches, JSON):\n"
+                            + json.dumps(packed, ensure_ascii=False, indent=2),
+                        }
+                    )
+                    messages.append(
+                        {
+                            "role": "user",
+                            "content": (
+                                "Use the search results above to help the user.\n"
+                                "- If the user asked to find experiments, list the best matches with ID and 1-line reason.\n"
+                                "- If the user asked a question, use the most relevant result(s) and cite the IDs/subjects you relied on.\n"
+                                "- If results seem unrelated, say so briefly and suggest a better query.\n\n"
+                                f"User query:\n{routed_arg}"
+                            ),
+                        }
+                    )
+                    reply = ollama.chat(messages=messages)
+                    return safe_reply(reply, max_chars=cfg.agent.max_reply_chars)
 
                 if action == "google":
                     if not routed_arg:
@@ -767,6 +885,46 @@ def _handle_comment(
 
                 if action == "simulate":
                     sim_text = routed_arg or arg
+                    # Prefer: LLM builds PE-SCRIPT -> simulate -> LLM interprets results.
+                    if bool(getattr(cfg.agent, "simulation_ai_enabled", True)):
+                        try:
+                            reply = simulate_ai_script_circuit_with_phyengine(
+                                ollama=ollama,
+                                text=sim_text,
+                                context_json=experiment_context,
+                                phy_engine_cfg=cfg.phy_engine,
+                                config_base_dir=config_base_dir,
+                                max_components=int(
+                                    getattr(cfg.agent, "simulation_ai_max_components", 30) or 30
+                                ),
+                                max_probes=int(
+                                    getattr(cfg.agent, "simulation_ai_max_probes", 20) or 20
+                                ),
+                            )
+                            if not _looks_like_pe_script_parse_failure(reply):
+                                return safe_reply(reply, max_chars=cfg.agent.max_reply_chars)
+
+                            # Script parse failed; try legacy JSON-spec LLM path before other fallbacks.
+                            try:
+                                reply2 = simulate_ai_circuit_with_phyengine(
+                                    ollama=ollama,
+                                    text=sim_text,
+                                    context_json=experiment_context,
+                                    phy_engine_cfg=cfg.phy_engine,
+                                    config_base_dir=config_base_dir,
+                                    max_components=int(
+                                        getattr(cfg.agent, "simulation_ai_max_components", 30) or 30
+                                    ),
+                                    max_probes=int(
+                                        getattr(cfg.agent, "simulation_ai_max_probes", 20) or 20
+                                    ),
+                                )
+                                return safe_reply(reply2, max_chars=cfg.agent.max_reply_chars)
+                            except Exception as e:
+                                logger.info("AI JSON-spec simulation failed; falling back: %s", e)
+                        except Exception as e:
+                            logger.info("AI PE-SCRIPT simulation failed; falling back: %s", e)
+
                     if (
                         bool(getattr(cfg.agent, "simulation_enabled", True))
                         and experiment_context is not None
@@ -799,30 +957,22 @@ def _handle_comment(
                             phy_engine_cfg=cfg.phy_engine,
                             config_base_dir=config_base_dir,
                         )
-                        return safe_reply(reply, max_chars=cfg.agent.max_reply_chars)
+                        if not _looks_like_series_demo_prompt(reply) or _looks_like_series_demo_request(sim_text):
+                            return safe_reply(reply, max_chars=cfg.agent.max_reply_chars)
                     except Exception as e:
                         logger.info("Fallback demo simulation failed: %s", e)
 
-                    # AI-built circuit simulation (optional, more flexible).
-                    if bool(getattr(cfg.agent, "simulation_ai_enabled", True)):
-                        try:
-                            reply = simulate_ai_circuit_with_phyengine(
-                                ollama=ollama,
-                                text=sim_text,
-                                context_json=experiment_context,
-                                phy_engine_cfg=cfg.phy_engine,
-                                config_base_dir=config_base_dir,
-                                max_components=int(
-                                    getattr(cfg.agent, "simulation_ai_max_components", 30) or 30
-                                ),
-                                max_probes=int(
-                                    getattr(cfg.agent, "simulation_ai_max_probes", 20) or 20
-                                ),
-                            )
-                            return safe_reply(reply, max_chars=cfg.agent.max_reply_chars)
-                        except Exception as e:
-                            return f"Simulation failed: {e}"
-                    return safe_reply(reply, max_chars=cfg.agent.max_reply_chars)
+                    is_cjk = any("\u4e00" <= ch <= "\u9fff" for ch in (sim_text or ""))
+                    return safe_reply(
+                        (
+                            "仿真失败：我没法为这个请求构建可运行的电路。\n"
+                            "请确认：Ollama 正常运行、agent.simulation_ai_enabled=true，或提供更明确的电路/规格。"
+                            if is_cjk
+                            else "Simulation failed: unable to build a circuit for this request. "
+                            "Ensure Ollama is running and simulation_ai_enabled=true, or provide an explicit circuit/spec to simulate."
+                        ),
+                        max_chars=cfg.agent.max_reply_chars,
+                    )
 
                 if action == "circuit":
                     if not routed_arg:
@@ -913,6 +1063,44 @@ def _handle_comment(
                 if _looks_like_simulation_request(arg) and bool(
                     getattr(cfg.agent, "simulation_enabled", True)
                 ):
+                    if bool(getattr(cfg.agent, "simulation_ai_enabled", True)):
+                        try:
+                            reply = simulate_ai_script_circuit_with_phyengine(
+                                ollama=ollama,
+                                text=arg,
+                                context_json=experiment_context,
+                                phy_engine_cfg=cfg.phy_engine,
+                                config_base_dir=config_base_dir,
+                                max_components=int(
+                                    getattr(cfg.agent, "simulation_ai_max_components", 30) or 30
+                                ),
+                                max_probes=int(
+                                    getattr(cfg.agent, "simulation_ai_max_probes", 20) or 20
+                                ),
+                            )
+                            if not _looks_like_pe_script_parse_failure(reply):
+                                return safe_reply(reply, max_chars=cfg.agent.max_reply_chars)
+
+                            try:
+                                reply2 = simulate_ai_circuit_with_phyengine(
+                                    ollama=ollama,
+                                    text=arg,
+                                    context_json=experiment_context,
+                                    phy_engine_cfg=cfg.phy_engine,
+                                    config_base_dir=config_base_dir,
+                                    max_components=int(
+                                        getattr(cfg.agent, "simulation_ai_max_components", 30) or 30
+                                    ),
+                                    max_probes=int(
+                                        getattr(cfg.agent, "simulation_ai_max_probes", 20) or 20
+                                    ),
+                                )
+                                return safe_reply(reply2, max_chars=cfg.agent.max_reply_chars)
+                            except Exception as e:
+                                logger.info("AI JSON-spec simulation failed; falling back: %s", e)
+                        except Exception as e:
+                            logger.info("AI PE-SCRIPT simulation failed; falling back: %s", e)
+
                     if (
                         experiment_context is not None
                         and isinstance(experiment_context.get("summary_id"), str)
@@ -944,28 +1132,10 @@ def _handle_comment(
                             phy_engine_cfg=cfg.phy_engine,
                             config_base_dir=config_base_dir,
                         )
-                        return safe_reply(reply, max_chars=cfg.agent.max_reply_chars)
+                        if not _looks_like_series_demo_prompt(reply) or _looks_like_series_demo_request(arg):
+                            return safe_reply(reply, max_chars=cfg.agent.max_reply_chars)
                     except Exception as e:
                         logger.info("Fallback demo simulation failed: %s", e)
-
-                    if bool(getattr(cfg.agent, "simulation_ai_enabled", True)):
-                        try:
-                            reply = simulate_ai_circuit_with_phyengine(
-                                ollama=ollama,
-                                text=arg,
-                                context_json=experiment_context,
-                                phy_engine_cfg=cfg.phy_engine,
-                                config_base_dir=config_base_dir,
-                                max_components=int(
-                                    getattr(cfg.agent, "simulation_ai_max_components", 30) or 30
-                                ),
-                                max_probes=int(
-                                    getattr(cfg.agent, "simulation_ai_max_probes", 20) or 20
-                                ),
-                            )
-                            return safe_reply(reply, max_chars=cfg.agent.max_reply_chars)
-                        except Exception as e:
-                            logger.info("AI circuit simulation failed: %s", e)
 
                 looks_like_circuit, explicit_publish = _fallback_route_for_circuit(arg)
                 if looks_like_circuit:
@@ -1146,13 +1316,81 @@ def _handle_comment(
     if cmd in ("search", "find"):
         if not arg:
             return "Provide a query string."
+        if _looks_political_sensitive(arg):
+            return _political_refusal_message(arg)
+        q = arg.strip()
+        if q.startswith("@"):
+            q = q[1:].strip()
+        if q.casefold().startswith(("user:", "user ", "用户:", "用户 ")):
+            name = q.split(None, 1)[1].strip() if " " in q else q.split(":", 1)[1].strip()
+            logger.debug("Tool search(user) invoked (name=%r)", name[:80])
+            try:
+                data = get_user_by_name(user, name=name)
+            except Exception as e:
+                logger.warning("User search failed: %s", _public_error_text(e, max_chars=2000))
+                return f"Search failed: {e}"
+            u = data.get("User") if isinstance(data, dict) else None
+            if not isinstance(u, dict):
+                return "No user found."
+            uid = best_effort_extract_text(u.get("ID")) or best_effort_extract_text(u.get("UserID"))
+            nick = best_effort_extract_text(u.get("Nickname")) or "(no nickname)"
+            ver = best_effort_extract_text(u.get("Verification"))
+            sig = best_effort_extract_text(u.get("Signature"))
+            lines = ["User:"]
+            lines.append(f"- Nickname: {nick}")
+            if uid:
+                lines.append(f"- ID: {uid}")
+            if ver:
+                lines.append(f"- Verification: {ver}")
+            if sig:
+                lines.append(f"- Signature: {truncate(sig, max_chars=120)}")
+            return safe_reply("\n".join(lines), max_chars=cfg.agent.max_reply_chars)
         logger.debug("Tool search invoked (query=%r)", arg[:200])
         try:
             hits = search_recent_experiments(user=user, query=arg, max_scan=200, max_results=5)
         except Exception as e:
             logger.warning("Local search failed: %s", _public_error_text(e, max_chars=2000))
             return f"Search failed: {e}"
-        return safe_reply(format_experiment_hits(hits), max_chars=cfg.agent.max_reply_chars)
+        if not hits:
+            return safe_reply(format_experiment_hits(hits), max_chars=cfg.agent.max_reply_chars)
+
+        packed: list[dict[str, Any]] = []
+        for item in hits[:5]:
+            packed.append(
+                {
+                    "id": best_effort_extract_text(item.get("ID"))
+                    or best_effort_extract_text(item.get("Id")),
+                    "subject": best_effort_extract_text(item.get("Subject")),
+                    "title": best_effort_extract_text(item.get("Title")),
+                    "summary": best_effort_extract_text(item.get("Summary")),
+                    "description": best_effort_extract_text(item.get("Description")),
+                    "category": best_effort_extract_text(item.get("Category")),
+                    "user_id": best_effort_extract_text(item.get("UserID")),
+                }
+            )
+
+        messages: list[dict[str, str]] = [{"role": "system", "content": cfg.agent.system_prompt}]
+        messages.append(
+            {
+                "role": "system",
+                "content": "Internal Physics Lab search results (top matches, JSON):\n"
+                + json.dumps(packed, ensure_ascii=False, indent=2),
+            }
+        )
+        messages.append(
+            {
+                "role": "user",
+                "content": (
+                    "Use the search results above to help the user.\n"
+                    "- If the user asked to find experiments, list the best matches with ID and 1-line reason.\n"
+                    "- If the user asked a question, use the most relevant result(s) and cite the IDs/subjects you relied on.\n"
+                    "- If results seem unrelated, say so briefly and suggest a better query.\n\n"
+                    f"User query:\n{arg}"
+                ),
+            }
+        )
+        reply = ollama.chat(messages=messages)
+        return safe_reply(reply, max_chars=cfg.agent.max_reply_chars)
 
     if cmd in ("google", "web", "websearch"):
         if not arg:
@@ -1262,15 +1500,18 @@ def _handle_comment(
 
     if cmd in ("simulate", "sim"):
         logger.debug("Tool simulate invoked (len=%d)", len(arg))
-        try:
-            reply = simulate_series_vdc_resistors(
-                text=arg or text,
-                phy_engine_cfg=cfg.phy_engine,
-                config_base_dir=config_base_dir,
-            )
-        except Exception as e:
-            if bool(getattr(cfg.agent, "simulation_ai_enabled", True)):
-                try:
+        if bool(getattr(cfg.agent, "simulation_ai_enabled", True)):
+            try:
+                reply = simulate_ai_script_circuit_with_phyengine(
+                    ollama=ollama,
+                    text=arg or text,
+                    context_json=experiment_context,
+                    phy_engine_cfg=cfg.phy_engine,
+                    config_base_dir=config_base_dir,
+                    max_components=int(getattr(cfg.agent, "simulation_ai_max_components", 30) or 30),
+                    max_probes=int(getattr(cfg.agent, "simulation_ai_max_probes", 20) or 20),
+                )
+                if _looks_like_pe_script_parse_failure(reply):
                     reply = simulate_ai_circuit_with_phyengine(
                         ollama=ollama,
                         text=arg or text,
@@ -1282,10 +1523,30 @@ def _handle_comment(
                         ),
                         max_probes=int(getattr(cfg.agent, "simulation_ai_max_probes", 20) or 20),
                     )
-                except Exception as e2:
-                    return f"Simulation failed: {e2}"
-            else:
-                return f"Simulation failed: {e}"
+                return safe_reply(reply, max_chars=cfg.agent.max_reply_chars)
+            except Exception as e:
+                logger.info("AI simulation failed; falling back to demo: %s", e)
+
+        try:
+            reply = simulate_series_vdc_resistors(
+                text=arg or text,
+                phy_engine_cfg=cfg.phy_engine,
+                config_base_dir=config_base_dir,
+            )
+        except Exception as e:
+            return f"Simulation failed: {e}"
+        if _looks_like_series_demo_prompt(reply) and not _looks_like_series_demo_request(arg or text):
+            return safe_reply(
+                (
+                    "仿真失败：这个请求不匹配内置的“串联电阻演示仿真器”。\n"
+                    "请启用 AI 仿真（agent.simulation_ai_enabled=true）并确认 Ollama 正常运行，或提供更具体的电路/规格。"
+                    if any("\u4e00" <= ch <= "\u9fff" for ch in (arg or text or ""))
+                    else "Simulation failed: this request doesn't match the built-in series-resistor demo simulator. "
+                    "Enable AI simulation (simulation_ai_enabled=true) and ensure Ollama is running, "
+                    "or provide a concrete circuit/spec."
+                ),
+                max_chars=cfg.agent.max_reply_chars,
+            )
         return safe_reply(reply, max_chars=cfg.agent.max_reply_chars)
 
     return safe_reply(
@@ -2416,11 +2677,13 @@ def _cmd_run(args: argparse.Namespace) -> int:
         except (PhyEngineError, OSError) as e:
             logger.warning("Phy-Engine prebuild failed (will try on-demand later): %s", e)
 
-    try:
-        password = getpass.getpass(f"Password for {cfg.account.email}: ")
-    except KeyboardInterrupt:
-        logger.info("Cancelled.")
-        return 130
+    password = _read_password(cfg)
+    if password is None:
+        try:
+            password = getpass.getpass(f"Password for {cfg.account.email}: ")
+        except KeyboardInterrupt:
+            logger.info("Cancelled.")
+            return 130
     logger.info("Logging in...")
     try:
         user = email_login(
@@ -2744,11 +3007,13 @@ def _cmd_diagnose(args: argparse.Namespace) -> int:
     logger = _setup_logging(cache_dir=cache_dir, level=(args.log_level or "DEBUG"))
     logger.info("phy_lab diagnose starting (config=%s, cache_dir=%s)", os.path.abspath(args.config), cache_dir)
 
-    try:
-        password = getpass.getpass(f"Password for {cfg.account.email}: ")
-    except KeyboardInterrupt:
-        logger.info("Cancelled.")
-        return 130
+    password = _read_password(cfg)
+    if password is None:
+        try:
+            password = getpass.getpass(f"Password for {cfg.account.email}: ")
+        except KeyboardInterrupt:
+            logger.info("Cancelled.")
+            return 130
 
     logger.info("Logging in...")
     try:
@@ -2957,6 +3222,185 @@ def _cmd_webtest(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_apitest(args: argparse.Namespace) -> int:
+    try:
+        cfg = load_config(args.config)
+    except (OSError, json.JSONDecodeError, ConfigError) as e:
+        print(f"Failed to load config: {e}")
+        return 2
+
+    base_dir = config_dir(args.config)
+    cache_dir = pick_cache_dir(args.config, config=cfg)
+    os.makedirs(cache_dir, exist_ok=True)
+    logger = _setup_logging(cache_dir=cache_dir, level=(args.log_level or "DEBUG"))
+    logger.info("Physics Lab API smoke test (config=%s, cache_dir=%s)", os.path.abspath(args.config), cache_dir)
+
+    password = _read_password(cfg)
+    if password is None:
+        try:
+            password = getpass.getpass(f"Password for {cfg.account.email}: ")
+        except KeyboardInterrupt:
+            logger.info("Cancelled.")
+            return 130
+
+    logger.info("Logging in...")
+    try:
+        user = email_login(
+            email=cfg.account.email,
+            password=password,
+            cache_dir=cache_dir,
+            http_timeout_sec=60.0,
+        )
+    except KeyboardInterrupt:
+        logger.info("Login cancelled.")
+        return 130
+    except (PLARError, Exception) as e:
+        logger.error("Login failed: %s", e)
+        return 3
+
+    try:
+        from physicsLab import Category  # type: ignore
+    except Exception as e:
+        print(f"Failed to import physicsLab.Category: {e}")
+        return 4
+
+    def _print_items(items: list[dict[str, Any]], *, label: str) -> None:
+        print("\n" + ("=" * 72))
+        print(label)
+        print(f"Count: {len(items)}")
+        for it in items[:5]:
+            sid = best_effort_extract_text(it.get("ID")) or best_effort_extract_text(it.get("Id")) or ""
+            subj = best_effort_extract_text(it.get("Subject")) or best_effort_extract_text(it.get("Title")) or ""
+            print(f"- {sid}  {subj}".rstrip())
+        print(("=" * 72) + "\n")
+
+    try:
+        exp = query_experiments(user, category=Category.Experiment, take=int(args.take or 5))
+        _print_items(exp, label="QueryExperiments: Experiment")
+    except Exception as e:
+        print(f"QueryExperiments Experiment failed: {e}")
+
+    try:
+        disc = query_experiments(user, category=Category.Discussion, take=int(args.take or 5))
+        _print_items(disc, label="QueryExperiments: Discussion")
+    except Exception as e:
+        print(f"QueryExperiments Discussion failed: {e}")
+
+    if args.user_name:
+        name = str(args.user_name).strip().lstrip("@")
+        if name:
+            try:
+                data = get_user_by_name(user, name=name)
+                u = data.get("User") if isinstance(data, dict) else None
+                uid = best_effort_extract_text(u.get("ID")) if isinstance(u, dict) else ""
+                nick = best_effort_extract_text(u.get("Nickname")) if isinstance(u, dict) else ""
+                print("\nUser lookup:")
+                print(f"- Nickname: {nick}")
+                print(f"- ID: {uid}")
+            except Exception as e:
+                print(f"GetUser failed: {e}")
+
+    if args.query:
+        q = str(args.query).strip()
+        if q:
+            try:
+                hits = search_recent_experiments(user=user, query=q, max_scan=200, max_results=5)
+                print("\nInternal search (best-effort recent scan):")
+                print(format_experiment_hits(hits))
+            except Exception as e:
+                print(f"Internal search failed: {e}")
+
+    return 0
+
+
+def _cmd_publishsav(args: argparse.Namespace) -> int:
+    try:
+        cfg = load_config(args.config)
+    except (OSError, json.JSONDecodeError, ConfigError) as e:
+        print(f"Failed to load config: {e}")
+        return 2
+
+    cache_dir = pick_cache_dir(args.config, config=cfg)
+    os.makedirs(cache_dir, exist_ok=True)
+    logger = _setup_logging(cache_dir=cache_dir, level=(args.log_level or "DEBUG"))
+    logger.info("Publish .sav (config=%s, cache_dir=%s)", os.path.abspath(args.config), cache_dir)
+
+    sav_path = os.path.abspath(str(args.sav_path or "").strip())
+    if not sav_path:
+        print("Missing --sav-path")
+        return 2
+    if not os.path.isfile(sav_path):
+        print(f".sav not found: {sav_path}")
+        return 2
+
+    title = str(args.title or "").strip() or os.path.basename(sav_path)
+    intro = str(args.introduction or "").strip()
+    category_value = str(args.category or "Discussion").strip() or "Discussion"
+    tags = []
+    if args.tags:
+        tags = [t.strip() for t in str(args.tags).split(",") if t.strip()]
+
+    # Safety: do not publish unless explicitly confirmed.
+    if not bool(args.yes):
+        print("Dry-run (no publish). Would publish:")
+        print(f"- sav: {sav_path}")
+        print(f"- category: {category_value}")
+        print(f"- title: {title}")
+        if tags:
+            print(f"- tags: {tags}")
+        if intro:
+            print(f"- introduction: {truncate(intro, max_chars=200)}")
+        try:
+            counts = load_plsav_counts(sav_path)
+            print(f"- plsav elements: {counts.elements} wires: {counts.wires}")
+        except Exception as e:
+            print(f"- plsav inspect failed: {e}")
+        print("Re-run with --yes to actually publish.")
+        return 0
+
+    password = _read_password(cfg)
+    if password is None:
+        try:
+            password = getpass.getpass(f"Password for {cfg.account.email}: ")
+        except KeyboardInterrupt:
+            logger.info("Cancelled.")
+            return 130
+
+    logger.info("Logging in...")
+    try:
+        user = email_login(
+            email=cfg.account.email,
+            password=password,
+            cache_dir=cache_dir,
+            http_timeout_sec=60.0,
+        )
+    except KeyboardInterrupt:
+        logger.info("Login cancelled.")
+        return 130
+    except (PLARError, Exception) as e:
+        logger.error("Login failed: %s", e)
+        return 3
+
+    try:
+        info = upload_sav_as_experiment(
+            user=user,
+            sav_path=sav_path,
+            title=title,
+            introduction=intro,
+            cache_dir=cache_dir,
+            category_value=category_value,
+            tags=tags or None,
+        )
+    except Exception as e:
+        print(f"Publish failed: {e}")
+        return 5
+
+    print("Published:")
+    print(f"- summary_id: {info.get('summary_id')}")
+    print(f"- category: {info.get('category')}")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="phy_lab-agent")
     sub = parser.add_subparsers(dest="cmd", required=True)
@@ -3046,6 +3490,25 @@ def main(argv: list[str] | None = None) -> int:
     p_web.add_argument("--max-results", default=None, type=int, help="Max results to parse (<=10)")
     p_web.add_argument("--log-level", default=None, help="Console log level (default: DEBUG)")
     p_web.set_defaults(func=_cmd_webtest)
+
+    p_api = sub.add_parser("apitest", help="Smoke test Physics Lab APIs (requires login)")
+    p_api.add_argument("--config", required=True, help="Path to config JSON")
+    p_api.add_argument("--take", default=5, type=int, help="Take count for QueryExperiments (<=24 recommended)")
+    p_api.add_argument("--user-name", default=None, help="Optional username/nickname to lookup (Users/GetUser)")
+    p_api.add_argument("--query", default=None, help="Optional internal search query to run (best-effort recent scan)")
+    p_api.add_argument("--log-level", default=None, help="Console log level (default: DEBUG)")
+    p_api.set_defaults(func=_cmd_apitest)
+
+    p_pub = sub.add_parser("publishsav", help="Publish a local .sav as a community experiment (destructive)")
+    p_pub.add_argument("--config", required=True, help="Path to config JSON")
+    p_pub.add_argument("--sav-path", required=True, help="Path to .sav file")
+    p_pub.add_argument("--category", default="Discussion", help="Experiment|Discussion (default: Discussion)")
+    p_pub.add_argument("--title", default=None, help="Title (default: filename)")
+    p_pub.add_argument("--introduction", default="", help="Introduction text")
+    p_pub.add_argument("--tags", default=None, help="Comma-separated tags (e.g. SmallProject,Featured)")
+    p_pub.add_argument("--yes", action="store_true", help="Actually publish (otherwise dry-run)")
+    p_pub.add_argument("--log-level", default=None, help="Console log level (default: DEBUG)")
+    p_pub.set_defaults(func=_cmd_publishsav)
 
     args = parser.parse_args(argv)
     return int(args.func(args))

@@ -43,6 +43,17 @@ def repo_root() -> str:
     return os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 
 
+def _unwrap_physicslab_user(user: Any) -> Any:
+    """Best-effort unwrap for thin user proxies.
+
+    The agent may wrap the PhysicsLab User object to serialize access across threads.
+    The upstream physicsLab library does strict `isinstance(user, User)` checks, so we
+    pass through the underlying object when available.
+    """
+    inner = getattr(user, "_user", None)
+    return inner if inner is not None else user
+
+
 def _vendored_physicslab_dir() -> str:
     return os.path.join(repo_root(), "third-parties", "physicsLab")
 
@@ -135,6 +146,144 @@ def query_experiments(
     skip: int = 0,
     from_skip: str | None = None,
 ) -> list[dict[str, Any]]:
+    # plweb2 typing hints suggest `Take` is effectively capped (commonly 24).
+    # Some servers reject larger values with `Input.Field.Invalid`.
+    take = int(take)
+    if take <= 0:
+        take = 20
+    if take > 24:
+        take = 24
+    skip = int(skip)
+    if skip < 0:
+        skip = 0
+    if isinstance(from_skip, str) and not from_skip.strip():
+        from_skip = None
+
+    def _extract_values(result: Any) -> list[dict[str, Any]]:
+        if not isinstance(result, dict):
+            raise PLARError(f"Unexpected query_experiments response type: {type(result).__name__}")
+        status = result.get("Status")
+        message = result.get("Message")
+        data = result.get("Data")
+        if data is None and "data" in result:
+            data = result.get("data")
+
+        # plweb2 expects Result{Status,Message,Data}. Data can be null on error.
+        if status is not None:
+            try:
+                st = int(status)
+            except Exception:
+                st = None
+            if st is not None and st != 200:
+                msg = str(message or "").strip()
+                raise PLARError(f"QueryExperiments failed (status={st}): {msg}".rstrip())
+
+        if data is None:
+            return []
+        if isinstance(data, list):
+            return [v for v in data if isinstance(v, dict)]
+        if not isinstance(data, dict):
+            return []
+
+        values = data.get("$values")
+        if values is None:
+            values = data.get("values")
+        if values is None:
+            values = data.get("Values")
+        if values is None:
+            return []
+        if not isinstance(values, list):
+            return []
+        return [v for v in values if isinstance(v, dict)]
+
+    def _direct_http_query() -> Any:
+        token = getattr(user, "token", None)
+        auth_code = getattr(user, "auth_code", None)
+        if not isinstance(token, str) or not token.strip() or not isinstance(auth_code, str) or not auth_code.strip():
+            raise PLARError("token/auth_code are missing for direct QueryExperiments")
+        cat_val = getattr(category, "value", category)
+        try:
+            import requests  # type: ignore
+        except ImportError as e:  # pragma: no cover
+            raise PLARError(
+                "Missing dependency: requests (required for Physics Lab API calls). "
+                "Install it with pip (e.g. 'pip install requests')."
+            ) from e
+
+        def _post(*, exclude_languages: Any, exclude_tags: Any, tags: Any, from_value: Any, skip_value: int) -> Any:
+            resp = requests.post(
+                "https://physics-api-cn.turtlesim.com/Contents/QueryExperiments",
+                json={
+                    "Query": {
+                        "Category": cat_val,
+                        "Languages": [],
+                        # Some servers are picky about null vs [], so we allow retries.
+                        "ExcludeLanguages": exclude_languages,
+                        "Tags": tags,
+                        "ExcludeTags": exclude_tags,
+                        "ModelTags": None,
+                        "ModelID": None,
+                        "ParentID": None,
+                        "UserID": None,
+                        "Special": None,
+                        "From": from_value,
+                        "Skip": int(skip_value),
+                        "Take": int(take),
+                        "Days": 0,
+                        "Sort": 0,
+                        "ShowAnnouncement": False,
+                    }
+                },
+                headers={
+                    "Content-Type": "application/json",
+                    "x-API-Token": token,
+                    "x-API-AuthCode": auth_code,
+                },
+                timeout=_requests_default_timeout_sec,
+            )
+            resp.raise_for_status()
+            return resp.json()
+
+        # Try to follow plweb2 first (null exclude fields).
+        exclude_variants = [
+            (None, None),
+            ([], None),
+            (None, []),
+            ([], []),
+        ]
+        tags_variants = [[], None]
+        page_variants = [
+            (from_skip, int(skip)),
+            (None, int(skip)),
+            (from_skip, 0),
+            (None, 0),
+        ]
+        last: Any = None
+        for from_value, skip_value in page_variants:
+            for tags_value in tags_variants:
+                for ex_langs, ex_tags in exclude_variants:
+                    last = _post(
+                        exclude_languages=ex_langs,
+                        exclude_tags=ex_tags,
+                        tags=tags_value,
+                        from_value=from_value,
+                        skip_value=int(skip_value),
+                    )
+                    if not isinstance(last, dict):
+                        continue
+                    st = last.get("Status")
+                    msg = str(last.get("Message") or "")
+                    if st == 400 and ("Input." in msg and "Invalid" in msg):
+                        continue
+                    return last
+        return last
+
+    # Prefer direct HTTP when possible to ensure request shape matches plweb2 (null vs []).
+    token = getattr(user, "token", None)
+    auth_code = getattr(user, "auth_code", None)
+    if isinstance(token, str) and token.strip() and isinstance(auth_code, str) and auth_code.strip():
+        return _extract_values(_direct_http_query())
+
     qe = getattr(user, "query_experiments", None)
     if callable(qe):
         # NOTE: The upstream API expects `Query.Tags` to be an array. Passing null can
@@ -144,9 +293,9 @@ def query_experiments(
             result = qe(
                 category=category,
                 tags=[],
-                exclude_tags=[],
+                exclude_tags=None,
                 languages=[],
-                exclude_languages=[],
+                exclude_languages=None,
                 user_id=None,
                 take=take,
                 skip=skip,
@@ -160,105 +309,124 @@ def query_experiments(
         # Defensive fallback: some wrappers/mocks may expose a non-callable attribute with the
         # same name. In that case, call the underlying HTTP API directly using the user's
         # token/auth_code.
-        token = getattr(user, "token", None)
-        auth_code = getattr(user, "auth_code", None)
-        if not isinstance(token, str) or not token.strip() or not isinstance(auth_code, str) or not auth_code.strip():
-            raise PLARError(
-                "query_experiments is not callable on this user object, and token/auth_code are missing."
-            )
-        cat_val = getattr(category, "value", category)
         try:
-            import requests  # type: ignore
-        except ImportError as e:  # pragma: no cover
-            raise PLARError(
-                "Missing dependency: requests (required for Physics Lab API calls). "
-                "Install it with pip (e.g. 'pip install requests')."
-            ) from e
-        resp = requests.post(
-            "https://physics-api-cn.turtlesim.com/Contents/QueryExperiments",
-            json={
-                "Query": {
-                    "Category": cat_val,
-                    "Languages": [],
-                    "ExcludeLanguages": [],
-                    "Tags": [],
-                    "ExcludeTags": [],
-                    "ModelTags": None,
-                    "ModelID": None,
-                    "ParentID": None,
-                    "UserID": None,
-                    "Special": None,
-                    "From": from_skip,
-                    "Skip": int(skip),
-                    "Take": int(take),
-                    "Days": 0,
-                    "Sort": 0,
-                    "ShowAnnouncement": False,
-                }
-            },
-            headers={
-                "Content-Type": "application/json",
-                "x-API-Token": token,
-                "x-API-AuthCode": auth_code,
-            },
-            timeout=_requests_default_timeout_sec,
-        )
-        resp.raise_for_status()
-        result = resp.json()
+            result = _direct_http_query()
+        except PLARError:
+            raise
     if result is None:
         # Wrapper call failed; retry with a direct HTTP request.
-        token = getattr(user, "token", None)
-        auth_code = getattr(user, "auth_code", None)
-        if not isinstance(token, str) or not token.strip() or not isinstance(auth_code, str) or not auth_code.strip():
-            raise PLARError(
-                "query_experiments wrapper failed, and token/auth_code are missing for a direct retry."
-            )
-        cat_val = getattr(category, "value", category)
-        try:
-            import requests  # type: ignore
-        except ImportError as e:  # pragma: no cover
-            raise PLARError(
-                "Missing dependency: requests (required for Physics Lab API calls). "
-                "Install it with pip (e.g. 'pip install requests')."
-            ) from e
-        resp = requests.post(
-            "https://physics-api-cn.turtlesim.com/Contents/QueryExperiments",
-            json={
-                "Query": {
-                    "Category": cat_val,
-                    "Languages": [],
-                    "ExcludeLanguages": [],
-                    "Tags": [],
-                    "ExcludeTags": [],
-                    "ModelTags": None,
-                    "ModelID": None,
-                    "ParentID": None,
-                    "UserID": None,
-                    "Special": None,
-                    "From": from_skip,
-                    "Skip": int(skip),
-                    "Take": int(take),
-                    "Days": 0,
-                    "Sort": 0,
-                    "ShowAnnouncement": False,
-                }
-            },
-            headers={
-                "Content-Type": "application/json",
-                "x-API-Token": token,
-                "x-API-AuthCode": auth_code,
-            },
-            timeout=_requests_default_timeout_sec,
-        )
-        resp.raise_for_status()
-        result = resp.json()
-    data = result.get("Data")
-    if not isinstance(data, dict):
-        raise PLARError("Unexpected query_experiments response: missing Data object")
-    values = data.get("$values")
-    if not isinstance(values, list):
-        raise PLARError("Unexpected query_experiments response: missing Data.$values list")
-    return [v for v in values if isinstance(v, dict)]
+        result = _direct_http_query()
+    return _extract_values(result)
+
+
+def get_user_by_name(
+    user: Any,
+    *,
+    name: str,
+) -> dict[str, Any]:
+    name = (name or "").strip()
+    if not name:
+        raise PLARError("name is empty")
+
+    def _extract_data(result: Any) -> dict[str, Any]:
+        if not isinstance(result, dict):
+            raise PLARError(f"Unexpected get_user response type: {type(result).__name__}")
+        status = result.get("Status")
+        if status is not None:
+            try:
+                st = int(status)
+            except Exception:
+                st = None
+            if st is not None and st != 200:
+                msg = str(result.get("Message") or "").strip()
+                raise PLARError(f"GetUser failed (status={st}): {msg}".rstrip())
+        data = result.get("Data")
+        if not isinstance(data, dict):
+            raise PLARError("Unexpected get_user response: missing Data object")
+        return data
+
+    fn = getattr(user, "get_user_by_name", None)
+    if callable(fn):
+        return _extract_data(fn(name))
+
+    token = getattr(user, "token", None)
+    auth_code = getattr(user, "auth_code", None)
+    if not isinstance(token, str) or not token.strip() or not isinstance(auth_code, str) or not auth_code.strip():
+        raise PLARError("get_user_by_name is not callable and token/auth_code are missing")
+    try:
+        import requests  # type: ignore
+    except ImportError as e:  # pragma: no cover
+        raise PLARError(
+            "Missing dependency: requests (required for Physics Lab API calls). "
+            "Install it with pip (e.g. 'pip install requests')."
+        ) from e
+    resp = requests.post(
+        "https://physics-api-cn.turtlesim.com/Users/GetUser",
+        json={"Name": name},
+        headers={
+            "Content-Type": "application/json",
+            "x-API-Token": token,
+            "x-API-AuthCode": auth_code,
+        },
+        timeout=_requests_default_timeout_sec,
+    )
+    resp.raise_for_status()
+    return _extract_data(resp.json())
+
+
+def get_user_by_id(
+    user: Any,
+    *,
+    user_id: str,
+) -> dict[str, Any]:
+    user_id = (user_id or "").strip()
+    if not user_id:
+        raise PLARError("user_id is empty")
+
+    def _extract_data(result: Any) -> dict[str, Any]:
+        if not isinstance(result, dict):
+            raise PLARError(f"Unexpected get_user response type: {type(result).__name__}")
+        status = result.get("Status")
+        if status is not None:
+            try:
+                st = int(status)
+            except Exception:
+                st = None
+            if st is not None and st != 200:
+                msg = str(result.get("Message") or "").strip()
+                raise PLARError(f"GetUser failed (status={st}): {msg}".rstrip())
+        data = result.get("Data")
+        if not isinstance(data, dict):
+            raise PLARError("Unexpected get_user response: missing Data object")
+        return data
+
+    fn = getattr(user, "get_user_by_id", None)
+    if callable(fn):
+        return _extract_data(fn(user_id))
+
+    token = getattr(user, "token", None)
+    auth_code = getattr(user, "auth_code", None)
+    if not isinstance(token, str) or not token.strip() or not isinstance(auth_code, str) or not auth_code.strip():
+        raise PLARError("get_user_by_id is not callable and token/auth_code are missing")
+    try:
+        import requests  # type: ignore
+    except ImportError as e:  # pragma: no cover
+        raise PLARError(
+            "Missing dependency: requests (required for Physics Lab API calls). "
+            "Install it with pip (e.g. 'pip install requests')."
+        ) from e
+    resp = requests.post(
+        "https://physics-api-cn.turtlesim.com/Users/GetUser",
+        json={"ID": user_id},
+        headers={
+            "Content-Type": "application/json",
+            "x-API-Token": token,
+            "x-API-AuthCode": auth_code,
+        },
+        timeout=_requests_default_timeout_sec,
+    )
+    resp.raise_for_status()
+    return _extract_data(resp.json())
 
 
 def get_messages(
@@ -310,6 +478,8 @@ def upload_sav_as_experiment(
     ensure_physicslab_importable(cache_dir=cache_dir)
     from physicsLab import Category, Experiment, OpenMode
 
+    real_user = _unwrap_physicslab_user(user)
+
     if category_value == "Experiment":
         category = Category.Experiment
     elif category_value == "Discussion":
@@ -323,13 +493,47 @@ def upload_sav_as_experiment(
         _apply_publish_tags(exp, tags)
 
     # Use the internal upload to retrieve the SummaryID for reporting.
-    submit_response, submit_data = exp._Experiment__upload(user, category, None)  # type: ignore[attr-defined]
-    summary_id = submit_response["Data"]["Summary"]["ID"]
-    image_counter = submit_data["Summary"]["Image"]
+    try:
+        submit_response, submit_data = exp._Experiment__upload(real_user, category, None)  # type: ignore[attr-defined]
+    except Exception as e:
+        raise PLARError(f"SubmitExperiment failed: {e}") from e
 
-    user.confirm_experiment(summary_id, category, image_counter)
+    if not isinstance(submit_response, dict):
+        raise PLARError("SubmitExperiment returned unexpected response type")
+    status = submit_response.get("Status")
+    if status is not None:
+        try:
+            st = int(status)
+        except Exception:
+            st = None
+        if st is not None and st != 200:
+            msg = str(submit_response.get("Message") or "").strip()
+            raise PLARError(f"SubmitExperiment failed (status={st}): {msg}".rstrip())
+
+    data = submit_response.get("Data")
+    if not isinstance(data, dict):
+        raise PLARError("SubmitExperiment returned no Data object")
+    summary = data.get("Summary")
+    if not isinstance(summary, dict):
+        raise PLARError("SubmitExperiment returned no Data.Summary object")
+    summary_id = summary.get("ID")
+    if not isinstance(summary_id, str) or not summary_id.strip():
+        raise PLARError("SubmitExperiment returned missing Data.Summary.ID")
+
+    image_counter = None
+    if isinstance(submit_data, dict):
+        s2 = submit_data.get("Summary")
+        if isinstance(s2, dict):
+            image_counter = s2.get("Image")
+    if not isinstance(image_counter, int):
+        image_counter = 0
+
+    try:
+        real_user.confirm_experiment(summary_id, category, image_counter)
+    except Exception as e:
+        raise PLARError(f"ConfirmExperiment failed: {e}") from e
     return {
-        "summary_id": summary_id,
+        "summary_id": summary_id.strip(),
         "category": category.value,
     }
 
@@ -375,20 +579,8 @@ def _apply_publish_tags(exp: Any, tags: list[str]) -> None:
         except Exception:
             raw_tags.extend([getattr(t, "value", None) for t in enum_tags if getattr(t, "value", None)])
 
-    if raw_tags:
-        try:
-            plsav = getattr(exp, "PlSav", None)
-            if isinstance(plsav, dict):
-                summary = plsav.get("Summary")
-                if isinstance(summary, dict):
-                    existing = summary.get("Tags")
-                    if not isinstance(existing, list):
-                        existing = []
-                    merged = [x for x in existing if isinstance(x, str) and x.strip()]
-                    merged.extend(raw_tags)
-                    summary["Tags"] = list(dict.fromkeys(merged))
-        except Exception:
-            return
+    # Do NOT inject unknown/raw tags into PlSav Summary: server-side validation may reject them.
+    # Unknown tags are ignored.
 
 
 def get_summary(user: Any, *, summary_id: str, category_value: str) -> dict[str, Any]:
@@ -561,7 +753,12 @@ def get_experiment_context(
         from physicsLab import Experiment, OpenMode
 
         category = PLCategory.Experiment if category_value == "Experiment" else PLCategory.Discussion
-        exp = Experiment(OpenMode.load_by_plar_app, summary_id, category, user=user)
+        exp = Experiment(
+            OpenMode.load_by_plar_app,
+            summary_id,
+            category,
+            user=_unwrap_physicslab_user(user),
+        )
         plsav = exp.PlSav if isinstance(getattr(exp, "PlSav", None), dict) else None
         if isinstance(plsav, dict):
             summary_data = plsav.get("Summary")
@@ -641,16 +838,27 @@ def get_status_save(
     else:
         raise PLARError("category_value must be 'Experiment' or 'Discussion'")
 
-    exp = Experiment(OpenMode.load_by_plar_app, summary_id, category, user=user)
-    plsav = exp.PlSav if isinstance(getattr(exp, "PlSav", None), dict) else None
-    if not isinstance(plsav, dict):
-        raise PLARError("Failed to load PlSav for this content")
+    status_str: Any = None
+    try:
+        exp = Experiment(
+            OpenMode.load_by_plar_app,
+            summary_id,
+            category,
+            user=_unwrap_physicslab_user(user),
+        )
+        plsav = exp.PlSav if isinstance(getattr(exp, "PlSav", None), dict) else None
+        if isinstance(plsav, dict):
+            exp_obj = plsav.get("Experiment")
+            status_str = exp_obj.get("StatusSave") if isinstance(exp_obj, dict) else plsav.get("StatusSave")
+    except Exception:
+        # Fallback to raw API responses to avoid strict user type checks in the upstream library.
+        exp_res = get_experiment(user, summary_id=summary_id, category_value=category_value)
+        data = exp_res.get("Data") if isinstance(exp_res, dict) else None
+        plsav_like = _recursive_find_plsav_like(data) or _recursive_find_plsav_like(exp_res)
+        if isinstance(plsav_like, dict):
+            exp_obj = plsav_like.get("Experiment")
+            status_str = exp_obj.get("StatusSave") if isinstance(exp_obj, dict) else plsav_like.get("StatusSave")
 
-    exp_obj = plsav.get("Experiment")
-    if isinstance(exp_obj, dict):
-        status_str = exp_obj.get("StatusSave")
-    else:
-        status_str = plsav.get("StatusSave")
     if not isinstance(status_str, str) or not status_str.strip():
         raise PLARError("PlSav missing StatusSave")
 

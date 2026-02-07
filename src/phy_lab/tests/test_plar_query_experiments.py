@@ -38,7 +38,7 @@ class TestQueryExperiments(unittest.TestCase):
         self.assertEqual(got, [{"ID": "x"}])
         self.assertEqual(len(user.calls), 1)
         self.assertEqual(user.calls[0]["tags"], [])
-        self.assertEqual(user.calls[0]["exclude_tags"], [])
+        self.assertIsNone(user.calls[0]["exclude_tags"])
 
     def test_falls_back_to_direct_http_on_wrapper_error(self):
         user = _DummyUserRaises()
@@ -69,11 +69,64 @@ class TestQueryExperiments(unittest.TestCase):
         self.assertEqual(captured["url"], "https://physics-api-cn.turtlesim.com/Contents/QueryExperiments")
         self.assertEqual(captured["json"]["Query"]["Category"], "Discussion")
         self.assertEqual(captured["json"]["Query"]["Tags"], [])
-        self.assertEqual(captured["json"]["Query"]["ExcludeTags"], [])
+        self.assertIsNone(captured["json"]["Query"]["ExcludeTags"])
         self.assertEqual(captured["headers"]["x-API-Token"], "tok")
         self.assertEqual(captured["headers"]["x-API-AuthCode"], "auth")
+
+    def test_returns_empty_when_data_is_null(self):
+        class _User:
+            def query_experiments(self, **kwargs):
+                return {"Status": 200, "Message": "", "Data": None}
+
+        got = query_experiments(_User(), category="Experiment", take=1)
+        self.assertEqual(got, [])
+
+    def test_raises_on_non_200_status(self):
+        class _User:
+            def query_experiments(self, **kwargs):
+                return {"Status": 401, "Message": "Unauthorized", "Data": None}
+
+        with self.assertRaises(Exception) as ctx:
+            query_experiments(_User(), category="Experiment", take=1)
+        self.assertIn("status=401", str(ctx.exception))
+
+    def test_direct_http_shape_matches_plweb2_and_take_capped(self):
+        class _User:
+            token = "tok"
+            auth_code = "auth"
+
+        captured = {}
+
+        class _Resp:
+            def raise_for_status(self):
+                return None
+
+            def json(self):
+                return {"Status": 200, "Message": "", "Data": {"$values": []}}
+
+        def _post(url, json=None, headers=None, timeout=None):
+            captured["url"] = url
+            captured["json"] = json
+            captured["headers"] = headers
+            return _Resp()
+
+        import types
+
+        fake_requests = types.ModuleType("requests")
+        fake_requests.post = _post  # type: ignore[attr-defined]
+
+        with mock.patch.dict(sys.modules, {"requests": fake_requests}):
+            got = query_experiments(_User(), category="Experiment", take=200, skip=-1, from_skip="")
+
+        self.assertEqual(got, [])
+        q = captured["json"]["Query"]
+        self.assertEqual(q["Take"], 24)
+        self.assertEqual(q["Skip"], 0)
+        self.assertIsNone(q["From"])
+        self.assertEqual(q["Tags"], [])
+        self.assertIsNone(q["ExcludeTags"])
+        self.assertIsNone(q["ExcludeLanguages"])
 
 
 if __name__ == "__main__":
     unittest.main()
-

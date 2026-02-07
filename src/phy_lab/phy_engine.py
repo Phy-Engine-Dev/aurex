@@ -199,14 +199,36 @@ def verilog_to_plsav(
     timeout_sec: int = 300,
 ) -> None:
     options = options or Verilog2PlSavOptions()
-    cmd = [verilog2plsav_bin, out_sav_path, in_verilog_path]
+
+    def _as_cmd_token(v: object, *, where: str) -> str:
+        if isinstance(v, os.PathLike):
+            v = os.fspath(v)
+        if not isinstance(v, str):
+            raise PhyEngineError(f"Invalid {where}: expected str/path-like, got {type(v).__name__}")
+        s = v.strip()
+        if not s:
+            raise PhyEngineError(f"Invalid {where}: empty string")
+        return s
+
+    cmd = [
+        _as_cmd_token(verilog2plsav_bin, where="verilog2plsav_bin"),
+        _as_cmd_token(out_sav_path, where="out_sav_path"),
+        _as_cmd_token(in_verilog_path, where="in_verilog_path"),
+    ]
     if options.top:
-        cmd.extend(["--top", options.top])
+        cmd.extend(["--top", _as_cmd_token(options.top, where="options.top")])
     if options.extra_args:
-        cmd.extend(list(options.extra_args))
+        for i, a in enumerate(list(options.extra_args)):
+            cmd.append(_as_cmd_token(a, where=f"options.extra_args[{i}]"))
 
     try:
-        subprocess.run(cmd, check=True, timeout=timeout_sec, capture_output=True, text=True)
+        subprocess.run(
+            cmd,
+            check=True,
+            timeout=float(timeout_sec),
+            capture_output=True,
+            text=True,
+        )
     except subprocess.TimeoutExpired as e:
         raise PhyEngineError(f"verilog2plsav timed out: {e}") from e
     except subprocess.CalledProcessError as e:
@@ -218,6 +240,9 @@ def verilog_to_plsav(
         if len(out) > 4000:
             out = out[-4000:]
         raise PhyEngineError(f"verilog2plsav failed (exit={e.returncode}): {out}") from e
+    except (TypeError, OSError) as e:
+        msg = str(e).strip() or e.__class__.__name__
+        raise PhyEngineError(f"verilog2plsav invocation failed: {msg}") from e
 
     if not os.path.exists(out_sav_path):
         raise PhyEngineError(f"verilog2plsav did not produce output: {out_sav_path}")

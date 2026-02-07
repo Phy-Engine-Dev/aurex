@@ -21,9 +21,12 @@ from pe_sim import AnalyzeType, PhyEngineLib, SeriesVdcResistorsSpec
 from pe_builder import (
     PEBuilderError,
     build_circuit,
+    PEProbe,
     parse_pe_sim_spec,
     parse_spec_json,
 )
+from pe_cmd import PEScriptError, parse_pe_script_to_spec_obj
+from pe_tool import evaluate_probes, run_and_sample
 from plsav_sim import PlSavSimError, build_pe_circuit_input_from_status_save
 from phy_engine import (
     PhyEngineError,
@@ -217,6 +220,77 @@ def llm_build_pe_sim_spec_json(
     ).strip()
 
 
+def llm_build_pe_sim_script(
+    *,
+    ollama: OllamaClient,
+    user_text: str,
+    context_json: dict[str, Any] | None,
+    max_components: int,
+    max_probes: int,
+) -> str:
+    """Ask the LLM to produce a safe line-based command script for PE simulation."""
+    context_blob = ""
+    if context_json is not None:
+        context_blob = (
+            "Context JSON (current page):\n"
+            + json.dumps(context_json, ensure_ascii=False, indent=2)
+            + "\n\n"
+        )
+    prompt = (
+        "Write a PE-SCRIPT (a safe, line-based command script) to build and simulate a circuit.\n"
+        "You must follow the command grammar exactly. Output ONLY the script lines.\n"
+        "\n"
+        "Command reference (one per line; case-insensitive):\n"
+        "- ANALYSIS <dc|ac|tr>\n"
+        "- SET AC_OMEGA <omega_rad_s>           (only for ac)\n"
+        "- SET TR <t_step_s> <t_stop_s>        (only for tr)\n"
+        "- ADD <ID> <TYPE> <NODE0> <NODE1> <k=v ...>\n"
+        "    TYPE: resistor|r, capacitor|c, inductor|l, vdc, idc, vac, iac\n"
+        "    Params:\n"
+        "      - resistor: r=<ohm>\n"
+        "      - capacitor: c=<farad>\n"
+        "      - inductor: l=<henry>\n"
+        "      - vdc: v=<volt>\n"
+        "      - idc: i=<amp>\n"
+        "      - vac: vp=<volt_peak> freq=<hz> phase=<deg>\n"
+        "      - iac: ip=<amp_peak> freq=<hz> phase=<deg>\n"
+        "- WIRE <NODE> <ID.PIN> [ID.PIN ...]   (optional; PIN is 0 or 1)\n"
+        "- PROBE NODE <NODE>\n"
+        "- PROBE I <ID>\n"
+        "- PROBE VDROP <ID>\n"
+        "- RUN                                 (optional marker)\n"
+        "\n"
+        "Wiring rules:\n"
+        "- Pins that share the same NODE name are connected.\n"
+        "- You MUST include a ground node named exactly 'gnd' connected to the circuit.\n"
+        "\n"
+        "Hard constraints:\n"
+        f"- At most {int(max_components)} ADD commands.\n"
+        f"- At most {int(max_probes)} PROBE commands.\n"
+        "- Every component must be a 2-terminal element.\n"
+        "- Use simple node names like: gnd, n1, n2, vin, vout.\n"
+        "- Use SI units (Ohm, Farad, Henry, Volt, Ampere).\n"
+        "\n"
+        "Output rules:\n"
+        "- Output ONLY script lines (no JSON, no markdown, no explanations).\n"
+        "- Do NOT use semicolons.\n"
+        "- No extra commands outside the reference.\n"
+        "\n"
+        + context_blob
+        + "User request:\n"
+        + user_text.strip()
+    )
+    return ollama.chat(
+        messages=[
+            {
+                "role": "system",
+                "content": "You are a careful circuit engineer. Output PE-SCRIPT only.",
+            },
+            {"role": "user", "content": prompt},
+        ]
+    ).strip()
+
+
 def simulate_ai_circuit_with_phyengine(
     *,
     ollama: OllamaClient,
@@ -400,6 +474,116 @@ def simulate_ai_circuit_with_phyengine(
     return "\n".join(lines)
 
 
+def simulate_ai_script_circuit_with_phyengine(
+    *,
+    ollama: OllamaClient,
+    text: str,
+    context_json: dict[str, Any] | None,
+    phy_engine_cfg: Any,
+    config_base_dir: str,
+    max_components: int = 30,
+    max_probes: int = 20,
+) -> str:
+    """LLM -> PE-SCRIPT -> (parsed) -> Phy-Engine -> results -> LLM answer."""
+    lang_zh = _looks_like_zh(text)
+
+    cmake_source_dir = _resolve_existing_path(
+        str(getattr(phy_engine_cfg, "cmake_source_dir", "")),
+        base_dir=config_base_dir,
+    )
+    lib_cfg_path = _resolve_existing_path(
+        str(getattr(phy_engine_cfg, "phyengine_lib_path", "")),
+        base_dir=config_base_dir,
+    )
+    lib_path = ensure_phyengine_lib(
+        phyengine_lib_path=lib_cfg_path,
+        auto_build=bool(getattr(phy_engine_cfg, "auto_build", False)),
+        cmake_source_dir=cmake_source_dir,
+        cmake_build_dir=os.path.abspath(
+            os.path.join(config_base_dir, str(getattr(phy_engine_cfg, "cmake_build_dir", "")))
+        ),
+        cmake_build_type=str(getattr(phy_engine_cfg, "cmake_build_type", "Release")),
+        build_timeout_sec=int(getattr(phy_engine_cfg, "build_timeout_sec", 900)),
+    )
+
+    script = llm_build_pe_sim_script(
+        ollama=ollama,
+        user_text=text,
+        context_json=context_json,
+        max_components=max_components,
+        max_probes=max_probes,
+    )
+    try:
+        spec_obj = parse_pe_script_to_spec_obj(
+            script,
+            max_components=max_components,
+            max_probes=max_probes,
+        )
+        spec = parse_pe_sim_spec(spec_obj, max_components=max_components, max_probes=max_probes)
+        built = build_circuit(spec)
+    except (PEScriptError, PEBuilderError) as e:
+        return (
+            f"我没能把命令脚本解析成可仿真的电路。错误：{e}\n\n脚本：\n{script}"
+            if lang_zh
+            else f"I couldn't parse the command script into a simulatable circuit. Error: {e}\n\nScript:\n{script}"
+        )
+
+    probes = list(spec.probes)
+    if not probes:
+        node_names = [n for n in built.node_to_pin.keys() if n != "gnd"]
+        for n in node_names[: max(0, max_probes // 2)]:
+            probes.append(PEProbe(kind="node_voltage", target=n))
+        for comp in spec.components[: max(0, max_probes // 2)]:
+            probes.append(PEProbe(kind="component_current", target=comp.id))
+
+    sample = run_and_sample(lib_path=lib_path, spec=spec, built=built)
+    evaluated = evaluate_probes(
+        built=built,
+        sample=sample,
+        probes=[{"kind": p.kind, "target": p.target} for p in probes[:max_probes]],
+    )
+
+    raw = {
+        "analysis": {
+            "type": spec.analysis_type,
+            "ac_omega_rad_s": spec.ac_omega_rad_s,
+            "tr_t_step_s": spec.tr_t_step_s,
+            "tr_t_stop_s": spec.tr_t_stop_s,
+        },
+        "components": [
+            {"id": c.id, "type": c.type, "nodes": list(c.nodes), "params": dict(c.params)}
+            for c in spec.components
+        ],
+        "probes": evaluated,
+    }
+
+    messages: list[dict[str, str]] = []
+    messages.append(
+        {
+            "role": "system",
+            "content": (
+                "Reply in Chinese. Use the simulation results precisely. Be concise."
+                if lang_zh
+                else "Reply in English. Use the simulation results precisely. Be concise."
+            ),
+        }
+    )
+    messages.append({"role": "system", "content": "PE-SCRIPT used:\n" + script.strip()})
+    messages.append({"role": "system", "content": "Raw simulation results (JSON):\n" + json.dumps(raw, ensure_ascii=False)})
+    messages.append(
+        {
+            "role": "user",
+            "content": (
+                "Use the simulation results above to answer the user's request.\n"
+                "- If a requested value is missing/unavailable, say so briefly.\n"
+                "- Include the most relevant numeric results.\n\n"
+                f"User request:\n{text.strip()}"
+            ),
+        }
+    )
+    return ollama.chat(messages=messages).strip()
+
+
 def search_recent_experiments(
     *,
     user: Any,
@@ -420,10 +604,26 @@ def search_recent_experiments(
     scanned: list[dict[str, Any]] = []
 
     for cat in categories:
-        if len(scanned) >= max_scan:
-            break
-        page = query_experiments(user, category=cat, take=min(50, max_scan - len(scanned)))
-        scanned.extend(page)
+        from_skip: str | None = None
+        skip = 0
+        while len(scanned) < max_scan:
+            page_take = min(24, max_scan - len(scanned))
+            page = query_experiments(
+                user,
+                category=cat,
+                take=page_take,
+                skip=skip,
+                from_skip=from_skip,
+            )
+            if not page:
+                break
+            scanned.extend(page)
+            skip += int(page_take)
+            last = page[-1]
+            last_id = best_effort_extract_text(last.get("ID")) or best_effort_extract_text(last.get("Id"))
+            from_skip = last_id or from_skip
+            if len(page) < page_take:
+                break
 
     q = query.casefold()
     hits: list[dict[str, Any]] = []

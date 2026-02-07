@@ -79,6 +79,15 @@ python src/phy_lab/agent.py run --config .phy_lab/config.json
 
 当你选择 `duckduckgo-search` 时，需要安装依赖：`pip install duckduckgo-search`
 
+登录密码不建议写入配置文件。需要无人值守运行时，请使用环境变量（优先级最高）：
+- `PHY_LAB_PASSWORD` 或 `PHYSICSLAB_PASSWORD`
+
+测试账号/本地调试如果想避免交互输入，也可以在配置文件里写入 `account.password`（优先级低于环境变量）。
+
+调试命令（需要登录）：
+- `phy_lab-agent apitest --config .phy_lab/config.json --take 5 --user-name 某个昵称 --query 关键词`
+- `phy_lab-agent publishsav --config .phy_lab/config.json --sav-path path/to/design.sav --category Discussion --title 标题 --yes`
+
 如果你希望让 Agent 在自然语言下自动选择工具（例如生成电路/搜索/总结），可以设置：
 
 - `agent.auto_tool_routing=true`

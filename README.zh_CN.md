@@ -23,7 +23,7 @@ python -m pip install -r src/phy_lab/requirements.txt
 python src/phy_lab/agent.py init --config .phy_lab/config.json
 ```
 
-运行（密码运行时输入，不会写入磁盘）：
+运行（默认密码运行时输入，不会写入磁盘；测试场景也可在 `account.password` 写入配置）：
 
 ```bash
 python src/phy_lab/agent.py run --config .phy_lab/config.json
@@ -39,4 +39,3 @@ python src/phy_lab/agent.py run --config .phy_lab/config.json --once --dry-run
 
 - 英文：`src/phy_lab/README.md`
 - 简体中文：`src/phy_lab/README.zh_CN.md`
-

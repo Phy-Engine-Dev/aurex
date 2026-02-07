@@ -90,6 +90,12 @@ Key settings:
 - `agent.simulation_ai_enabled`: allow the LLM to build a small PE circuit for simulation when a request cannot be parsed by the built-in simulator (default: `true`)
 - `agent.simulation_ai_max_components`: max components for AI-built simulations (default: `30`)
 - `agent.simulation_ai_max_probes`: max probe lines returned (default: `20`)
+
+For non-interactive runs, do not store passwords in config files. Use `PHY_LAB_PASSWORD` (or `PHYSICSLAB_PASSWORD`) env var instead.
+
+Debug commands (require login):
+- `phy_lab-agent apitest --config .phy_lab/config.json --take 5 --user-name <nickname> --query <keywords>`
+- `phy_lab-agent publishsav --config .phy_lab/config.json --sav-path path/to/design.sav --category Discussion --title "Title" --yes`
 - `agent.overload_protection_enabled`: enable overload protection (default: `true`)
 - `agent.overload_window_sec`: time window for request counting (default: `600`)
 - `agent.overload_max_requests`: max requests per window before replying busy (default: `40`)
