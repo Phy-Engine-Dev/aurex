@@ -68,7 +68,7 @@ class TestQueryExperiments(unittest.TestCase):
         self.assertEqual(got, [{"ID": "y"}])
         self.assertEqual(captured["url"], "https://physics-api-cn.turtlesim.com/Contents/QueryExperiments")
         self.assertEqual(captured["json"]["Query"]["Category"], "Discussion")
-        self.assertEqual(captured["json"]["Query"]["Tags"], [])
+        self.assertIsNone(captured["json"]["Query"]["Tags"])
         self.assertIsNone(captured["json"]["Query"]["ExcludeTags"])
         self.assertEqual(captured["headers"]["x-API-Token"], "tok")
         self.assertEqual(captured["headers"]["x-API-AuthCode"], "auth")
@@ -123,9 +123,43 @@ class TestQueryExperiments(unittest.TestCase):
         self.assertEqual(q["Take"], 24)
         self.assertEqual(q["Skip"], 0)
         self.assertIsNone(q["From"])
-        self.assertEqual(q["Tags"], [])
+        self.assertIsNone(q["Tags"])
         self.assertIsNone(q["ExcludeTags"])
         self.assertIsNone(q["ExcludeLanguages"])
+
+    def test_direct_http_supports_days_and_popularity_sort(self):
+        class _User:
+            token = "tok"
+            auth_code = "auth"
+
+        captured = {}
+
+        class _Resp:
+            def raise_for_status(self):
+                return None
+
+            def json(self):
+                return {"Status": 200, "Message": "", "Data": {"$values": []}}
+
+        def _post(url, json=None, headers=None, timeout=None):
+            captured["url"] = url
+            captured["json"] = json
+            captured["headers"] = headers
+            return _Resp()
+
+        import types
+
+        fake_requests = types.ModuleType("requests")
+        fake_requests.post = _post  # type: ignore[attr-defined]
+
+        with mock.patch.dict(sys.modules, {"requests": fake_requests}):
+            got = query_experiments(_User(), category="Experiment", take=5, days=14, sort="Popularity")
+
+        self.assertEqual(got, [])
+        q = captured["json"]["Query"]
+        self.assertEqual(q["Category"], "Experiment")
+        self.assertEqual(q["Days"], "14")
+        self.assertEqual(q["Sort"], "Popularity")
 
 
 if __name__ == "__main__":

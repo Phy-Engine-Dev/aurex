@@ -734,11 +734,89 @@ def search_recent_experiments(
         return []
 
     try:
-        from physicsLab import Category
-    except Exception as e:  # pragma: no cover
-        raise PLARError(f"Failed to import physicsLab.Category: {e}") from e
+        from physicsLab import Category  # type: ignore
 
-    categories = [Category.Experiment, Category.Discussion]
+        categories: list[Any] = [Category.Experiment, Category.Discussion]
+    except Exception:  # pragma: no cover
+        # Allow direct HTTP mode without the physicsLab dependency.
+        categories = ["Experiment", "Discussion"]
+
+    def _parse_hot_query(q: str) -> tuple[list[str], int] | None:
+        q = (q or "").strip()
+        if not q:
+            return None
+        qlow = q.casefold()
+        if not (q.startswith("热门") or any(w in qlow for w in ("hot", "popular", "popularity"))):
+            return None
+
+        # Days: default 14 for "hot" queries if unspecified.
+        days = 14
+        m = re.search(r"(?i)\bdays?\s*=\s*(?P<n>[0-9]{1,3})\b", q) or re.search(
+            r"(?i)\b(?P<n>[0-9]{1,3})\s*(?:d|day|days)\b", q
+        ) or re.search(r"(?P<n>[0-9]{1,3})\s*天", q)
+        if m and m.group("n"):
+            try:
+                days = int(m.group("n"))
+            except Exception:
+                days = 14
+        if days < 0:
+            days = 0
+        if days > 365:
+            days = 365
+
+        cats: list[str] = []
+        mc = re.search(r"(?i)\bcategory\s*=\s*(?P<cats>[A-Za-z/,_]+)\b", q)
+        if mc and mc.group("cats"):
+            raw = mc.group("cats")
+            for part in re.split(r"[/,]", raw):
+                p = (part or "").strip()
+                if not p:
+                    continue
+                if p.casefold() in ("user", "experiment", "discussion", "model"):
+                    cats.append(p[:1].upper() + p[1:].casefold())
+        else:
+            if ("用户" in q) or ("user" in qlow):
+                cats.append("User")
+            if ("实验" in q) or ("experiment" in qlow):
+                cats.append("Experiment")
+            if ("讨论" in q) or ("discussion" in qlow):
+                cats.append("Discussion")
+
+        if not cats:
+            cats = ["Experiment", "Discussion"]
+
+        # De-dup and keep stable order.
+        cats = list(dict.fromkeys(cats))
+        return cats, days
+
+    hot = _parse_hot_query(query)
+    if hot is not None:
+        cats, days = hot
+        out: list[dict[str, Any]] = []
+        for c in cats:
+            try:
+                page = query_experiments(
+                    user,
+                    category=c,
+                    take=min(24, max(1, int(max_results))),
+                    skip=0,
+                    from_skip=None,
+                    days=days,
+                    sort="Popularity",
+                )
+            except Exception:
+                continue
+            for item in page:
+                if not isinstance(item, dict):
+                    continue
+                if "Category" not in item:
+                    item = dict(item)
+                    item["Category"] = c
+                out.append(item)
+                if len(out) >= max_results:
+                    return out
+        return out
+
     scanned: list[dict[str, Any]] = []
 
     for cat in categories:
@@ -787,10 +865,17 @@ def format_experiment_hits(hits: list[dict[str, Any]]) -> str:
         item_id = best_effort_extract_text(item.get("ID")) or best_effort_extract_text(
             item.get("Id")
         )
+        cat = best_effort_extract_text(item.get("Category"))
         if item_id:
-            lines.append(f"{idx}. {subject} (ID: {item_id})")
+            if cat:
+                lines.append(f"{idx}. [{cat}] {subject} (ID: {item_id})")
+            else:
+                lines.append(f"{idx}. {subject} (ID: {item_id})")
         else:
-            lines.append(f"{idx}. {subject}")
+            if cat:
+                lines.append(f"{idx}. [{cat}] {subject}")
+            else:
+                lines.append(f"{idx}. {subject}")
     return "\n".join(lines)
 
 

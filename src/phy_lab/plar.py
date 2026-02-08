@@ -145,6 +145,9 @@ def query_experiments(
     take: int = 20,
     skip: int = 0,
     from_skip: str | None = None,
+    days: int | str | None = None,
+    sort: int | str | None = None,
+    user_id: str | None = None,
 ) -> list[dict[str, Any]]:
     # plweb2 typing hints suggest `Take` is effectively capped (commonly 24).
     # Some servers reject larger values with `Input.Field.Invalid`.
@@ -158,6 +161,43 @@ def query_experiments(
         skip = 0
     if isinstance(from_skip, str) and not from_skip.strip():
         from_skip = None
+    if isinstance(user_id, str) and not user_id.strip():
+        user_id = None
+
+    def _sort_variants(v: int | str | None) -> list[int | str]:
+        if v is None:
+            return [0]
+        if isinstance(v, int):
+            return [v]
+        s = str(v).strip()
+        if not s:
+            return [0]
+        low = s.casefold()
+        mapping: dict[str, int] = {
+            "default": 0,
+            "popularity": 1,
+            "popular": 1,
+            "hot": 1,
+            "random": 2,
+        }
+        if low in mapping:
+            return [s, mapping[low]]
+        return [s]
+
+    def _days_variants(v: int | str | None) -> list[int | str]:
+        if v is None:
+            return [0]
+        if isinstance(v, int):
+            if v < 0:
+                return [0]
+            # App/web sometimes sends Days as a string.
+            return [str(v), v]
+        s = str(v).strip()
+        if not s:
+            return [0]
+        if s.isdigit():
+            return [s, int(s)]
+        return [s]
 
     def _extract_values(result: Any) -> list[dict[str, Any]]:
         if not isinstance(result, dict):
@@ -210,7 +250,16 @@ def query_experiments(
                 "Install it with pip (e.g. 'pip install requests')."
             ) from e
 
-        def _post(*, exclude_languages: Any, exclude_tags: Any, tags: Any, from_value: Any, skip_value: int) -> Any:
+        def _post(
+            *,
+            exclude_languages: Any,
+            exclude_tags: Any,
+            tags: Any,
+            from_value: Any,
+            skip_value: int,
+            days_value: int | str,
+            sort_value: int | str,
+        ) -> Any:
             resp = requests.post(
                 "https://physics-api-cn.turtlesim.com/Contents/QueryExperiments",
                 json={
@@ -224,13 +273,13 @@ def query_experiments(
                         "ModelTags": None,
                         "ModelID": None,
                         "ParentID": None,
-                        "UserID": None,
+                        "UserID": user_id,
                         "Special": None,
                         "From": from_value,
                         "Skip": int(skip_value),
                         "Take": int(take),
-                        "Days": 0,
-                        "Sort": 0,
+                        "Days": days_value,
+                        "Sort": sort_value,
                         "ShowAnnouncement": False,
                     }
                 },
@@ -238,6 +287,8 @@ def query_experiments(
                     "Content-Type": "application/json",
                     "x-API-Token": token,
                     "x-API-AuthCode": auth_code,
+                    "Accept": "application/json",
+                    "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) phy_lab/1.0",
                 },
                 timeout=_requests_default_timeout_sec,
             )
@@ -251,7 +302,9 @@ def query_experiments(
             (None, []),
             ([], []),
         ]
-        tags_variants = [[], None]
+        # Many clients send Tags=null when no tag filtering is intended.
+        # Try None first for "all tags", then [] as a compatibility fallback.
+        tags_variants = [None, []]
         page_variants = [
             (from_skip, int(skip)),
             (None, int(skip)),
@@ -259,23 +312,29 @@ def query_experiments(
             (None, 0),
         ]
         last: Any = None
+        sort_variants = _sort_variants(sort)
+        days_variants = _days_variants(days)
         for from_value, skip_value in page_variants:
             for tags_value in tags_variants:
                 for ex_langs, ex_tags in exclude_variants:
-                    last = _post(
-                        exclude_languages=ex_langs,
-                        exclude_tags=ex_tags,
-                        tags=tags_value,
-                        from_value=from_value,
-                        skip_value=int(skip_value),
-                    )
-                    if not isinstance(last, dict):
-                        continue
-                    st = last.get("Status")
-                    msg = str(last.get("Message") or "")
-                    if st == 400 and ("Input." in msg and "Invalid" in msg):
-                        continue
-                    return last
+                    for days_value in days_variants:
+                        for sort_value in sort_variants:
+                            last = _post(
+                                exclude_languages=ex_langs,
+                                exclude_tags=ex_tags,
+                                tags=tags_value,
+                                from_value=from_value,
+                                skip_value=int(skip_value),
+                                days_value=days_value,
+                                sort_value=sort_value,
+                            )
+                            if not isinstance(last, dict):
+                                continue
+                            st = last.get("Status")
+                            msg = str(last.get("Message") or "")
+                            if st == 400 and ("Input." in msg and "Invalid" in msg):
+                                continue
+                            return last
         return last
 
     # Prefer direct HTTP when possible to ensure request shape matches plweb2 (null vs []).
