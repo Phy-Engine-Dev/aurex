@@ -82,6 +82,7 @@ from tools import (  # noqa: E402
     render_help,
     safe_reply,
     search_recent_experiments,
+    simulate_ai_verilog_with_phyengine,
     simulate_ai_circuit_with_phyengine,
     simulate_ai_script_circuit_with_phyengine,
     simulate_series_vdc_resistors,
@@ -258,6 +259,52 @@ def _looks_like_series_demo_prompt(text: str) -> bool:
 def _looks_like_series_demo_request(text: str) -> bool:
     t = (text or "").casefold()
     return any(x in t for x in ("串联", "series", "resistor", "电阻", "ohm", "ω", "v="))
+
+def _looks_like_plar_search_request(text: str) -> bool:
+    """Heuristic: user explicitly wants an in-app/community search.
+
+    Physics Lab internal search is best-effort and can return no results; keep this conservative.
+    """
+    t = (text or "").strip()
+    if not t:
+        return False
+
+    low = t.casefold()
+
+    # Explicit English intent.
+    if any(
+        low.startswith(x)
+        for x in (
+            "search ",
+            "find ",
+            "look for ",
+            "looking for ",
+            "lookup ",
+        )
+    ):
+        return True
+    if any(x in low for x in (" search ", " find ", " look for ", " looking for ")):
+        return True
+
+    # Explicit Chinese intent.
+    if any(x in t for x in ("搜索", "查找", "搜一下", "搜下", "查下", "找一下", "帮我找", "想找")):
+        return True
+    if any(x in t for x in ("有没有", "推荐", "求", "哪里有")) and any(
+        y in t for y in ("实验", "作品", "电路", "工程", "讨论")
+    ):
+        return True
+
+    # Explicit user lookup patterns.
+    if low.startswith(("user:", "user ", "用户:", "用户 ")):
+        return True
+    if low.startswith(("@", "＠")):
+        return True
+    if ("@" in t or "＠" in t) and any(x in low for x in ("who is", "id", "uid")):
+        return True
+    if ("@" in t or "＠" in t) and any(x in t for x in ("是谁", "谁是", "ID", "id", "用户")):
+        return True
+
+    return False
 
 def _read_password_from_env(email: str) -> str | None:
     # Do not store passwords in config files. Use an env var if you need non-interactive runs.
@@ -437,10 +484,15 @@ def _llm_route_tool(
         "Allowed actions:\n"
         "- chat\n"
         "- summarize\n"
-        "- search_plar  (search within Physics Lab community)\n"
+        "- search_plar  (search within Physics Lab community; best-effort over recent items)\n"
         "- google  (web search)\n"
         "- circuit  (generate Verilog and compile to .sav)\n"
         "- simulate  (run a local circuit simulation demo)\n\n"
+        "Internal search policy (important):\n"
+        "- Choose search_plar ONLY when the user explicitly asks you to search/find/recommend items in the Physics Lab community.\n"
+        "- Do NOT choose search_plar as a default for general Q&A. It often returns no results.\n"
+        "- If the user is not clearly asking for a search, prefer chat (or ask a short clarifying question).\n"
+        "- If you choose search_plar, keep arg as concise keywords, or 'user: <name>' for user lookups.\n\n"
         "Publishing policy:\n"
         "- Only set publish=true if the user explicitly asks to publish/share/post the experiment.\n"
         "- Otherwise publish=false.\n\n"
@@ -810,6 +862,18 @@ def _handle_comment(
                     len(routed_arg),
                 )
 
+                if action == "search_plar" and not _looks_like_plar_search_request(arg):
+                    q0 = (routed_arg or "").strip()
+                    allow_implicit_user_lookup = q0.startswith(("@", "＠")) or q0.casefold().startswith(
+                        ("user:", "user ", "用户:", "用户 ")
+                    )
+                    if not allow_implicit_user_lookup:
+                        logger.info(
+                            "Auto tool routing: ignoring search_plar (no explicit search intent; user_text_len=%d)",
+                            len(arg),
+                        )
+                        action = "chat"
+
                 if action == "summarize":
                     if not routed_arg and experiment_context is not None:
                         messages: list[dict[str, str]] = [{"role": "system", "content": cfg.agent.system_prompt}]
@@ -1009,8 +1073,40 @@ def _handle_comment(
                     sim_text = routed_arg or arg
                     failures: list[str] = []
                     ai_parse_failure: str | None = None
+                    prefers_verilog = any(
+                        x in (sim_text or "").casefold()
+                        for x in (
+                            "verilog",
+                            "module",
+                            "endmodule",
+                            "logic",
+                            "gate",
+                            "flipflop",
+                            "与门",
+                            "或门",
+                            "非门",
+                            "异或",
+                            "逻辑",
+                        )
+                    )
                     # Prefer: LLM builds PE-SCRIPT -> simulate -> LLM interprets results.
                     if bool(getattr(cfg.agent, "simulation_ai_enabled", True)):
+                        if prefers_verilog:
+                            try:
+                                replyv = simulate_ai_verilog_with_phyengine(
+                                    ollama=ollama,
+                                    text=sim_text,
+                                    context_json=experiment_context,
+                                    phy_engine_cfg=cfg.phy_engine,
+                                    config_base_dir=config_base_dir,
+                                    cache_dir=cache_dir,
+                                    max_attempts=2,
+                                    max_elements=int(getattr(cfg.agent, "simulation_max_elements", 300) or 300),
+                                )
+                                return safe_reply(replyv, max_chars=cfg.agent.max_reply_chars)
+                            except Exception as e:
+                                failures.append(f"ai_verilog_sim_failed: {_format_exception_brief(e)}")
+                                logger.info("AI Verilog simulation failed; falling back: %s", e)
                         try:
                             reply = simulate_ai_script_circuit_with_phyengine(
                                 ollama=ollama,

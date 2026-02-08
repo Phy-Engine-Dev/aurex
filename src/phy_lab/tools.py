@@ -1189,6 +1189,200 @@ def _looks_like_zh(text: str) -> bool:
     return any("\u4e00" <= ch <= "\u9fff" for ch in (text or ""))
 
 
+_DIGITAL_TICKS_RE = re.compile(
+    r"(?i)(?:ticks?|clks?|clock)\s*=\s*(?P<n>[0-9]{1,7})|(?:时钟|脉冲)\s*(?P<n2>[0-9]{1,7})\s*(?:次|下|拍)?"
+)
+
+
+def _parse_digital_ticks(text: str) -> int | None:
+    m = _DIGITAL_TICKS_RE.search(text or "")
+    if not m:
+        return None
+    n = m.group("n") or m.group("n2")
+    if not n:
+        return None
+    try:
+        v = int(n)
+    except Exception:
+        return None
+    if v < 0:
+        return None
+    return min(1_000_000, v)
+
+
+def _status_save_has_logic(status_save: dict[str, Any]) -> bool:
+    els = status_save.get("Elements")
+    if not isinstance(els, list):
+        return False
+    for e in els:
+        if not isinstance(e, dict):
+            continue
+        mid = e.get("ModelID")
+        if not isinstance(mid, str):
+            continue
+        s = mid.casefold()
+        if "logic" in s or "gate" in s or "flipflop" in s or "adder" in s or "subtractor" in s or "counter" in s:
+            return True
+    return False
+
+
+_LOGIC_ASSIGN_RE = re.compile(r"(?i)\b(?P<name>[A-Za-z][A-Za-z0-9_]*)\s*=\s*(?P<val>[01])\b")
+
+
+def _parse_logic_input_assignments(text: str) -> dict[str, int]:
+    assigns: dict[str, int] = {}
+    for m in _LOGIC_ASSIGN_RE.finditer(text or ""):
+        name = (m.group("name") or "").strip()
+        if not name:
+            continue
+        v = 1 if (m.group("val") or "0") == "1" else 0
+        assigns[name.casefold()] = v
+    return assigns
+
+
+def _apply_logic_assignments(status_save: dict[str, Any], assigns: dict[str, int]) -> None:
+    if not assigns:
+        return
+    els = status_save.get("Elements")
+    if not isinstance(els, list):
+        return
+    for el in els:
+        if not isinstance(el, dict):
+            continue
+        if el.get("ModelID") != "Logic Input":
+            continue
+        label = el.get("Label")
+        if not isinstance(label, str) or not label.strip():
+            continue
+        key = label.strip().casefold()
+        if key not in assigns:
+            continue
+        props = el.get("Properties")
+        if not isinstance(props, dict):
+            props = {}
+            el["Properties"] = props
+        props["开关"] = float(assigns[key])
+
+
+def _load_status_save_from_sav_path(path: str) -> dict[str, Any]:
+    with open(path, "r", encoding="utf-8") as f:
+        root = json.load(f)
+    if not isinstance(root, dict):
+        raise RuntimeError(".sav root must be an object")
+    exp = root.get("Experiment")
+    if not isinstance(exp, dict):
+        raise RuntimeError(".sav missing Experiment object")
+    ss = exp.get("StatusSave")
+    if isinstance(ss, str):
+        try:
+            obj = json.loads(ss)
+        except json.JSONDecodeError as e:
+            raise RuntimeError(f".sav Experiment.StatusSave is not valid JSON: {e}") from e
+        if not isinstance(obj, dict):
+            raise RuntimeError(".sav StatusSave JSON is not an object")
+        return obj
+    if isinstance(ss, dict):
+        return ss
+    raise RuntimeError(".sav missing Experiment.StatusSave")
+
+
+def simulate_ai_verilog_with_phyengine(
+    *,
+    ollama: OllamaClient,
+    text: str,
+    context_json: dict[str, Any] | None,
+    phy_engine_cfg: Any,
+    config_base_dir: str,
+    cache_dir: str,
+    max_attempts: int = 2,
+    max_elements: int = 1000,
+) -> str:
+    """LLM/user Verilog -> verilog2plsav -> StatusSave -> Phy-Engine adapter simulation."""
+    lang_zh = _looks_like_zh(text)
+    if max_attempts <= 0:
+        max_attempts = 1
+    if max_attempts > 5:
+        max_attempts = 5
+
+    verilog = extract_fenced_code(text, preferred_lang="verilog")
+    if not verilog:
+        # Heuristic: user pasted Verilog without fences.
+        t = (text or "")
+        if "module" in t and "endmodule" in t:
+            verilog = t
+    if not verilog:
+        verilog = llm_generate_verilog(ollama=ollama, spec=text)
+
+    cmake_source_dir = _resolve_existing_path(
+        str(getattr(phy_engine_cfg, "cmake_source_dir", "")),
+        base_dir=config_base_dir,
+    )
+    verilog2plsav_cfg_path = _resolve_existing_path(
+        str(getattr(phy_engine_cfg, "verilog2plsav_path", "")),
+        base_dir=config_base_dir,
+    )
+    verilog2plsav_bin = ensure_verilog2plsav(
+        verilog2plsav_path=verilog2plsav_cfg_path,
+        auto_build=bool(getattr(phy_engine_cfg, "auto_build", False)),
+        cmake_source_dir=cmake_source_dir,
+        cmake_build_dir=os.path.abspath(
+            os.path.join(config_base_dir, str(getattr(phy_engine_cfg, "cmake_build_dir", "")))
+        ),
+        cmake_build_type=str(getattr(phy_engine_cfg, "cmake_build_type", "Release")),
+        build_timeout_sec=int(getattr(phy_engine_cfg, "build_timeout_sec", 900)),
+    )
+
+    extra_args = getattr(phy_engine_cfg, "verilog2plsav_args", None)
+    extra_args_list: list[str] = []
+    if isinstance(extra_args, list) and all(isinstance(x, str) for x in extra_args):
+        extra_args_list = [x for x in extra_args if x.strip()]
+
+    assigns = _parse_logic_input_assignments(text)
+
+    with tempfile.TemporaryDirectory(prefix="phy_lab_verilog_sim_", dir=cache_dir) as temp_dir:
+        in_v = os.path.join(temp_dir, "design.v")
+        out_sav = os.path.join(temp_dir, "design.sav")
+
+        last_error: str | None = None
+        for attempt in range(1, max_attempts + 1):
+            with open(in_v, "w", encoding="utf-8") as f:
+                f.write(verilog)
+                f.write("\n")
+            try:
+                verilog_to_plsav(
+                    verilog2plsav_bin=verilog2plsav_bin,
+                    out_sav_path=out_sav,
+                    in_verilog_path=in_v,
+                    options=Verilog2PlSavOptions(top="top", extra_args=extra_args_list or None),
+                    timeout_sec=int(getattr(phy_engine_cfg, "run_timeout_sec", 300)),
+                )
+                last_error = None
+                break
+            except Exception as e:
+                last_error = str(e) or e.__class__.__name__
+                if attempt >= max_attempts:
+                    if lang_zh:
+                        return "Verilog→.sav 编译失败：\n" + truncate(last_error, max_chars=1800)
+                    return "Verilog→.sav compilation failed:\n" + truncate(last_error, max_chars=1800)
+                verilog = llm_fix_verilog(
+                    ollama=ollama,
+                    spec=text,
+                    prior_verilog=verilog,
+                    error_text=last_error,
+                )
+
+        status_save = _load_status_save_from_sav_path(out_sav)
+        _apply_logic_assignments(status_save, assigns)
+
+        return simulate_status_save_with_phyengine(
+            text=text,
+            status_save=status_save,
+            phy_engine_cfg=phy_engine_cfg,
+            config_base_dir=config_base_dir,
+            max_elements=int(max_elements),
+        )
+
+
 def _pe_sim_timeout_sec(phy_engine_cfg: Any, *, default_sec: float = 5.0) -> float:
     v = getattr(phy_engine_cfg, "sim_timeout_sec", None)
     if v is None:
@@ -1211,6 +1405,7 @@ def _pe_status_save_adapter_worker(
     tr_t_step_s: float,
     tr_t_stop_s: float,
     ac_omega_rad_s: float,
+    digital_clk_ticks: int,
 ) -> dict[str, Any]:
     lib = PhyEngineLib(lib_path)
     return lib.simulate_status_save(
@@ -1219,6 +1414,7 @@ def _pe_status_save_adapter_worker(
         tr_t_step_s=float(tr_t_step_s),
         tr_t_stop_s=float(tr_t_stop_s),
         ac_omega_rad_s=float(ac_omega_rad_s),
+        digital_clk_ticks=int(digital_clk_ticks),
         indent=0,
     )
 
@@ -1336,6 +1532,9 @@ def simulate_status_save_with_phyengine(
     analyze_type = 4 if wants_tr else 1
     adapter_err = ""
     if lib.can_simulate_status_save():
+        ticks = _parse_digital_ticks(text)
+        if ticks is None:
+            ticks = 1 if _status_save_has_logic(status_save) else 0
         try:
             out_status = run_with_timeout(
                 fn=_pe_status_save_adapter_worker,
@@ -1346,6 +1545,7 @@ def simulate_status_save_with_phyengine(
                     "tr_t_step_s": float(t_step or 1e-6) if wants_tr else 0.0,
                     "tr_t_stop_s": float(t_stop or 1e-6) if wants_tr else 0.0,
                     "ac_omega_rad_s": 0.0,
+                    "digital_clk_ticks": int(ticks),
                 },
                 timeout_sec=float(timeout_sec),
                 label="Phy-Engine StatusSave simulation",

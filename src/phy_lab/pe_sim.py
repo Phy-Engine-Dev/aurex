@@ -74,6 +74,7 @@ class PhyEngineLib:
         self._plw_last_error = None
         self._plw_string_free = None
         self._plw_pe_simulate_status_save = None
+        self._plw_pe_simulate_status_save_ex = None
         self._bind()
 
     def _bind(self) -> None:
@@ -194,8 +195,24 @@ class PhyEngineLib:
         except Exception:
             self._plw_pe_simulate_status_save = None
 
+        try:
+            self._plw_pe_simulate_status_save_ex = getattr(self._lib, "plw_pe_simulate_status_save_ex")
+            self._plw_pe_simulate_status_save_ex.argtypes = [
+                c_char_p,  # json bytes
+                c_size_t,  # byte length
+                c_uint32,  # analyze_type
+                c_double,  # tr_t_step_s
+                c_double,  # tr_t_stop_s
+                c_double,  # ac_omega_rad_s
+                c_int,  # digital_clk_ticks
+                c_int,  # indent
+            ]
+            self._plw_pe_simulate_status_save_ex.restype = c_void_p
+        except Exception:
+            self._plw_pe_simulate_status_save_ex = None
+
     def can_simulate_status_save(self) -> bool:
-        return bool(self._plw_pe_simulate_status_save and self._plw_string_free)
+        return bool((self._plw_pe_simulate_status_save_ex or self._plw_pe_simulate_status_save) and self._plw_string_free)
 
     def simulate_status_save(
         self,
@@ -205,20 +222,33 @@ class PhyEngineLib:
         tr_t_step_s: float = 0.0,
         tr_t_stop_s: float = 0.0,
         ac_omega_rad_s: float = 0.0,
+        digital_clk_ticks: int = 1,
         indent: int = 0,
     ) -> dict:
         if not self.can_simulate_status_save():
             raise PESimError("Phy-Engine library does not export plw_pe_simulate_status_save")
         payload = json.dumps(status_save, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
-        ptr = self._plw_pe_simulate_status_save(
-            payload,
-            ctypes.c_size_t(len(payload)),
-            ctypes.c_uint32(int(analyze_type)),
-            ctypes.c_double(float(tr_t_step_s)),
-            ctypes.c_double(float(tr_t_stop_s)),
-            ctypes.c_double(float(ac_omega_rad_s)),
-            ctypes.c_int(int(indent)),
-        )
+        if self._plw_pe_simulate_status_save_ex is not None:
+            ptr = self._plw_pe_simulate_status_save_ex(
+                payload,
+                ctypes.c_size_t(len(payload)),
+                ctypes.c_uint32(int(analyze_type)),
+                ctypes.c_double(float(tr_t_step_s)),
+                ctypes.c_double(float(tr_t_stop_s)),
+                ctypes.c_double(float(ac_omega_rad_s)),
+                ctypes.c_int(int(digital_clk_ticks)),
+                ctypes.c_int(int(indent)),
+            )
+        else:
+            ptr = self._plw_pe_simulate_status_save(
+                payload,
+                ctypes.c_size_t(len(payload)),
+                ctypes.c_uint32(int(analyze_type)),
+                ctypes.c_double(float(tr_t_step_s)),
+                ctypes.c_double(float(tr_t_stop_s)),
+                ctypes.c_double(float(ac_omega_rad_s)),
+                ctypes.c_int(int(indent)),
+            )
         if not ptr:
             msg = None
             if self._plw_last_error is not None:

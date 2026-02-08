@@ -147,6 +147,50 @@ class TestAgentSearchFlow(unittest.TestCase):
         self.assertIn("Nickname: abc", out)
         self.assertIn("ID: u9", out)
 
+    def test_auto_routed_search_is_ignored_without_explicit_search_intent(self):
+        class _Cfg2:
+            class _Agent:
+                system_prompt = "sys"
+                max_reply_chars = 2000
+                mention_tag = "@aurex"
+                commands_enabled = False
+                command_prefix = "!"
+                auto_tool_routing = True
+                require_mention = False
+                user_targets_require_mention = False
+                web_search_enabled = False
+                simulation_enabled = False
+
+            agent = _Agent()
+
+        ollama = _FakeOllama()
+        user = object()
+        # Not an explicit search request.
+        comment = {"Content": "Explain op amp basics"}
+
+        def _fake_route(**_kw):
+            return {"action": "search_plar", "arg": "op amp", "publish": False}
+
+        with mock.patch.object(agent_mod, "_llm_route_tool", side_effect=_fake_route):
+            with mock.patch.object(
+                agent_mod, "search_recent_experiments", side_effect=AssertionError("search should not run")
+            ):
+                out = agent_mod._handle_comment(
+                    comment=comment,
+                    user=user,
+                    ollama=ollama,
+                    cache_dir="cache",
+                    config_base_dir=".",
+                    cfg=_Cfg2(),
+                    dry_run=True,
+                    logger=agent_mod.logging.getLogger("t"),
+                    conversation_key=None,
+                    experiment_context=None,
+                    history=[],
+                )
+
+        self.assertEqual(out, "OK")
+
     def test_circuit_command_defaults_to_discussion_category(self):
         class _Cfg4:
             class _Agent:
