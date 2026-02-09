@@ -67,6 +67,15 @@ class _Cfg:
 
 
 class TestAgentMode(unittest.TestCase):
+    def test_parse_context_ref(self):
+        self.assertEqual(agent_mod._parse_context_ref("experiment:abc"), ("Experiment", "abc"))
+        self.assertEqual(agent_mod._parse_context_ref("exp:abc"), ("Experiment", "abc"))
+        self.assertEqual(agent_mod._parse_context_ref("discussion:abc"), ("Discussion", "abc"))
+        self.assertEqual(agent_mod._parse_context_ref("disc:abc"), ("Discussion", "abc"))
+        self.assertEqual(agent_mod._parse_context_ref("abc"), ("Experiment", "abc"))
+        self.assertIsNone(agent_mod._parse_context_ref("x:abc"))
+        self.assertIsNone(agent_mod._parse_context_ref("experiment:"))
+
     def test_shrink_context_omits_excerpts(self):
         ctx = {
             "summary_id": "abc",

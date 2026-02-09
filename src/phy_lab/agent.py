@@ -5795,6 +5795,172 @@ def _cmd_publishsav(args: argparse.Namespace) -> int:
     return 0
 
 
+def _parse_context_ref(text: str) -> tuple[str, str] | None:
+    """Parse a context reference like `experiment:<24hex>` or `discussion:<24hex>`."""
+    t = str(text or "").strip()
+    if not t:
+        return None
+    if ":" in t:
+        pfx, sid = t.split(":", 1)
+        p = (pfx or "").strip().casefold()
+        sid2 = (sid or "").strip()
+        if not sid2:
+            return None
+        if p in ("experiment", "exp", "e"):
+            return "Experiment", sid2
+        if p in ("discussion", "discuss", "disc", "d"):
+            return "Discussion", sid2
+        # Accept already-normalized values.
+        if p in ("experiment", "discussion"):
+            return pfx.strip().title(), sid2
+        return None
+    # Default category when user provides only an ID.
+    return "Experiment", t
+
+
+def _cmd_oneshot(args: argparse.Namespace) -> int:
+    """Run one local prompt (agent-mode or plain chat) for debugging."""
+    try:
+        cfg = load_config(args.config)
+    except (OSError, json.JSONDecodeError, ConfigError) as e:
+        print(f"Failed to load config: {e}")
+        return 2
+
+    base_dir = config_dir(args.config)
+    cache_dir = pick_cache_dir(args.config, config=cfg)
+    os.makedirs(cache_dir, exist_ok=True)
+
+    want_debug_io = bool(getattr(args, "debug_io", False))
+    logger = _setup_logging(
+        cache_dir=cache_dir,
+        level=(args.log_level or ("DEBUG" if want_debug_io else getattr(cfg.agent, "log_level", "INFO"))),
+    )
+    logger.info("phy_lab oneshot (config=%s, cache_dir=%s)", os.path.abspath(args.config), cache_dir)
+
+    mode = str(getattr(args, "mode", "agent") or "agent").strip().lower()
+    if mode not in ("agent", "chat"):
+        print("Invalid --mode. Use: agent, chat")
+        return 2
+
+    text = str(getattr(args, "text", "") or "").strip()
+    if not text:
+        try:
+            text = (sys.stdin.read() or "").strip()
+        except Exception:
+            text = ""
+    if not text:
+        print("Missing --text (or provide stdin).")
+        return 2
+
+    context_json: dict[str, Any] | None = None
+    context_ref = _parse_context_ref(str(getattr(args, "context", "") or "").strip()) if getattr(args, "context", None) else None
+
+    need_login = (mode == "agent") or (context_ref is not None)
+    user: Any = object()
+    if need_login:
+        password = _read_password(cfg)
+        if password is None:
+            try:
+                password = getpass.getpass(f"Password for {cfg.account.email}: ")
+            except KeyboardInterrupt:
+                logger.info("Cancelled.")
+                return 130
+
+        logger.info("Logging in...")
+        try:
+            user = email_login(
+                email=cfg.account.email,
+                password=password,
+                cache_dir=cache_dir,
+                http_timeout_sec=60.0,
+            )
+        except KeyboardInterrupt:
+            logger.info("Login cancelled.")
+            return 130
+        except (PLARError, Exception) as e:
+            logger.error("Login failed: %s", e)
+            return 3
+
+    # Optionally fetch context JSON (useful to reproduce comment-context behavior).
+    if context_ref is not None:
+        category_value, summary_id = context_ref
+        try:
+            context_json = get_experiment_context(
+                user,
+                summary_id=summary_id,
+                category_value=category_value,
+                cache_dir=cache_dir,
+                ttl_sec=300,
+                max_json_chars=20_000,
+            )
+        except Exception as e:
+            print(f"Failed to load context {category_value}:{summary_id}: {_format_exception_brief(e)}")
+            return 4
+
+    # Force debug I/O if requested.
+    if want_debug_io:
+        try:
+            setattr(cfg.agent, "debug_log_llm_io", True)
+        except Exception:
+            pass
+
+    endpoints = list(getattr(cfg.ollama, "base_urls", None) or []) or [cfg.ollama.base_url]
+    base_url = str(endpoints[0] or cfg.ollama.base_url).strip()
+    if not base_url:
+        print("Missing ollama.base_url in config.")
+        return 2
+    client = OllamaClient(
+        base_url=base_url,
+        model=cfg.ollama.model,
+        timeout_sec=int(getattr(cfg.ollama, "request_timeout_sec", 240) or 240),
+        temperature=float(getattr(cfg.ollama, "temperature", 0.2) or 0.2),
+        num_predict=int(getattr(cfg.ollama, "num_predict", 2048) or 2048),
+        gptoss_optimization=bool(getattr(cfg.ollama, "gptoss_optimization", False)),
+    )
+    logger.info("Ollama: %s (model=%s)", base_url, cfg.ollama.model)
+
+    try:
+        if mode == "chat":
+            system_prompt = _effective_system_prompt(cfg=cfg, user_text=text)
+            msgs: list[dict[str, str]] = [{"role": "system", "content": system_prompt}]
+            if context_json is not None:
+                msgs.append(
+                    {
+                        "role": "system",
+                        "content": "Context JSON (current page):\n"
+                        + json.dumps(_shrink_context_json_for_llm(context_json), ensure_ascii=False, indent=2),
+                    }
+                )
+            msgs.append({"role": "user", "content": text})
+            out = client.chat(messages=msgs)
+            print(out)
+            return 0
+
+        # Agent mode: run tools, but never publish (dry_run=True).
+        reply = agent_mode_run(
+            ollama=client,
+            user=user,
+            cfg=cfg,
+            cache_dir=cache_dir,
+            config_base_dir=base_dir,
+            dry_run=True,
+            logger=logger,
+            task=text,
+            context_json=context_json,
+            history=[],
+            requester_nickname=getattr(user, "nickname", None),
+            requester_user_id=getattr(user, "user_id", None),
+            max_seconds=int(getattr(args, "max_seconds", 180) or 180),
+            max_steps=int(getattr(args, "max_steps", 12) or 12),
+        )
+        print(reply)
+        return 0
+    except Exception as e:
+        logger.error("oneshot failed: %s", e, exc_info=True)
+        print(f"ERROR: {_format_exception_brief(e)}")
+        return 5
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="phy_lab-agent")
     sub = parser.add_subparsers(dest="cmd", required=True)
@@ -5911,6 +6077,21 @@ def main(argv: list[str] | None = None) -> int:
     p_pub.add_argument("--yes", action="store_true", help="Actually publish (otherwise dry-run)")
     p_pub.add_argument("--log-level", default=None, help="Console log level (default: DEBUG)")
     p_pub.set_defaults(func=_cmd_publishsav)
+
+    p_one = sub.add_parser("oneshot", help="Run a single local prompt (debug helper)")
+    p_one.add_argument("--config", required=True, help="Path to config JSON")
+    p_one.add_argument("--text", default=None, help="Prompt text (default: read from stdin)")
+    p_one.add_argument("--mode", default="agent", help="agent|chat (default: agent)")
+    p_one.add_argument(
+        "--context",
+        default=None,
+        help="Optional context to load: experiment:<id> | discussion:<id> | <id> (defaults to Experiment)",
+    )
+    p_one.add_argument("--max-seconds", default=180, type=int, help="Agent-mode time budget seconds (default: 180)")
+    p_one.add_argument("--max-steps", default=12, type=int, help="Agent-mode max tool steps (default: 12)")
+    p_one.add_argument("--debug-io", action="store_true", help="Force debug logs for LLM I/O")
+    p_one.add_argument("--log-level", default=None, help="Console log level (default: config or DEBUG if --debug-io)")
+    p_one.set_defaults(func=_cmd_oneshot)
 
     args = parser.parse_args(argv)
     return int(args.func(args))
