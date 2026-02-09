@@ -153,10 +153,12 @@ class OllamaClient:
             session.trust_env = False
 
         retry_guard = (
-            "IMPORTANT:\n"
-            "- Your reply MUST include a non-empty final answer.\n"
-            "- Do NOT output only internal reasoning.\n"
-            "- If you are unsure, say so briefly in the final answer.\n"
+            "IMPORTANT (non-empty output required):\n"
+            "- Your previous response had empty 'message.content'. This is NOT allowed.\n"
+            "- You MUST return a non-empty final answer in message.content.\n"
+            "- Do NOT output only internal reasoning/thinking.\n"
+            "- Keep the final answer short (<= 800 characters).\n"
+            "- If you intend to call a tool, also include the tool-call JSON in message.content.\n"
         )
 
         # Some Ollama builds/models can occasionally return an empty message.content.
@@ -164,6 +166,7 @@ class OllamaClient:
         max_attempts = 2
         last_data: Any = None
         last_details: dict[str, Any] = {}
+        base_options: dict[str, Any] = dict(payload.get("options") or {})
         for attempt in range(1, max_attempts + 1):
             try:
                 resp = session.post(url, json=payload, timeout=self.timeout_sec)
@@ -197,6 +200,9 @@ class OllamaClient:
                 return tool_json
             thinking = message.get("thinking")
             thinking_len = len(thinking) if isinstance(thinking, str) else 0
+            done_reason = data.get("done_reason")
+            eval_count = data.get("eval_count")
+            prompt_eval_count = data.get("prompt_eval_count")
             last_details = {
                 "model": self.model,
                 "base_url": self.base_url,
@@ -205,9 +211,21 @@ class OllamaClient:
                 "content_len": len(content),
                 "had_thinking": bool(thinking_len),
                 "thinking_len": thinking_len,
+                "done_reason": done_reason,
+                "eval_count": eval_count,
+                "prompt_eval_count": prompt_eval_count,
+                "num_predict": int(base_options.get("num_predict") or self.num_predict),
             }
             if attempt < max_attempts:
                 # Retry with an extra guard message to encourage a non-empty final output.
+                # If the model is burning the whole budget on the thinking channel, force a
+                # shorter retry to give it a chance to produce message.content.
+                retry_num_predict = int(base_options.get("num_predict") or self.num_predict)
+                if retry_num_predict <= 0:
+                    retry_num_predict = int(self.num_predict) if int(self.num_predict) > 0 else 512
+                retry_num_predict = min(retry_num_predict, 512)
+                payload["options"] = dict(base_options)
+                payload["options"]["num_predict"] = retry_num_predict
                 payload["messages"] = list(base_messages) + [{"role": "system", "content": retry_guard}]
                 continue
 

@@ -314,6 +314,31 @@ def _political_refusal_message(user_text: str) -> str:
         return "抱歉，我不能处理或搜索任何政治相关内容。我可以帮助你解决物理实验室社区相关问题。"
     return "Sorry, I can't help with political content or political web searches. I can help with Physics Lab AR community questions."
 
+def _looks_like_content_intro_request(text: str) -> bool:
+    """Heuristic: user wants an intro/summary of a specific work/content."""
+    t = (text or "").strip()
+    if not t:
+        return False
+    low = t.casefold()
+    asks_intro = any(
+        x in low
+        for x in (
+            "introduce",
+            "introduction",
+            "介绍",
+            "简介",
+            "讲讲",
+            "看看",
+            "内容",
+            "是什么",
+        )
+    )
+    mentions_work = any(x in low for x in ("work", "作品", "实验", "讨论", "experiment", "discussion"))
+    refers_specific = any(
+        x in low for x in ("发布", "uid:", "user:", "experiment:", "discussion:", "@", "＠")
+    ) or bool(_HEX24_RE.search(t.strip()))
+    return bool(asks_intro and mentions_work and refers_specific)
+
 def _looks_like_pe_script_parse_failure(text: str) -> bool:
     t = (text or "").strip()
     return t.startswith("I couldn't parse the command script") or t.startswith(
@@ -727,6 +752,8 @@ def _agent_tool_prompt(*, max_seconds: int) -> str:
         "  - Use search_plar ONLY to LOOKUP by user name/id or content id.\n"
         "  - For discovery, use list_plar (latest/hot/featured/following/followers) and then open by ID.\n"
         "- Never guess content IDs. Only open IDs that the user provided or that you obtained from list_plar/search_plar.\n"
+        "- When describing a specific work, you MUST open it first (plar_open_content_page or plar_get_experiment_context) and only use fields from that Context JSON.\n"
+        "- In your FINAL answer about a work, include Category + SummaryID + Subject so the user can verify.\n"
         "- Publishing is only allowed when the user explicitly asks AND config enables it; otherwise keep publish=false.\n"
         "- If you publish via circuit tool and it returns published=true, your FINAL answer MUST include:\n"
         "  - Category (always Discussion)\n"
@@ -1601,6 +1628,7 @@ def agent_mode_run(
 
     wants_simulation = _looks_like_simulation_request(task)
     simulation_enabled = bool(getattr(getattr(cfg, "agent", None), "simulation_enabled", True))
+    wants_content_intro = _looks_like_content_intro_request(task)
 
     start_ts = time.time()
     deadline = start_ts + float(max_seconds)
@@ -1649,6 +1677,8 @@ def agent_mode_run(
 
     last_raw = ""
     did_use_simulation_tool = False
+    did_open_content = False
+    had_auth_failed = False
     for step in range(1, int(max_steps) + 1):
         now = time.time()
         time_left = int(max(0.0, deadline - now))
@@ -1803,6 +1833,19 @@ def agent_mode_run(
                     }
                 )
                 continue
+            if wants_content_intro and tools_enabled and (not did_open_content) and (not had_auth_failed):
+                messages.append(
+                    {
+                        "role": "system",
+                        "content": (
+                            "REJECTED: You must OPEN the specific work/content before describing it.\n"
+                            "- If user gave an ID: call plar_open_content_page.\n"
+                            "- If user gave a nickname: plar_get_user_by_name -> list_plar(user_id=...) -> plar_open_content_page(summary_id,...).\n"
+                            "If you cannot access (auth failed), say so and do NOT invent any details."
+                        ),
+                    }
+                )
+                continue
             if debug_io:
                 logger.debug("agent.tool_call: step=%d tool=end final_len=%d", step, len(final or ""))
             out = safe_reply(final or "", max_chars=cfg.agent.max_reply_chars)
@@ -1834,6 +1877,14 @@ def agent_mode_run(
             requester_nickname=requester_nickname,
             requester_user_id=requester_user_id,
         )
+        if tool in ("plar_open_content_page", "plar_get_experiment_context"):
+            obj = _try_parse_json_object(result or "")
+            if isinstance(obj, dict) and obj.get("error") == "auth_failed":
+                had_auth_failed = True
+            elif isinstance(obj, dict) and obj.get("found") is False:
+                pass
+            elif isinstance(obj, dict):
+                did_open_content = True
         if debug_io:
             logger.debug(
                 "agent.tool_result: step=%d tool=%s len=%d preview=%r",
@@ -4628,13 +4679,28 @@ def _process_work_item(
         # Avoid getting stuck retrying the same comment forever: we will mark it processed below.
         details = getattr(e, "details", None)
         if isinstance(e, OllamaError) and isinstance(details, dict) and details:
+            is_empty = "empty 'message.content'" in (str(e) or "").casefold()
             logger.warning(
                 "[%s] LLM failed (comment=%s): %s details=%s",
                 target_key,
                 key,
                 e,
-                {k: details.get(k) for k in ("attempt", "max_attempts", "had_thinking", "thinking_len", "content_len")},
-                exc_info=True,
+                {
+                    k: details.get(k)
+                    for k in (
+                        "attempt",
+                        "max_attempts",
+                        "had_thinking",
+                        "thinking_len",
+                        "content_len",
+                        "done_reason",
+                        "eval_count",
+                        "prompt_eval_count",
+                        "num_predict",
+                    )
+                },
+                # Empty-content failures are expected/transient; avoid log spam with full tracebacks.
+                exc_info=(False if is_empty else True),
             )
         else:
             logger.warning("[%s] Handle comment failed (comment=%s): %s", target_key, key, e, exc_info=True)
