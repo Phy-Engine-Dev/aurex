@@ -221,7 +221,7 @@ def _format_required_by_prefix(*, nickname: str | None, user_id: str | None) -> 
     else:
         who = f"@{uid}"
     # Required format (no space between 'by' and '@').
-    return f"required by{who} ({uid})\n\n"
+    return f"required by {who} ({uid})\n\n"
 
 
 def _llm_generate_publish_title_intro(
@@ -726,6 +726,7 @@ def _agent_tool_prompt(*, max_seconds: int) -> str:
         "- Physics Lab search limitation: do NOT assume a true keyword search exists.\n"
         "  - Use search_plar ONLY to LOOKUP by user name/id or content id.\n"
         "  - For discovery, use list_plar (latest/hot/featured/following/followers) and then open by ID.\n"
+        "- Never guess content IDs. Only open IDs that the user provided or that you obtained from list_plar/search_plar.\n"
         "- Publishing is only allowed when the user explicitly asks AND config enables it; otherwise keep publish=false.\n"
         "- If you publish via circuit tool and it returns published=true, your FINAL answer MUST include:\n"
         "  - Category (always Discussion)\n"
@@ -746,6 +747,9 @@ def _agent_tool_prompt(*, max_seconds: int) -> str:
         "\n"
         "Open/read flows (examples):\n"
         "- {\"tool\":\"plar_get_user_board\",\"args\":{\"user_id\":\"<uid>\",\"take\":20,\"skip\":0}}  (read someone's board)\n"
+        "- To view a user's works by nickname: plar_get_user_by_name -> list_plar with user_id.\n"
+        "  - {\"tool\":\"plar_get_user_by_name\",\"args\":{\"name\":\"紫兰斋\"}}\n"
+        "  - {\"tool\":\"list_plar\",\"args\":{\"kind\":\"latest\",\"category\":\"both\",\"user_id\":\"<uid>\",\"take\":5}}\n"
         "- {\"tool\":\"plar_open_content_page\",\"args\":{\"summary_id\":\"<24hex>\",\"category\":\"Experiment\",\"take\":20,\"skip\":0}}  (read an experiment/discussion + recent comments)\n"
     )
 
@@ -1212,14 +1216,31 @@ def _agent_execute_tool(
                 )
             except Exception:
                 comments = []
-            ctx = get_experiment_context(
-                user,
-                summary_id=summary_id,
-                category_value="Experiment" if category == "Experiment" else "Discussion",
-                cache_dir=cache_dir,
-                ttl_sec=300,
-                max_json_chars=20_000,
-            )
+            try:
+                ctx = get_experiment_context(
+                    user,
+                    summary_id=summary_id,
+                    category_value="Experiment" if category == "Experiment" else "Discussion",
+                    cache_dir=cache_dir,
+                    ttl_sec=300,
+                    max_json_chars=20_000,
+                )
+            except Exception as e:
+                # Make errors machine-actionable for the agent loop.
+                msg_low = (str(e) or "").casefold()
+                if isinstance(e, PermissionError) and "login failed" in msg_low:
+                    return json.dumps(
+                        {"error": "auth_failed", "summary_id": summary_id, "category": category},
+                        ensure_ascii=False,
+                        indent=2,
+                    )
+                if _is_probable_content_not_found_error(e):
+                    return json.dumps(
+                        {"found": False, "summary_id": summary_id, "category": category},
+                        ensure_ascii=False,
+                        indent=2,
+                    )
+                return f"ERROR: {_format_exception_brief(e)}"
             obj = dict(ctx or {})
             obj["recent_comments"] = _recent_comments_context(comments, limit=8)
             obj["paging"] = {"take": take, "skip": skip}
@@ -1316,14 +1337,30 @@ def _agent_execute_tool(
             category = str(args.get("category") or "").strip() or "Experiment"
             if not summary_id:
                 return "ERROR: missing args.summary_id"
-            ctx = get_experiment_context(
-                user,
-                summary_id=summary_id,
-                category_value=category,
-                cache_dir=cache_dir,
-                ttl_sec=300,
-                max_json_chars=20_000,
-            )
+            try:
+                ctx = get_experiment_context(
+                    user,
+                    summary_id=summary_id,
+                    category_value=category,
+                    cache_dir=cache_dir,
+                    ttl_sec=300,
+                    max_json_chars=20_000,
+                )
+            except Exception as e:
+                msg_low = (str(e) or "").casefold()
+                if isinstance(e, PermissionError) and "login failed" in msg_low:
+                    return json.dumps(
+                        {"error": "auth_failed", "summary_id": summary_id, "category": category},
+                        ensure_ascii=False,
+                        indent=2,
+                    )
+                if _is_probable_content_not_found_error(e):
+                    return json.dumps(
+                        {"found": False, "summary_id": summary_id, "category": category},
+                        ensure_ascii=False,
+                        indent=2,
+                    )
+                return f"ERROR: {_format_exception_brief(e)}"
             return json.dumps(ctx, ensure_ascii=False, indent=2)
 
         if tool == "plar_get_status_save":
@@ -1487,7 +1524,7 @@ def _agent_execute_tool(
             else:
                 title = truncate(f"Auto Circuit: {spec}", max_chars=60)
                 intro_body = truncate(f"Spec:\n{spec}", max_chars=520)
-            introduction = truncate(required_by + "\n\n" + intro_body, max_chars=600)
+            introduction = truncate(required_by + "\n" + intro_body, max_chars=600)
             res = build_and_maybe_publish_circuit(
                 ollama=ollama,
                 user=user,
@@ -1707,7 +1744,7 @@ def agent_mode_run(
         try:
             tool, args, final = _agent_parse_tool_call(raw)
         except Exception:
-            # Fallback: treat as final answer.
+            # Reject: in agent mode, we require strict JSON tool calls until the final "end".
             if debug_io:
                 logger.debug(
                     "agent.llm_out_unparsed: step=%d len=%d preview=%r",
@@ -1715,8 +1752,18 @@ def agent_mode_run(
                     len(raw or ""),
                     truncate(raw or "", max_chars=debug_max),
                 )
-            out = safe_reply(raw, max_chars=cfg.agent.max_reply_chars)
-            return out if out.strip() else "Done."
+            messages.append(
+                {
+                    "role": "system",
+                    "content": (
+                        "REJECTED: You MUST output STRICT JSON only.\n"
+                        "- Tool call: {\"tool\":\"<name>\",\"args\":{...}}\n"
+                        "- Or finish: {\"tool\":\"end\",\"final\":\"...\"}\n"
+                        "Do not output prose."
+                    ),
+                }
+            )
+            continue
 
         if tool == "end":
             if debug_io:
@@ -2801,7 +2848,7 @@ def _handle_comment(
                     else:
                         title = truncate(f"Auto Circuit: {routed_arg}", max_chars=60)
                         intro_body = truncate(f"Spec:\n{routed_arg}", max_chars=520)
-                    introduction = truncate(required_by + "\n\n" + intro_body, max_chars=600)
+                    introduction = truncate(required_by + "\n" + intro_body, max_chars=600)
                     try:
                         res = build_and_maybe_publish_circuit(
                             ollama=ollama,
@@ -2964,7 +3011,7 @@ def _handle_comment(
                     else:
                         title = truncate(f"Auto Circuit: {arg}", max_chars=60)
                         intro_body = truncate(f"Spec:\n{arg}", max_chars=520)
-                    introduction = truncate(required_by + "\n\n" + intro_body, max_chars=600)
+                    introduction = truncate(required_by + "\n" + intro_body, max_chars=600)
                     try:
                         res = build_and_maybe_publish_circuit(
                             ollama=ollama,

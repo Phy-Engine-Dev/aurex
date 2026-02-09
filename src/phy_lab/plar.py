@@ -39,6 +39,49 @@ def configure_requests_default_timeout(timeout_sec: float) -> None:
     _requests_timeout_patched = True
 
 
+def _requests_post_json_no_env_proxy(
+    *,
+    url: str,
+    payload: dict[str, Any],
+    headers: dict[str, str],
+    timeout_sec: float | None = None,
+) -> tuple[int, Any]:
+    """POST JSON and ignore HTTP(S)_PROXY env vars.
+
+    Users commonly set proxy env vars for web search. The upstream physicsLab library
+    uses requests with trust_env=True, which can accidentally proxy Physics Lab API
+    traffic and return misleading 403 errors ("login failed").
+    """
+    try:
+        import requests  # type: ignore
+    except ImportError as e:  # pragma: no cover
+        raise PLARError(
+            "Missing dependency: requests (required for Physics Lab API calls). "
+            "Install it with pip (e.g. 'pip install requests')."
+        ) from e
+
+    timeout_final = _requests_default_timeout_sec if timeout_sec is None else float(timeout_sec)
+
+    # Tests may stub `requests` without Session support; fall back to module-level post.
+    session_factory = getattr(requests, "Session", None)
+    if callable(session_factory):
+        session = session_factory()
+        # Prevent accidentally proxying Physics Lab API requests when users set env proxies.
+        try:
+            session.trust_env = False
+        except Exception:
+            pass
+        resp = session.post(url, json=payload, headers=headers, timeout=timeout_final)
+    else:  # pragma: no cover
+        resp = requests.post(url, json=payload, headers=headers, timeout=timeout_final)
+    status_code = int(getattr(resp, "status_code", 0) or 0)
+    try:
+        data = resp.json()
+    except Exception:
+        data = getattr(resp, "text", "")
+    return status_code, data
+
+
 def repo_root() -> str:
     return os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 
@@ -254,13 +297,6 @@ def query_experiments(
         if not isinstance(token, str) or not token.strip() or not isinstance(auth_code, str) or not auth_code.strip():
             raise PLARError("token/auth_code are missing for direct QueryExperiments")
         cat_val = getattr(category, "value", category)
-        try:
-            import requests  # type: ignore
-        except ImportError as e:  # pragma: no cover
-            raise PLARError(
-                "Missing dependency: requests (required for Physics Lab API calls). "
-                "Install it with pip (e.g. 'pip install requests')."
-            ) from e
 
         def _post(
             *,
@@ -273,9 +309,9 @@ def query_experiments(
             days_value: int | str,
             sort_value: int | str,
         ) -> Any:
-            resp = requests.post(
-                "https://physics-api-cn.turtlesim.com/Contents/QueryExperiments",
-                json={
+            status_code, data = _requests_post_json_no_env_proxy(
+                url="https://physics-api-cn.turtlesim.com/Contents/QueryExperiments",
+                payload={
                     "Query": {
                         "Category": cat_val,
                         "Languages": languages_value,
@@ -303,10 +339,15 @@ def query_experiments(
                     "Accept": "application/json",
                     "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) phy_lab/1.0",
                 },
-                timeout=_requests_default_timeout_sec,
+                timeout_sec=_requests_default_timeout_sec,
             )
-            resp.raise_for_status()
-            return resp.json()
+            if status_code == 403:
+                raise PermissionError("login failed")
+            if status_code == 404:
+                raise PLARError("QueryExperiments failed (status=404): not found")
+            if status_code and status_code >= 400:
+                raise PLARError(f"QueryExperiments failed (http={status_code}): {data}")
+            return data
 
         # Try to follow plweb2 first (null exclude fields).
         exclude_lang_variants: list[Any]
@@ -442,25 +483,21 @@ def get_user_by_name(
     auth_code = getattr(user, "auth_code", None)
     if not isinstance(token, str) or not token.strip() or not isinstance(auth_code, str) or not auth_code.strip():
         raise PLARError("get_user_by_name is not callable and token/auth_code are missing")
-    try:
-        import requests  # type: ignore
-    except ImportError as e:  # pragma: no cover
-        raise PLARError(
-            "Missing dependency: requests (required for Physics Lab API calls). "
-            "Install it with pip (e.g. 'pip install requests')."
-        ) from e
-    resp = requests.post(
-        "https://physics-api-cn.turtlesim.com/Users/GetUser",
-        json={"Name": name},
+    status_code, data = _requests_post_json_no_env_proxy(
+        url="https://physics-api-cn.turtlesim.com/Users/GetUser",
+        payload={"Name": name},
         headers={
             "Content-Type": "application/json",
             "x-API-Token": token,
             "x-API-AuthCode": auth_code,
         },
-        timeout=_requests_default_timeout_sec,
+        timeout_sec=_requests_default_timeout_sec,
     )
-    resp.raise_for_status()
-    return _extract_data(resp.json())
+    if status_code == 403:
+        raise PermissionError("login failed")
+    if status_code and status_code >= 400:
+        raise PLARError(f"GetUser failed (http={status_code}): {data}")
+    return _extract_data(data)
 
 
 def get_user_by_id(
@@ -497,25 +534,21 @@ def get_user_by_id(
     auth_code = getattr(user, "auth_code", None)
     if not isinstance(token, str) or not token.strip() or not isinstance(auth_code, str) or not auth_code.strip():
         raise PLARError("get_user_by_id is not callable and token/auth_code are missing")
-    try:
-        import requests  # type: ignore
-    except ImportError as e:  # pragma: no cover
-        raise PLARError(
-            "Missing dependency: requests (required for Physics Lab API calls). "
-            "Install it with pip (e.g. 'pip install requests')."
-        ) from e
-    resp = requests.post(
-        "https://physics-api-cn.turtlesim.com/Users/GetUser",
-        json={"ID": user_id},
+    status_code, data = _requests_post_json_no_env_proxy(
+        url="https://physics-api-cn.turtlesim.com/Users/GetUser",
+        payload={"ID": user_id},
         headers={
             "Content-Type": "application/json",
             "x-API-Token": token,
             "x-API-AuthCode": auth_code,
         },
-        timeout=_requests_default_timeout_sec,
+        timeout_sec=_requests_default_timeout_sec,
     )
-    resp.raise_for_status()
-    return _extract_data(resp.json())
+    if status_code == 403:
+        raise PermissionError("login failed")
+    if status_code and status_code >= 400:
+        raise PLARError(f"GetUser failed (http={status_code}): {data}")
+    return _extract_data(data)
 
 
 def get_relations(
@@ -624,16 +657,9 @@ def get_relations(
     auth_code = getattr(user, "auth_code", None)
     if not isinstance(token, str) or not token.strip() or not isinstance(auth_code, str) or not auth_code.strip():
         raise PLARError("get_relations is not callable and token/auth_code are missing")
-    try:
-        import requests  # type: ignore
-    except ImportError as e:  # pragma: no cover
-        raise PLARError(
-            "Missing dependency: requests (required for Physics Lab API calls). "
-            "Install it with pip (e.g. 'pip install requests')."
-        ) from e
-    resp = requests.post(
-        "https://physics-api-cn.turtlesim.com/Users/GetRelations",
-        json={
+    status_code, data = _requests_post_json_no_env_proxy(
+        url="https://physics-api-cn.turtlesim.com/Users/GetRelations",
+        payload={
             "UserID": user_id,
             "DisplayType": display_type_code,
             "Skip": skip,
@@ -645,10 +671,13 @@ def get_relations(
             "x-API-Token": token,
             "x-API-AuthCode": auth_code,
         },
-        timeout=_requests_default_timeout_sec,
+        timeout_sec=_requests_default_timeout_sec,
     )
-    resp.raise_for_status()
-    return _extract_users(resp.json())
+    if status_code == 403:
+        raise PermissionError("login failed")
+    if status_code and status_code >= 400:
+        raise PLARError(f"GetRelations failed (http={status_code}): {data}")
+    return _extract_users(data)
 
 
 def get_messages(
@@ -806,18 +835,39 @@ def _apply_publish_tags(exp: Any, tags: list[str]) -> None:
 
 
 def get_summary(user: Any, *, summary_id: str, category_value: str) -> dict[str, Any]:
+    if category_value not in ("Experiment", "Discussion"):
+        raise PLARError("category_value must be 'Experiment' or 'Discussion'")
+
+    token = getattr(user, "token", None)
+    auth_code = getattr(user, "auth_code", None)
+    if isinstance(token, str) and token.strip() and isinstance(auth_code, str) and auth_code.strip():
+        status_code, data = _requests_post_json_no_env_proxy(
+            url="https://physics-api-cn.turtlesim.com/Contents/GetSummary",
+            payload={"ContentID": summary_id, "Category": category_value},
+            headers={
+                "Content-Type": "application/json",
+                "x-API-Token": token,
+                "x-API-AuthCode": auth_code,
+                "Accept": "application/json",
+            },
+            timeout_sec=_requests_default_timeout_sec,
+        )
+        if status_code == 403:
+            raise PermissionError("login failed")
+        if status_code == 404:
+            raise PLARError("GetSummary failed (status=404): not found (wrong category or deleted)")
+        if status_code and status_code >= 400:
+            raise PLARError(f"GetSummary failed (http={status_code}): {data}")
+        if not isinstance(data, dict):
+            raise PLARError("Unexpected GetSummary response type")
+        return data
+
+    # Fallback: use upstream wrapper when token/auth_code are not available (tests/mocks).
     try:
         from physicsLab import Category
     except Exception as e:  # pragma: no cover
         raise PLARError(f"Failed to import physicsLab.Category: {e}") from e
-
-    if category_value == "Experiment":
-        category = Category.Experiment
-    elif category_value == "Discussion":
-        category = Category.Discussion
-    else:
-        raise PLARError("category_value must be 'Experiment' or 'Discussion'")
-
+    category = Category.Experiment if category_value == "Experiment" else Category.Discussion
     result = user.get_summary(summary_id, category)
     if not isinstance(result, dict):
         raise PLARError("Unexpected get_summary response type")
@@ -825,18 +875,39 @@ def get_summary(user: Any, *, summary_id: str, category_value: str) -> dict[str,
 
 
 def get_experiment(user: Any, *, summary_id: str, category_value: str) -> dict[str, Any]:
+    if category_value not in ("Experiment", "Discussion"):
+        raise PLARError("category_value must be 'Experiment' or 'Discussion'")
+
+    token = getattr(user, "token", None)
+    auth_code = getattr(user, "auth_code", None)
+    if isinstance(token, str) and token.strip() and isinstance(auth_code, str) and auth_code.strip():
+        status_code, data = _requests_post_json_no_env_proxy(
+            url="https://physics-api-cn.turtlesim.com/Contents/GetExperiment",
+            payload={"ContentID": summary_id, "Category": category_value},
+            headers={
+                "Content-Type": "application/json",
+                "x-API-Token": token,
+                "x-API-AuthCode": auth_code,
+                "Accept": "application/json",
+            },
+            timeout_sec=_requests_default_timeout_sec,
+        )
+        if status_code == 403:
+            raise PermissionError("login failed")
+        if status_code == 404:
+            raise PLARError("GetExperiment failed (status=404): not found (wrong category or deleted)")
+        if status_code and status_code >= 400:
+            raise PLARError(f"GetExperiment failed (http={status_code}): {data}")
+        if not isinstance(data, dict):
+            raise PLARError("Unexpected GetExperiment response type")
+        return data
+
+    # Fallback: use upstream wrapper when token/auth_code are not available (tests/mocks).
     try:
         from physicsLab import Category
     except Exception as e:  # pragma: no cover
         raise PLARError(f"Failed to import physicsLab.Category: {e}") from e
-
-    if category_value == "Experiment":
-        category = Category.Experiment
-    elif category_value == "Discussion":
-        category = Category.Discussion
-    else:
-        raise PLARError("category_value must be 'Experiment' or 'Discussion'")
-
+    category = Category.Experiment if category_value == "Experiment" else Category.Discussion
     result = user.get_experiment(summary_id, category)
     if not isinstance(result, dict):
         raise PLARError("Unexpected get_experiment response type")
