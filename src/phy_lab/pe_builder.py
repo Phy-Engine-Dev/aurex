@@ -99,6 +99,51 @@ _TYPE_TO_CODE: dict[str, int] = {
     "iac": ElementCode.IAC,
 }
 
+def _canonical_component_type(t: str) -> str:
+    s = (t or "").strip()
+    if not s:
+        return ""
+    low = s.casefold()
+    low = low.replace("_", " ")
+    low = re.sub(r"\s+", " ", low).strip()
+
+    # Common English aliases
+    if low in ("r", "res", "resistor", "resistance", "ohm"):
+        return "resistor"
+    if low in ("c", "cap", "capacitor", "capacitance"):
+        return "capacitor"
+    if low in ("l", "ind", "inductor", "inductance"):
+        return "inductor"
+    if low in ("vdc", "dc", "dc source", "voltage source", "battery", "cell"):
+        return "vdc"
+    if low in ("idc", "dc current", "current source"):
+        return "idc"
+    if low in ("vac", "ac", "ac source"):
+        return "vac"
+    if low in ("iac", "ac current"):
+        return "iac"
+
+    # Common CJK aliases (Physics Lab UI terms)
+    if low in ("电阻", "电阻器"):
+        return "resistor"
+    if low in ("电容", "电容器"):
+        return "capacitor"
+    if low in ("电感", "电感器"):
+        return "inductor"
+    if low in ("电源", "直流电源", "电压源", "学生电源", "电池"):
+        return "vdc"
+    if low in ("电流源", "直流电流源"):
+        return "idc"
+    if low in ("交流电源", "交流电压源"):
+        return "vac"
+    if low in ("交流电流源",):
+        return "iac"
+
+    # Model hallucinations we want to accept gracefully.
+    if low in ("student source", "student power", "student powersource"):
+        return "vdc"
+    return low
+
 
 _PARAM_SYNONYMS: dict[str, tuple[str, ...]] = {
     "resistor": ("r", "r_ohm", "resistance", "resistance_ohm", "ohm"),
@@ -161,7 +206,8 @@ def parse_pe_sim_spec(
             raise PEBuilderError(f"Duplicate component id: {cid}")
         seen_ids.add(cid)
 
-        ctype = _require_str(cobj.get("type"), where=f"spec.components[{i}].type").lower()
+        ctype_raw = _require_str(cobj.get("type"), where=f"spec.components[{i}].type")
+        ctype = _canonical_component_type(ctype_raw)
         if ctype not in _TYPE_TO_CODE:
             raise PEBuilderError(
                 f"Unsupported component type: {ctype}. Allowed: {sorted(set(_TYPE_TO_CODE.keys()))}"

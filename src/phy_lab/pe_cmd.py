@@ -98,21 +98,52 @@ def _canonical_type(t: str) -> str:
         return "vac"
     if x in ("iac",):
         return "iac"
+    # Common aliases / UI terms.
+    x2 = re.sub(r"\\s+", " ", x.replace("_", " ")).strip()
+    if x2 in ("dc", "dc source", "voltage source", "battery", "cell", "student source", "student power"):
+        return "vdc"
+    if x2 in ("current source", "dc current"):
+        return "idc"
+    if x2 in ("ac", "ac source"):
+        return "vac"
+    if x2 in ("ac current",):
+        return "iac"
+    if x2 in ("电源", "直流电源", "学生电源", "电压源", "电池"):
+        return "vdc"
+    if x2 in ("电流源", "直流电流源"):
+        return "idc"
+    if x2 in ("交流电源", "交流电压源"):
+        return "vac"
+    if x2 in ("交流电流源",):
+        return "iac"
+    if x2 in ("电阻", "电阻器"):
+        return "resistor"
+    if x2 in ("电容", "电容器"):
+        return "capacitor"
+    if x2 in ("电感", "电感器"):
+        return "inductor"
     return x
 
 
 def _param_key_map(ctype: str) -> dict[str, str]:
     # Maps DSL keys to pe_builder expected keys.
     if ctype == "resistor":
-        return {"r": "r_ohm", "r_ohm": "r_ohm", "ohm": "r_ohm"}
+        return {
+            "r": "r_ohm",
+            "r_ohm": "r_ohm",
+            "ohm": "r_ohm",
+            "resistance": "r_ohm",
+            "resistance_ohm": "r_ohm",
+            "电阻": "r_ohm",
+        }
     if ctype == "capacitor":
-        return {"c": "c_f", "c_f": "c_f", "f": "c_f"}
+        return {"c": "c_f", "c_f": "c_f", "f": "c_f", "capacitance": "c_f", "电容": "c_f"}
     if ctype == "inductor":
-        return {"l": "l_h", "l_h": "l_h", "h": "l_h"}
+        return {"l": "l_h", "l_h": "l_h", "h": "l_h", "inductance": "l_h", "电感": "l_h"}
     if ctype == "vdc":
-        return {"v": "v_v", "v_v": "v_v", "volt": "v_v"}
+        return {"v": "v_v", "v_v": "v_v", "volt": "v_v", "voltage": "v_v", "电压": "v_v"}
     if ctype == "idc":
-        return {"i": "i_a", "i_a": "i_a", "amp": "i_a"}
+        return {"i": "i_a", "i_a": "i_a", "amp": "i_a", "current": "i_a", "电流": "i_a"}
     if ctype == "vac":
         return {
             "vp": "vp_v",

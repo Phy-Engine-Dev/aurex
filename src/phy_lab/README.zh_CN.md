@@ -155,7 +155,7 @@ python src/phy_lab/agent.py run --config .phy_lab/config.json
 - `!summarize`：当你在实验/讨论目标下使用时，会基于当前内容的上下文信息生成总结
 - `!search <@用户名|uid:<id>|experiment:<id>|discussion:<id>>`：仅支持“定位/查询”（不支持关键词搜索）
 - `!circuit <需求>`：生成电路（Verilog→`.sav`），并在允许发布时自动发布
-- `!simulate <参数>`：直流仿真演示（目前支持 VDC + 两个电阻串联）
+- `!simulate <参数>`：本地仿真（Phy-Engine）
 
 指令示例：
 
@@ -198,6 +198,22 @@ python src/phy_lab/agent.py run --config .phy_lab/config.json
 2) 让 Agent 自动编译：
    - 配置 `phy_engine.auto_build=true`
    - 确保 `cmake` 在 PATH 中可用
+
+### 仿真使用方法（重要）
+
+本项目有两条仿真路径：
+
+1) **从自然语言“生成一个小电路”再仿真**（PE-SCRIPT/JSON 规格）
+   - 这条路径目前只支持少量 2 端元件：`resistor/capacitor/inductor/vdc/idc/vac/iac`
+   - **学生电源/电源/电池/电压源** 都应当建模为 `vdc`
+   - 示例（直流）：
+     - `@aurex simulate V=5V 电阻=1k 串联`
+
+2) **对物实“已有作品”进行 StatusSave 仿真**（支持的元件更丰富，取决于 `libphyengine` 内置适配器）
+   - 你需要提供作品 ID，例如：
+     - `@aurex 仿真 experiment:0123456789abcdef01234567`
+     - `@aurex 仿真 discussion:0123456789abcdef01234567`
+   - Agent 会先打开作品、拉取 `StatusSave`，再调用 Phy-Engine 适配器仿真。
 
 ## 缓存与清理
 

@@ -199,6 +199,11 @@ def llm_build_pe_sim_spec_json(
         "  ]\n"
         "}\n"
         "\n"
+        "Type notes (important):\n"
+        "- `type` MUST be exactly one of: resistor, capacitor, inductor, vdc, idc, vac, iac.\n"
+        "- If the user says 学生电源/电源/电池/电压源, use type=vdc.\n"
+        "- Do NOT invent other types like \"student source\" / \"power supply\".\n"
+        "\n"
         "Component param rules:\n"
         "- resistor: params MUST contain {\"r_ohm\": <number>}\n"
         "- capacitor: params MUST contain {\"c_f\": <number>}\n"
@@ -321,6 +326,8 @@ def llm_fix_pe_sim_spec_json(
         "- Use simple node names like: gnd, n1, n2, vin, vout.\n"
         "- Use SI units (Ohm, Farad, Henry, Volt, Ampere).\n"
         "- Include at least ONE source component: vdc|idc|vac|iac.\n"
+        "- `type` MUST be exactly one of: resistor, capacitor, inductor, vdc, idc, vac, iac.\n"
+        "- If the user says 学生电源/电源/电池/电压源, that is vdc.\n"
         "\n"
         "Output rules:\n"
         "- Output ONLY valid JSON (no markdown, no comments).\n"
@@ -397,6 +404,7 @@ def llm_build_pe_sim_script(
         "- Every component must be a 2-terminal element.\n"
         "- Use simple node names like: gnd, n1, n2, vin, vout.\n"
         "- Use SI units (Ohm, Farad, Henry, Volt, Ampere).\n"
+        "- If the user mentions 学生电源/电源/电池, model it as VDC (type=vdc with v=<volt>).\n"
         "\n"
         "Output rules:\n"
         "- Output ONLY script lines (no JSON, no markdown, no explanations).\n"
@@ -486,11 +494,19 @@ def simulate_ai_circuit_with_phyengine(
             )
 
     if last_err is not None:
+        allowed = ["resistor", "capacitor", "inductor", "vdc", "idc", "vac", "iac"]
+        if not lang_zh:
+            return (
+                "I couldn't build a valid circuit spec from your request.\n"
+                f"Error: {last_err}\n"
+                f"Supported component types (this path): {allowed}\n"
+                "Tip: if you want to simulate an existing Physics Lab work with richer components, provide an experiment/discussion ID and use status-save simulation."
+            )
         return (
-            "I couldn't build a valid circuit spec from your request. "
-            f"Error: {last_err}"
-            if not lang_zh
-            else f"我没能从你的描述里构建出可仿真的电路规格。错误：{last_err}"
+            "我没能从你的描述里构建出可仿真的电路规格。\n"
+            f"错误：{last_err}\n"
+            f"当前该路径仅支持的元件类型：{allowed}\n"
+            "提示：如果你要仿真物实里已有作品（包含更多元件），请提供 experiment:<id>/discussion:<id>，让工具走 StatusSave 仿真。"
         )
 
     timeout_sec = _pe_sim_timeout_sec(phy_engine_cfg, default_sec=5.0)

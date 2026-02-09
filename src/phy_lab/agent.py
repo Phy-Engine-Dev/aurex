@@ -664,6 +664,12 @@ def _agent_parse_tool_call(raw: str) -> tuple[str, dict[str, Any], str]:
             "plar_list_plar": "list_plar",
             "plar_search_plar": "search_plar",
             "plar_web_search": "web_search",
+            # Back-compat: some prompts/models call these "raw API" helpers.
+            # We expose only the "context/open" tools, so map to those.
+            "plar_get_experiment": "plar_open_content_page",
+            "plar_get_summary": "plar_open_content_page",
+            "get_experiment": "plar_open_content_page",
+            "get_summary": "plar_open_content_page",
             "google": "web_search",
             "web": "web_search",
             "websearch": "web_search",

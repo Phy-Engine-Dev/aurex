@@ -43,6 +43,19 @@ class TestPEBuilder(unittest.TestCase):
         # must include a non-trivial gnd connection
         self.assertIn("gnd", built.node_to_pin)
 
+    def test_type_alias_student_source_maps_to_vdc(self):
+        obj = {
+            "analysis": {"type": "dc", "ac_omega_rad_s": None, "tr_t_step_s": None, "tr_t_stop_s": None},
+            "components": [
+                {"id": "V1", "type": "student source", "nodes": ["n1", "gnd"], "params": {"v_v": 5}},
+                {"id": "R1", "type": "电阻", "nodes": ["n1", "gnd"], "params": {"r_ohm": 10}},
+            ],
+            "probes": [],
+        }
+        spec = parse_pe_sim_spec(obj, max_components=10, max_probes=10)
+        built = build_circuit(spec)
+        self.assertIn("V1", built.element_index_by_id)
+
 
 if __name__ == "__main__":
     unittest.main()
