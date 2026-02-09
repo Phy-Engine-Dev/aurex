@@ -1599,6 +1599,9 @@ def agent_mode_run(
     if not task:
         return render_help(command_prefix=getattr(cfg.agent, "command_prefix", "!"), mode="agent")
 
+    wants_simulation = _looks_like_simulation_request(task)
+    simulation_enabled = bool(getattr(getattr(cfg, "agent", None), "simulation_enabled", True))
+
     start_ts = time.time()
     deadline = start_ts + float(max_seconds)
     tool_cutoff_ts = start_ts + float(max(0, int(max_seconds) - 60))
@@ -1607,6 +1610,18 @@ def agent_mode_run(
         {"role": "system", "content": system_prompt},
         {"role": "system", "content": _agent_tool_prompt(max_seconds=max_seconds)},
     ]
+    if wants_simulation and simulation_enabled:
+        messages.append(
+            {
+                "role": "system",
+                "content": (
+                    "SIMULATION REQUEST DETECTED.\n"
+                    "- You MUST use the simulation tools (simulate / simulate_verilog / simulate_status_save).\n"
+                    "- Do NOT provide hand-waved 'by calculation' results unless tools are disabled or fail.\n"
+                    "- If Context JSON provides summary_id/category, prefer simulate_status_save."
+                ),
+            }
+        )
     if context_json is not None:
         messages.append(
             {
@@ -1633,6 +1648,7 @@ def agent_mode_run(
         return f"Sorry — agent timed out ({mins} minutes) and couldn't finish this task. Please @me again with a shorter request."
 
     last_raw = ""
+    did_use_simulation_tool = False
     for step in range(1, int(max_steps) + 1):
         now = time.time()
         time_left = int(max(0.0, deadline - now))
@@ -1766,10 +1782,34 @@ def agent_mode_run(
             continue
 
         if tool == "end":
+            if (
+                wants_simulation
+                and simulation_enabled
+                and tools_enabled
+                and (not did_use_simulation_tool)
+            ):
+                # Enforce tool usage while tools are still available.
+                messages.append(
+                    {
+                        "role": "system",
+                        "content": (
+                            "REJECTED: You must run a simulation tool before ending.\n"
+                            "Call one of:\n"
+                            "- {\"tool\":\"simulate\",\"args\":{\"text\":\"...\"}}\n"
+                            "- {\"tool\":\"simulate_verilog\",\"args\":{\"text\":\"...\"}}\n"
+                            "- {\"tool\":\"simulate_status_save\",\"args\":{\"summary_id\":\"...\",\"category\":\"Experiment|Discussion\",\"question\":\"...\"}}\n"
+                            "Then end with {\"tool\":\"end\",\"final\":\"...\"}."
+                        ),
+                    }
+                )
+                continue
             if debug_io:
                 logger.debug("agent.tool_call: step=%d tool=end final_len=%d", step, len(final or ""))
             out = safe_reply(final or "", max_chars=cfg.agent.max_reply_chars)
             return out if out.strip() else "Done."
+
+        if tool in ("simulate", "simulate_verilog", "simulate_status_save"):
+            did_use_simulation_tool = True
 
         if debug_io:
             arg_keys = sorted([k for k in (args or {}).keys() if isinstance(k, str)])[:20]
