@@ -705,6 +705,80 @@ def _recent_comments_context(comments: list[dict[str, Any]], *, limit: int = 8) 
     return items[: max(0, limit)]
 
 
+def _extract_user_obj_from_get_user_data(data: Any) -> dict[str, Any] | None:
+    if not isinstance(data, dict):
+        return None
+    u = data.get("User")
+    if isinstance(u, dict):
+        return u
+    # Some wrappers may already return the user object as Data.
+    if any(k in data for k in ("ID", "UserID", "Nickname", "Name", "Signature")):
+        return data
+    return None
+
+
+def _build_user_board_context(
+    *,
+    user: Any,
+    board_user_id: str,
+    comments: list[dict[str, Any]],
+) -> dict[str, Any]:
+    owner_id: str | None = board_user_id.strip() or None
+    owner_nickname: str | None = None
+    owner_signature: str | None = None
+    try:
+        data = get_user_by_id(user, user_id=board_user_id)
+        u = _extract_user_obj_from_get_user_data(data)
+        if isinstance(u, dict):
+            owner_id = best_effort_extract_text(u.get("ID")) or best_effort_extract_text(u.get("UserID")) or owner_id
+            owner_nickname = best_effort_extract_text(u.get("Nickname")) or best_effort_extract_text(u.get("Name")) or None
+            sig = best_effort_extract_text(u.get("Signature"))
+            owner_signature = truncate(sig, max_chars=200) if sig else None
+    except Exception:
+        pass
+
+    title = ""
+    if owner_nickname:
+        title = f"{owner_nickname} 的留言板"
+
+    return {
+        "page_type": "UserBoard",
+        "title": title or None,
+        "board_owner": {
+            "id": owner_id,
+            "nickname": owner_nickname,
+            "signature": owner_signature,
+        },
+        "recent_comments": _recent_comments_context(comments, limit=12),
+    }
+
+
+def _extract_user_board_query(arg: str) -> tuple[str | None, str | None]:
+    """Return (nickname, user_id)."""
+    t = (arg or "").strip()
+    if not t or len(t) > 120:
+        return None, None
+    if not any(x in t for x in ("留言板", "主页", "墙", "board", "wall")):
+        return None, None
+
+    # Explicit ID.
+    m_id = re.search(r"\bUser[:： ]([A-Za-z0-9_-]{8,64})\b", t)
+    if m_id:
+        return None, m_id.group(1).strip()
+
+    # @nickname
+    m_at = re.search(r"[@＠]([^\s，。！？:：;；]{2,32})", t)
+    if m_at:
+        return m_at.group(1).strip(), None
+
+    # 用户:xxx / user:xxx
+    m_user = re.search(r"(?:用户|user)\s*[:： ]\s*([^\s，。！？:：;；]{2,32})", t, flags=re.IGNORECASE)
+    if m_user:
+        return m_user.group(1).strip(), None
+
+    return None, None
+
+
 def _should_trigger(
     *,
     text: str,
@@ -768,6 +842,51 @@ def _infer_nl_tool(text: str) -> tuple[str, str]:
     return "chat", text
 
 
+def _is_generic_summarize_arg(arg: str) -> bool:
+    """True when the user likely means 'summarize the current page', not literal text."""
+    t = (arg or "").strip()
+    if not t:
+        return True
+    # Remove common punctuation/spaces so "这个 实验" or "实验。" matches.
+    t2 = re.sub(r"[\s\.,!?，。！？:：;；\-_—()（）\[\]{}<>《》\"'“”‘’]+", "", t).strip()
+    low = t2.casefold()
+    return low in {
+        "实验",
+        "讨论",
+        "留言板",
+        "留言",
+        "墙",
+        "主页",
+        "这个",
+        "当前",
+        "本文",
+        "这篇",
+        "这个实验",
+        "这个讨论",
+        "这个留言板",
+        "当前留言板",
+        "本实验",
+        "本讨论",
+        "当前实验",
+        "当前讨论",
+        "本留言板",
+        "此实验",
+        "此讨论",
+        "此留言板",
+        "experiment",
+        "discussion",
+        "messageboard",
+        "board",
+        "wall",
+        "this",
+        "current",
+        "thisexperiment",
+        "thisdiscussion",
+        "thisboard",
+        "thiswall",
+    }
+
+
 def _handle_comment(
     *,
     comment: dict[str, Any],
@@ -823,7 +942,7 @@ def _handle_comment(
                 messages.append(
                     {
                         "role": "system",
-                        "content": "Context JSON (current content page):\n"
+                        "content": "Context JSON (current page):\n"
                         + json.dumps(experiment_context, ensure_ascii=False, indent=2),
                     }
                 )
@@ -875,12 +994,12 @@ def _handle_comment(
                         action = "chat"
 
                 if action == "summarize":
-                    if not routed_arg and experiment_context is not None:
+                    if experiment_context is not None and _is_generic_summarize_arg(routed_arg):
                         messages: list[dict[str, str]] = [{"role": "system", "content": cfg.agent.system_prompt}]
                         messages.append(
                             {
                                 "role": "system",
-                                "content": "Context JSON (current content page):\n"
+                                "content": "Context JSON (current page):\n"
                                 + json.dumps(experiment_context, ensure_ascii=False, indent=2),
                             }
                         )
@@ -1461,7 +1580,7 @@ def _handle_comment(
         context_blob = ""
         if experiment_context is not None:
             context_blob = (
-                "You are replying to a comment on the current content page. "
+                "You are replying to a comment on the current page. "
                 "Use the following context to answer accurately.\n"
                 + json.dumps(experiment_context, ensure_ascii=False, indent=2)
                 + "\n\n"
@@ -1522,26 +1641,97 @@ def _handle_comment(
         return safe_reply(reply, max_chars=cfg.agent.max_reply_chars)
 
     if cmd in ("summarize", "sum"):
-        if not arg and experiment_context is None:
+        # Allow summarizing another user's message board by name/ID.
+        nick, uid = _extract_user_board_query(arg)
+        if nick or uid:
+            try:
+                board_user_id = ""
+                board_user_obj: dict[str, Any] | None = None
+                if uid:
+                    board_user_id = uid
+                    data = get_user_by_id(user, user_id=uid)
+                    board_user_obj = _extract_user_obj_from_get_user_data(data)
+                else:
+                    data = get_user_by_name(user, name=str(nick or ""))
+                    board_user_obj = _extract_user_obj_from_get_user_data(data)
+                    if isinstance(board_user_obj, dict):
+                        board_user_id = (
+                            best_effort_extract_text(board_user_obj.get("ID"))
+                            or best_effort_extract_text(board_user_obj.get("UserID"))
+                        )
+
+                if not board_user_id:
+                    return "No user found."
+
+                comments = get_comments(
+                    user,
+                    target_id=board_user_id,
+                    target_type="User",
+                    take=int(getattr(cfg.agent, "take", 20) or 20),
+                    skip=0,
+                )
+                ctx = _build_user_board_context(
+                    user=user,
+                    board_user_id=board_user_id,
+                    comments=comments,
+                )
+                if isinstance(board_user_obj, dict):
+                    nickname = (
+                        best_effort_extract_text(board_user_obj.get("Nickname"))
+                        or best_effort_extract_text(board_user_obj.get("Name"))
+                        or None
+                    )
+                    ctx["board_owner"] = {
+                        "id": board_user_id,
+                        "nickname": nickname or ctx.get("board_owner", {}).get("nickname"),
+                        "signature": ctx.get("board_owner", {}).get("signature"),
+                    }
+                    if nickname:
+                        ctx["title"] = f"{nickname} 的留言板"
+
+                messages: list[dict[str, str]] = [{"role": "system", "content": cfg.agent.system_prompt}]
+                messages.append(
+                    {
+                        "role": "system",
+                        "content": "Context JSON (current page):\n"
+                        + json.dumps(ctx, ensure_ascii=False, indent=2),
+                    }
+                )
+                messages.append(
+                    {
+                        "role": "user",
+                        "content": "Summarize this user's message board using the Context JSON. Keep it under 6 bullets.",
+                    }
+                )
+                reply = ollama.chat(messages=messages)
+                return safe_reply(reply, max_chars=cfg.agent.max_reply_chars)
+            except Exception as e:
+                return f"Failed to summarize user board: {e}"
+
+        use_page_context = experiment_context is not None and _is_generic_summarize_arg(arg)
+
+        if (not arg) and (experiment_context is None):
             return "Provide text to summarize."
-        if not arg and experiment_context is not None:
-            logger.debug("Tool summarize invoked (using experiment context)")
+
+        if use_page_context:
+            logger.debug("Tool summarize invoked (using page context)")
             messages: list[dict[str, str]] = [{"role": "system", "content": cfg.agent.system_prompt}]
             messages.append(
                 {
                     "role": "system",
-                    "content": "Context JSON (current content page):\n"
+                    "content": "Context JSON (current page):\n"
                     + json.dumps(experiment_context, ensure_ascii=False, indent=2),
                 }
             )
             messages.append(
                 {
                     "role": "user",
-                    "content": "Summarize the current content. Include: title, key purpose, and what the circuit/experiment contains (use plsav_summary if present). Keep it under 6 bullets.",
+                    "content": "Summarize the current page. Use Context JSON fields like title/body_text/content_text/recent_comments/plsav_summary. Keep it under 6 bullets.",
                 }
             )
             reply = ollama.chat(messages=messages)
             return safe_reply(reply, max_chars=cfg.agent.max_reply_chars)
+
         logger.debug("Tool summarize invoked (len=%d)", len(arg))
         reply = llm_summarize(ollama=ollama, system_prompt=cfg.agent.system_prompt, text=arg)
         return safe_reply(reply, max_chars=cfg.agent.max_reply_chars)
@@ -2075,6 +2265,12 @@ def _process_target(
                 logger.debug("[%s] Loaded experiment context (cached)", target_key)
             except Exception as e:
                 logger.debug("[%s] Failed to load experiment context: %s", target_key, e)
+        elif target.type == "User":
+            experiment_context = _build_user_board_context(
+                user=user,
+                board_user_id=target.id,
+                comments=comments,
+            )
 
         reply = _handle_comment(
             comment=comment,
@@ -2804,6 +3000,22 @@ def _process_work_item(
             experiment_context["recent_comments"] = _recent_comments_context(comments, limit=8)
         except Exception as e:
             logger.debug("[%s] Failed to load experiment context: %s", target_key, e)
+    elif target.type == "User":
+        try:
+            comments = get_comments(
+                user,
+                target_id=target.id,
+                target_type=target.type,
+                take=int(getattr(cfg.agent, "take", 20) or 20),
+                skip=0,
+            )
+        except Exception:
+            comments = []
+        experiment_context = _build_user_board_context(
+            user=user,
+            board_user_id=target.id,
+            comments=comments,
+        )
 
     reply = _handle_comment(
         comment=comment,

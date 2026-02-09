@@ -785,6 +785,7 @@ def get_experiment_context(
     ttl_sec: int = 300,
     max_json_chars: int = 20_000,
 ) -> dict[str, Any]:
+    context_version = 2
     os.makedirs(cache_dir, exist_ok=True)
     cache_root = os.path.join(cache_dir, "plar_cache")
     os.makedirs(cache_root, exist_ok=True)
@@ -797,7 +798,11 @@ def get_experiment_context(
             if now - st.st_mtime <= ttl_sec:
                 with open(cache_path, "r", encoding="utf-8") as f:
                     cached = json.load(f)
-                if isinstance(cached, dict) and cached.get("summary_id") == summary_id:
+                if (
+                    isinstance(cached, dict)
+                    and cached.get("context_version") == context_version
+                    and cached.get("summary_id") == summary_id
+                ):
                     return cached
         except Exception:
             pass
@@ -832,9 +837,42 @@ def get_experiment_context(
         plsav_like = _recursive_find_plsav_like(exp_data) or _recursive_find_plsav_like(exp_res)
         plsav_summary = _summarize_plsav(plsav_like) if isinstance(plsav_like, dict) else {}
 
+    title = _extract_title_from_obj(summary_data) or _extract_title_from_obj(exp_data)
+    if not title and isinstance(plsav_summary, dict):
+        title = str(plsav_summary.get("subject") or "").strip()
+
+    # Best-effort text extraction for "正文/内容" style requests.
+    # Keep these relatively small so we can always include them in LLM context.
+    summary_text = _collect_text_recursive(summary_data, max_chars=6000)
+    experiment_text = _collect_text_recursive(exp_data, max_chars=8000)
+
+    author_id = ""
+    author_nickname = ""
+    if isinstance(summary_data, dict):
+        u = summary_data.get("User")
+        if isinstance(u, dict):
+            author_id = best_effort_extract_text(u.get("ID")) or best_effort_extract_text(u.get("UserID"))
+            author_nickname = (
+                best_effort_extract_text(u.get("Nickname"))
+                or best_effort_extract_text(u.get("Name"))
+                or ""
+            )
+
     context = {
+        "context_version": context_version,
         "summary_id": summary_id,
         "category": category_value,
+        # Friendly, structured fields for LLM prompting.
+        "title": title or None,
+        "author": {
+            "id": author_id or None,
+            "nickname": author_nickname or None,
+        },
+        # Aliases are intentional: different models/agents tend to prefer different words.
+        "body_text": summary_text or None,
+        "content_text": experiment_text or None,
+        "summary_text": summary_text or None,
+        "experiment_text": experiment_text or None,
         "summary_data_excerpt": _safe_json_dumps(summary_data, max_chars=max_json_chars),
         "experiment_data_excerpt": _safe_json_dumps(exp_data, max_chars=max_json_chars),
         "plsav_summary": plsav_summary,
@@ -961,3 +999,140 @@ def iter_text_fields(item: dict[str, Any], keys: Iterable[str]) -> Iterable[str]
             text = best_effort_extract_text(item.get(key))
             if text:
                 yield text
+
+
+_PLAR_TEXT_PRI_KEYS: tuple[str, ...] = (
+    # Common title-ish keys
+    "Subject",
+    "Title",
+    "Name",
+    # Common body-ish keys
+    "Description",
+    "Content",
+    "Text",
+    "Body",
+    "Markdown",
+    "Html",
+    "Introduction",
+    "Intro",
+    "Summary",
+)
+
+_PLAR_TEXT_SKIP_KEYS: frozenset[str] = frozenset(
+    {
+        # Extremely large / not human-readable
+        "StatusSave",
+        "StatusSaveRaw",
+        "Elements",
+        "Wires",
+        # Large media-ish / binary-ish
+        "Image",
+        "Images",
+        "Video",
+        "Videos",
+        "Audio",
+        "Audios",
+    }
+)
+
+
+def _truncate_text(text: str, *, max_chars: int) -> str:
+    text = (text or "").strip()
+    if not text:
+        return ""
+    if len(text) <= max_chars:
+        return text
+    return text[: max(0, max_chars - 12)] + "...(truncated)"
+
+
+def _extract_title_from_obj(obj: Any) -> str:
+    if not isinstance(obj, dict):
+        return ""
+    for k in ("Subject", "Title", "Name"):
+        v = obj.get(k)
+        t = best_effort_extract_text(v).strip()
+        if t:
+            return t
+    return ""
+
+
+def _collect_text_recursive(
+    obj: Any,
+    *,
+    max_chars: int,
+    max_nodes: int = 2500,
+    max_depth: int = 7,
+) -> str:
+    """Best-effort text extraction from physicsLab API objects.
+
+    The upstream API returns a mix of nested dict/list structures. This function walks
+    them and collects useful string leaves, skipping known huge/binary-ish fields.
+    """
+    if max_chars <= 0:
+        return ""
+
+    parts: list[str] = []
+    seen: set[int] = set()
+    nodes = 0
+    stack: list[tuple[Any, int]] = [(obj, 0)]
+
+    def push(v: Any, depth: int) -> None:
+        nonlocal nodes
+        if nodes >= max_nodes:
+            return
+        stack.append((v, depth))
+        nodes += 1
+
+    while stack and sum(len(p) for p in parts) < max_chars and nodes < max_nodes:
+        cur, depth = stack.pop()
+        if cur is None or depth > max_depth:
+            continue
+
+        if isinstance(cur, str):
+            t = cur.strip()
+            if t:
+                parts.append(t)
+            continue
+
+        if isinstance(cur, (int, float, bool)):
+            continue
+
+        oid = id(cur)
+        if oid in seen:
+            continue
+        seen.add(oid)
+
+        if isinstance(cur, list):
+            # Preserve order.
+            for item in reversed(cur[:200]):
+                push(item, depth + 1)
+            continue
+
+        if isinstance(cur, dict):
+            # Priority keys first (in order), then the rest (stable order).
+            for key in reversed(_PLAR_TEXT_PRI_KEYS):
+                if key in cur and key not in _PLAR_TEXT_SKIP_KEYS:
+                    push(cur.get(key), depth + 1)
+
+            for key in sorted(cur.keys(), key=lambda k: str(k), reverse=True):
+                if key in _PLAR_TEXT_SKIP_KEYS or key in _PLAR_TEXT_PRI_KEYS:
+                    continue
+                push(cur.get(key), depth + 1)
+            continue
+
+    # De-dupe while keeping order, then truncate.
+    out: list[str] = []
+    seen_text: set[str] = set()
+    for p in parts:
+        p2 = p.strip()
+        if not p2:
+            continue
+        # Avoid repeated boilerplate.
+        if p2 in seen_text:
+            continue
+        seen_text.add(p2)
+        out.append(p2)
+        if sum(len(x) for x in out) >= max_chars:
+            break
+
+    return _truncate_text("\n".join(out), max_chars=max_chars)
