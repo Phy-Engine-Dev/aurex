@@ -211,6 +211,59 @@ def _infer_publish_category(user_text: str, *, default_category: str) -> str:
     return "Discussion"
 
 
+def _format_required_by_prefix(*, nickname: str | None, user_id: str | None) -> str:
+    nick = (nickname or "").strip()
+    uid = (user_id or "").strip() or "unknown"
+    if nick:
+        # Force a stable @mention form without spaces/newlines.
+        nick2 = re.sub(r"\s+", "", nick.lstrip("@＠"))
+        who = f"@{nick2}" if nick2 else f"@{uid}"
+    else:
+        who = f"@{uid}"
+    # Required format (no space between 'by' and '@').
+    return f"required by{who} ({uid})\n\n"
+
+
+def _llm_generate_publish_title_intro(
+    *,
+    ollama: OllamaClient,
+    spec: str,
+    max_title_chars: int = 60,
+    max_intro_chars: int = 520,
+) -> tuple[str, str] | None:
+    """Ask the LLM for a human-friendly title and intro body (without the required-by line)."""
+    spec = (spec or "").strip()
+    if not spec:
+        return None
+    prompt = (
+        "Generate a good title and a short introduction for a Physics Lab AR discussion post.\n"
+        "Rules:\n"
+        "- Output STRICT JSON only: {\"title\":\"...\",\"introduction\":\"...\"}\n"
+        "- Do NOT include any @mentions.\n"
+        "- Do NOT include the requester line; it will be added by the system.\n"
+        "- Keep it concise and readable.\n"
+    )
+    msgs: list[dict[str, str]] = [
+        {"role": "system", "content": prompt},
+        {"role": "user", "content": f"Spec:\n{spec}"},
+    ]
+    raw = ollama.chat(messages=msgs)
+    obj = _try_parse_json_object(raw)
+    if not obj:
+        return None
+    title = obj.get("title")
+    intro = obj.get("introduction")
+    if not isinstance(title, str) or not isinstance(intro, str):
+        return None
+    title = re.sub(r"[@＠][^\s]+", "", title).strip()
+    intro = re.sub(r"[@＠][^\s]+", "", intro).strip()
+    title = truncate(title, max_chars=max_title_chars) if title else ""
+    intro = truncate(intro, max_chars=max_intro_chars) if intro else ""
+    if not title or not intro:
+        return None
+    return title, intro
+
+
 _POLITICAL_RE = re.compile(
     r"(?i)\\b("
     r"politic|politics|election|vote|campaign|parliament|congress|senate|president|prime\\s+minister|government|regime|party|"
@@ -655,13 +708,15 @@ def _agent_tool_prompt(*, max_seconds: int) -> str:
         "- plar_query_experiments {category:str, take?:int, skip?:int, days?:int, sort?:str}\n"
         "- plar_get_user_by_name {name:str}\n"
         "- plar_get_user_by_id {user_id:str}\n"
+        "- plar_get_user_board {user_id:str, take?:int, skip?:int}\n"
         "- plar_get_experiment_context {summary_id:str, category:str}\n"
+        "- plar_open_content_page {summary_id:str, category:\"Experiment\"|\"Discussion\", take?:int, skip?:int}\n"
         "- plar_get_status_save {summary_id:str, category:str}\n"
         "- plar_get_comments {target_type:str, target_id:str, take?:int, skip?:int}\n"
         "- simulate {text:str}\n"
         "- simulate_verilog {text:str}\n"
         "- simulate_status_save {summary_id:str, category:str, question?:str}\n"
-        "- circuit {spec:str, publish?:bool, category?:\"Experiment\"|\"Discussion\"}\n"
+        "- circuit {spec:str, publish?:bool}\n"
         "- end {final:str}\n"
         "\n"
         "Tool policies:\n"
@@ -673,7 +728,7 @@ def _agent_tool_prompt(*, max_seconds: int) -> str:
         "  - For discovery, use list_plar (latest/hot/featured/following/followers) and then open by ID.\n"
         "- Publishing is only allowed when the user explicitly asks AND config enables it; otherwise keep publish=false.\n"
         "- If you publish via circuit tool and it returns published=true, your FINAL answer MUST include:\n"
-        "  - Category (Experiment or Discussion)\n"
+        "  - Category (always Discussion)\n"
         "  - SummaryID (the 24-hex id)\n"
         "- Prefer concise outputs; keep tool args minimal.\n"
         "\n"
@@ -683,7 +738,15 @@ def _agent_tool_prompt(*, max_seconds: int) -> str:
         "- {\"tool\":\"list_plar\",\"args\":{\"kind\":\"featured\",\"category\":\"Discussion\",\"take\":10}}\n"
         "- {\"tool\":\"list_plar\",\"args\":{\"kind\":\"following\",\"take\":50}}\n"
         "- {\"tool\":\"list_plar\",\"args\":{\"kind\":\"followers\",\"take\":50}}\n"
-        "- {\"tool\":\"list_plar\",\"args\":{\"kind\":\"staff\"}}  (filters your following list by Verification)\n"
+        "- {\"tool\":\"list_plar\",\"args\":{\"kind\":\"banned\",\"take\":50}}  (your ban list)\n"
+        "- {\"tool\":\"list_plar\",\"args\":{\"kind\":\"volunteers\",\"take\":50}}\n"
+        "- {\"tool\":\"list_plar\",\"args\":{\"kind\":\"editors\",\"take\":50}}  (editors + admins)\n"
+        "- {\"tool\":\"list_plar\",\"args\":{\"kind\":\"retired\",\"take\":50}}\n"
+        "- {\"tool\":\"list_plar\",\"args\":{\"kind\":\"staff\"}}  (best-effort: filters your following list by Verification)\n"
+        "\n"
+        "Open/read flows (examples):\n"
+        "- {\"tool\":\"plar_get_user_board\",\"args\":{\"user_id\":\"<uid>\",\"take\":20,\"skip\":0}}  (read someone's board)\n"
+        "- {\"tool\":\"plar_open_content_page\",\"args\":{\"summary_id\":\"<24hex>\",\"category\":\"Experiment\",\"take\":20,\"skip\":0}}  (read an experiment/discussion + recent comments)\n"
     )
 
 
@@ -707,6 +770,8 @@ def _agent_execute_tool(
     dry_run: bool,
     context_json: dict[str, Any] | None,
     logger: logging.Logger,
+    requester_nickname: str | None = None,
+    requester_user_id: str | None = None,
 ) -> str:
     try:
         tool = (tool or "").strip()
@@ -971,14 +1036,15 @@ def _agent_execute_tool(
                 take = int(args.get("take") or 50)
                 skip = int(args.get("skip") or 0)
                 query = str(args.get("query") or "").strip()
-                users = get_relations(user, user_id=uid, display_type="Following", skip=skip, take=take, query=query)
+                users = get_relations(user, user_id=uid, display_type=1, skip=skip, take=take, query=query)
                 compact = []
                 for u in users[:take]:
+                    u2 = u.get("User") if isinstance(u, dict) and isinstance(u.get("User"), dict) else u
                     compact.append(
                         {
-                            "id": best_effort_extract_text(u.get("ID")) or best_effort_extract_text(u.get("UserID")) or None,
-                            "nickname": best_effort_extract_text(u.get("Nickname")) or best_effort_extract_text(u.get("Name")) or None,
-                            "verification": best_effort_extract_text(u.get("Verification")) or None,
+                            "id": best_effort_extract_text(u2.get("ID")) or best_effort_extract_text(u2.get("UserID")) or None,
+                            "nickname": best_effort_extract_text(u2.get("Nickname")) or best_effort_extract_text(u2.get("Name")) or None,
+                            "verification": best_effort_extract_text(u2.get("Verification")) or None,
                         }
                     )
                 return json.dumps(compact, ensure_ascii=False, indent=2)
@@ -990,38 +1056,174 @@ def _agent_execute_tool(
                 take = int(args.get("take") or 50)
                 skip = int(args.get("skip") or 0)
                 query = str(args.get("query") or "").strip()
-                users = get_relations(user, user_id=uid, display_type="Follower", skip=skip, take=take, query=query)
+                users = get_relations(user, user_id=uid, display_type=0, skip=skip, take=take, query=query)
                 compact = []
                 for u in users[:take]:
+                    u2 = u.get("User") if isinstance(u, dict) and isinstance(u.get("User"), dict) else u
                     compact.append(
                         {
-                            "id": best_effort_extract_text(u.get("ID")) or best_effort_extract_text(u.get("UserID")) or None,
-                            "nickname": best_effort_extract_text(u.get("Nickname")) or best_effort_extract_text(u.get("Name")) or None,
-                            "verification": best_effort_extract_text(u.get("Verification")) or None,
+                            "id": best_effort_extract_text(u2.get("ID")) or best_effort_extract_text(u2.get("UserID")) or None,
+                            "nickname": best_effort_extract_text(u2.get("Nickname")) or best_effort_extract_text(u2.get("Name")) or None,
+                            "verification": best_effort_extract_text(u2.get("Verification")) or None,
                         }
                     )
                 return json.dumps(compact, ensure_ascii=False, indent=2)
 
-            if kind in ("staff", "admins", "admin", "管理员"):
+            if kind in ("banned", "baned", "小黑屋", "blocked"):
+                uid = str(args.get("user_id") or getattr(user, "user_id", "") or "").strip()
+                if not uid:
+                    return "ERROR: missing user_id and current user_id is unavailable"
+                take = int(args.get("take") or 50)
+                skip = int(args.get("skip") or 0)
+                query = str(args.get("query") or "").strip()
+                users = get_relations(user, user_id=uid, display_type=2, skip=skip, take=take, query=query)
+                compact = []
+                for u in users[:take]:
+                    u2 = u.get("User") if isinstance(u, dict) and isinstance(u.get("User"), dict) else u
+                    compact.append(
+                        {
+                            "id": best_effort_extract_text(u2.get("ID")) or best_effort_extract_text(u2.get("UserID")) or None,
+                            "nickname": best_effort_extract_text(u2.get("Nickname")) or best_effort_extract_text(u2.get("Name")) or None,
+                            "verification": best_effort_extract_text(u2.get("Verification")) or None,
+                        }
+                    )
+                return json.dumps(compact, ensure_ascii=False, indent=2)
+
+            if kind in ("volunteers", "volunteer", "志愿者", "义工"):
                 uid = str(args.get("user_id") or getattr(user, "user_id", "") or "").strip()
                 if not uid:
                     return "ERROR: missing user_id and current user_id is unavailable"
                 take = int(args.get("take") or 80)
-                users = get_relations(user, user_id=uid, display_type="Following", skip=0, take=take, query="")
+                skip = int(args.get("skip") or 0)
+                query = str(args.get("query") or "").strip()
+                users = get_relations(user, user_id=uid, display_type=3, skip=skip, take=take, query=query)
+                compact = []
+                for u in users[:take]:
+                    u2 = u.get("User") if isinstance(u, dict) and isinstance(u.get("User"), dict) else u
+                    compact.append(
+                        {
+                            "id": best_effort_extract_text(u2.get("ID")) or best_effort_extract_text(u2.get("UserID")) or None,
+                            "nickname": best_effort_extract_text(u2.get("Nickname")) or best_effort_extract_text(u2.get("Name")) or None,
+                            "verification": best_effort_extract_text(u2.get("Verification")) or None,
+                        }
+                    )
+                return json.dumps(compact, ensure_ascii=False, indent=2)
+
+            if kind in ("editors", "editor", "admins", "admin", "administrator", "administrators", "编辑", "管理员", "编辑和管理员"):
+                uid = str(args.get("user_id") or getattr(user, "user_id", "") or "").strip()
+                if not uid:
+                    return "ERROR: missing user_id and current user_id is unavailable"
+                take = int(args.get("take") or 80)
+                skip = int(args.get("skip") or 0)
+                query = str(args.get("query") or "").strip()
+                users = get_relations(user, user_id=uid, display_type=4, skip=skip, take=take, query=query)
+                compact = []
+                for u in users[:take]:
+                    u2 = u.get("User") if isinstance(u, dict) and isinstance(u.get("User"), dict) else u
+                    compact.append(
+                        {
+                            "id": best_effort_extract_text(u2.get("ID")) or best_effort_extract_text(u2.get("UserID")) or None,
+                            "nickname": best_effort_extract_text(u2.get("Nickname")) or best_effort_extract_text(u2.get("Name")) or None,
+                            "verification": best_effort_extract_text(u2.get("Verification")) or None,
+                        }
+                    )
+                return json.dumps(compact, ensure_ascii=False, indent=2)
+
+            if kind in ("retired", "emeritus", "荣休", "退休", "荣誉"):
+                uid = str(args.get("user_id") or getattr(user, "user_id", "") or "").strip()
+                if not uid:
+                    return "ERROR: missing user_id and current user_id is unavailable"
+                take = int(args.get("take") or 80)
+                skip = int(args.get("skip") or 0)
+                query = str(args.get("query") or "").strip()
+                users = get_relations(user, user_id=uid, display_type=5, skip=skip, take=take, query=query)
+                compact = []
+                for u in users[:take]:
+                    u2 = u.get("User") if isinstance(u, dict) and isinstance(u.get("User"), dict) else u
+                    compact.append(
+                        {
+                            "id": best_effort_extract_text(u2.get("ID")) or best_effort_extract_text(u2.get("UserID")) or None,
+                            "nickname": best_effort_extract_text(u2.get("Nickname")) or best_effort_extract_text(u2.get("Name")) or None,
+                            "verification": best_effort_extract_text(u2.get("Verification")) or None,
+                        }
+                    )
+                return json.dumps(compact, ensure_ascii=False, indent=2)
+
+            if kind in ("staff",):
+                uid = str(args.get("user_id") or getattr(user, "user_id", "") or "").strip()
+                if not uid:
+                    return "ERROR: missing user_id and current user_id is unavailable"
+                take = int(args.get("take") or 80)
+                users = get_relations(user, user_id=uid, display_type=1, skip=0, take=take, query="")
                 staff = []
                 for u in users:
-                    ver = best_effort_extract_text(u.get("Verification"))
+                    u2 = u.get("User") if isinstance(u, dict) and isinstance(u.get("User"), dict) else u
+                    ver = best_effort_extract_text(u2.get("Verification"))
                     if ver in ("Volunteer", "Editor", "Emeritus", "Administrator"):
                         staff.append(
                             {
-                                "id": best_effort_extract_text(u.get("ID")) or best_effort_extract_text(u.get("UserID")) or None,
-                                "nickname": best_effort_extract_text(u.get("Nickname")) or best_effort_extract_text(u.get("Name")) or None,
+                                "id": best_effort_extract_text(u2.get("ID")) or best_effort_extract_text(u2.get("UserID")) or None,
+                                "nickname": best_effort_extract_text(u2.get("Nickname")) or best_effort_extract_text(u2.get("Name")) or None,
                                 "verification": ver,
                             }
                         )
                 return json.dumps(staff, ensure_ascii=False, indent=2)
 
-            return "ERROR: unknown list_plar kind (try: latest|hot|featured|random|following|followers|staff)"
+            return "ERROR: unknown list_plar kind (try: latest|hot|featured|random|following|followers|banned|volunteers|editors|retired|staff)"
+
+        if tool == "plar_get_user_board":
+            user_id = str(args.get("user_id") or "").strip()
+            if not user_id:
+                return "ERROR: missing args.user_id"
+            take = int(args.get("take") or 20)
+            skip = int(args.get("skip") or 0)
+            if take < 1:
+                take = 20
+            if take > 50:
+                take = 50
+            if skip < 0:
+                skip = 0
+            comments = get_comments(user, target_id=user_id, target_type="User", take=take, skip=skip)
+            ctx = _build_user_board_context(user=user, board_user_id=user_id, comments=comments)
+            ctx["paging"] = {"take": take, "skip": skip}
+            return json.dumps(ctx, ensure_ascii=False, indent=2)
+
+        if tool == "plar_open_content_page":
+            summary_id = str(args.get("summary_id") or "").strip()
+            category = str(args.get("category") or "").strip() or "Experiment"
+            if not summary_id:
+                return "ERROR: missing args.summary_id"
+            take = int(args.get("take") or 20)
+            skip = int(args.get("skip") or 0)
+            if take < 1:
+                take = 20
+            if take > 50:
+                take = 50
+            if skip < 0:
+                skip = 0
+            comments = []
+            try:
+                comments = get_comments(
+                    user,
+                    target_id=summary_id,
+                    target_type="Experiment" if category == "Experiment" else "Discussion",
+                    take=take,
+                    skip=skip,
+                )
+            except Exception:
+                comments = []
+            ctx = get_experiment_context(
+                user,
+                summary_id=summary_id,
+                category_value="Experiment" if category == "Experiment" else "Discussion",
+                cache_dir=cache_dir,
+                ttl_sec=300,
+                max_json_chars=20_000,
+            )
+            obj = dict(ctx or {})
+            obj["recent_comments"] = _recent_comments_context(comments, limit=8)
+            obj["paging"] = {"take": take, "skip": skip}
+            return json.dumps(obj, ensure_ascii=False, indent=2)
 
         if tool == "plar_query_experiments":
             category = str(args.get("category") or "").strip() or "Experiment"
@@ -1266,21 +1468,26 @@ def _agent_execute_tool(
             if not spec:
                 return "ERROR: missing args.spec"
             publish_wanted = bool(args.get("publish"))
-            category_override = str(args.get("category") or "").strip()
-            if category_override not in ("", "Experiment", "Discussion"):
-                category_override = ""
             enable_publish_run = (
                 bool(getattr(cfg.agent, "enable_publish", False))
                 and bool(getattr(cfg.agent, "auto_publish", False))
                 and publish_wanted
                 and (not dry_run)
             )
-            default_cat = str(getattr(cfg.agent, "publish_category", "Discussion") or "Discussion")
-            publish_category_value = (
-                category_override
-                or _infer_publish_category(spec, default_category=default_cat)
-                or default_cat
+            # Community rule: always publish to Discussion.
+            publish_category_value = "Discussion"
+
+            required_by = _format_required_by_prefix(
+                nickname=requester_nickname,
+                user_id=requester_user_id,
             )
+            meta = _llm_generate_publish_title_intro(ollama=ollama, spec=spec) if enable_publish_run else None
+            if meta is not None:
+                title, intro_body = meta
+            else:
+                title = truncate(f"Auto Circuit: {spec}", max_chars=60)
+                intro_body = truncate(f"Spec:\n{spec}", max_chars=520)
+            introduction = truncate(required_by + "\n\n" + intro_body, max_chars=600)
             res = build_and_maybe_publish_circuit(
                 ollama=ollama,
                 user=user,
@@ -1293,8 +1500,8 @@ def _agent_execute_tool(
                 dry_run=dry_run,
                 max_attempts=int(getattr(cfg.agent, "circuit_max_attempts", 3) or 3),
                 publish_max_elements=int(getattr(cfg.agent, "publish_max_elements", 5000) or 5000),
-                title=truncate(f"Auto Circuit: {spec}", max_chars=60),
-                introduction=truncate(f"Spec:\n{spec}", max_chars=600),
+                title=title,
+                introduction=introduction,
                 publish_category_value=publish_category_value,
                 publish_tags=list(getattr(cfg.agent, "publish_tags", []) or []),
             )
@@ -1346,6 +1553,8 @@ def agent_mode_run(
     task: str,
     context_json: dict[str, Any] | None,
     history: list[dict[str, str]],
+    requester_nickname: str | None = None,
+    requester_user_id: str | None = None,
     max_seconds: int = 600,
     max_steps: int = 18,
 ) -> str:
@@ -1535,6 +1744,8 @@ def agent_mode_run(
             dry_run=dry_run,
             context_json=context_json,
             logger=logger,
+            requester_nickname=requester_nickname,
+            requester_user_id=requester_user_id,
         )
         if debug_io:
             logger.debug(
@@ -2170,6 +2381,8 @@ def _handle_comment(
             task=task,
             context_json=experiment_context,
             history=history,
+            requester_nickname=nickname,
+            requester_user_id=author_id,
         )
         return reply if (reply or "").strip() else "Done."
 
@@ -2579,22 +2792,16 @@ def _handle_comment(
                         and bool(getattr(cfg.agent, "auto_publish", False))
                         and publish_wanted
                     )
-                    publish_category_value = _infer_publish_category(
-                        routed_arg, default_category=getattr(cfg.agent, "publish_category", "Discussion")
-                    )
-                    title = truncate(f"Auto Circuit: {routed_arg}", max_chars=60)
-                    requested_by = nickname or author_id or "unknown"
-                    mentions = []
-                    by_at = _safe_at_mention(requested_by)
-                    if by_at:
-                        mentions.append(by_at)
-                    mentions.extend(_extract_safe_mentions(routed_arg))
-                    mentions = list(dict.fromkeys(mentions))[:5]
-                    mention_line = f"Mentions: {' '.join(mentions)}\n\n" if mentions else ""
-                    introduction = truncate(
-                        f"{mention_line}Requested by: {requested_by}\n\nSpec:\n{routed_arg}",
-                        max_chars=600,
-                    )
+                    # Community rule: publishing is forced to Discussion (server-side category_value).
+                    publish_category_value = "Discussion"
+                    required_by = _format_required_by_prefix(nickname=nickname, user_id=author_id)
+                    meta = _llm_generate_publish_title_intro(ollama=ollama, spec=routed_arg) if enable_publish else None
+                    if meta is not None:
+                        title, intro_body = meta
+                    else:
+                        title = truncate(f"Auto Circuit: {routed_arg}", max_chars=60)
+                        intro_body = truncate(f"Spec:\n{routed_arg}", max_chars=520)
+                    introduction = truncate(required_by + "\n\n" + intro_body, max_chars=600)
                     try:
                         res = build_and_maybe_publish_circuit(
                             ollama=ollama,
@@ -2633,11 +2840,10 @@ def _handle_comment(
                         )
 
                     if enable_publish and res.published:
-                        cat = str(getattr(res, "category", "") or "").strip() or str(publish_category_value or "").strip()
+                        cat = "Discussion"
                         open_hint = None
                         if isinstance(res.summary_id, str) and res.summary_id.strip():
-                            prefix = "experiment" if cat == "Experiment" else "discussion"
-                            open_hint = f"{prefix}:{res.summary_id.strip()}"
+                            open_hint = f"discussion:{res.summary_id.strip()}"
                         return safe_reply(
                             "Done. I generated Verilog, compiled to .sav with -O4 and '--layout hier', and published it.\n"
                             f"Category: {cat}\nSummaryID: {res.summary_id}\nOpen hint: {open_hint or ''}".rstrip(),
@@ -2750,22 +2956,15 @@ def _handle_comment(
                         and bool(getattr(cfg.agent, "auto_publish", False))
                         and publish_wanted
                     )
-                    publish_category_value = _infer_publish_category(
-                        arg, default_category=getattr(cfg.agent, "publish_category", "Discussion")
-                    )
-                    title = truncate(f"Auto Circuit: {arg}", max_chars=60)
-                    requested_by = nickname or author_id or "unknown"
-                    mentions = []
-                    by_at = _safe_at_mention(requested_by)
-                    if by_at:
-                        mentions.append(by_at)
-                    mentions.extend(_extract_safe_mentions(arg))
-                    mentions = list(dict.fromkeys(mentions))[:5]
-                    mention_line = f"Mentions: {' '.join(mentions)}\n\n" if mentions else ""
-                    introduction = truncate(
-                        f"{mention_line}Requested by: {requested_by}\n\nSpec:\n{arg}",
-                        max_chars=600,
-                    )
+                    publish_category_value = "Discussion"
+                    required_by = _format_required_by_prefix(nickname=nickname, user_id=author_id)
+                    meta = _llm_generate_publish_title_intro(ollama=ollama, spec=arg) if enable_publish else None
+                    if meta is not None:
+                        title, intro_body = meta
+                    else:
+                        title = truncate(f"Auto Circuit: {arg}", max_chars=60)
+                        intro_body = truncate(f"Spec:\n{arg}", max_chars=520)
+                    introduction = truncate(required_by + "\n\n" + intro_body, max_chars=600)
                     try:
                         res = build_and_maybe_publish_circuit(
                             ollama=ollama,
@@ -2804,11 +3003,10 @@ def _handle_comment(
                         )
 
                     if enable_publish and res.published:
-                        cat = str(getattr(res, "category", "") or "").strip() or str(publish_category_value or "").strip()
+                        cat = "Discussion"
                         open_hint = None
                         if isinstance(res.summary_id, str) and res.summary_id.strip():
-                            prefix = "experiment" if cat == "Experiment" else "discussion"
-                            open_hint = f"{prefix}:{res.summary_id.strip()}"
+                            open_hint = f"discussion:{res.summary_id.strip()}"
                         return safe_reply(
                             "Done. I generated Verilog, compiled to .sav with -O4 and '--layout hier', and published it.\n"
                             f"Category: {cat}\nSummaryID: {res.summary_id}\nOpen hint: {open_hint or ''}".rstrip(),
@@ -3168,27 +3366,24 @@ def _handle_comment(
         if not arg:
             return "Provide a circuit specification after the command."
 
-        publish_category_value = _infer_publish_category(
-            arg, default_category=getattr(cfg.agent, "publish_category", "Discussion")
-        )
+        publish_category_value = "Discussion"
         publish_tags = getattr(cfg.agent, "publish_tags", None)
         publish_tags_list = None
         if isinstance(publish_tags, list) and all(isinstance(x, str) for x in publish_tags):
             publish_tags_list = [x.strip() for x in publish_tags if x.strip()]
 
-        title = truncate(f"Auto Circuit: {arg}", max_chars=60)
-        requested_by = nickname or author_id or "unknown"
-        mentions = []
-        by_at = _safe_at_mention(requested_by)
-        if by_at:
-            mentions.append(by_at)
-        mentions.extend(_extract_safe_mentions(arg))
-        mentions = list(dict.fromkeys(mentions))[:5]
-        mention_line = f"Mentions: {' '.join(mentions)}\n\n" if mentions else ""
-        introduction = truncate(
-            f"{mention_line}Requested by: {requested_by}\n\nSpec:\n{arg}",
-            max_chars=600,
+        required_by = _format_required_by_prefix(nickname=nickname, user_id=author_id)
+        meta = (
+            _llm_generate_publish_title_intro(ollama=ollama, spec=arg)
+            if bool(cfg.agent.enable_publish) and (not dry_run)
+            else None
         )
+        if meta is not None:
+            title, intro_body = meta
+        else:
+            title = truncate(f"Auto Circuit: {arg}", max_chars=60)
+            intro_body = truncate(f"Spec:\n{arg}", max_chars=520)
+        introduction = truncate(required_by + "\n\n" + intro_body, max_chars=600)
         logger.debug(
             "Tool circuit invoked (publish=%s, dry_run=%s, spec_len=%d)",
             bool(cfg.agent.enable_publish),
@@ -3225,11 +3420,10 @@ def _handle_comment(
             )
 
         if res.published:
-            cat = str(getattr(res, "category", "") or "").strip() or str(publish_category_value or "").strip()
+            cat = "Discussion"
             open_hint = None
             if isinstance(res.summary_id, str) and res.summary_id.strip():
-                prefix = "experiment" if cat == "Experiment" else "discussion"
-                open_hint = f"{prefix}:{res.summary_id.strip()}"
+                open_hint = f"discussion:{res.summary_id.strip()}"
             return safe_reply(
                 f"Your circuit has been generated and published.\n"
                 f"Category: {cat}\nSummaryID: {res.summary_id}\nOpen hint: {open_hint or ''}".rstrip()
@@ -5318,7 +5512,8 @@ def _cmd_publishsav(args: argparse.Namespace) -> int:
 
     title = str(args.title or "").strip() or os.path.basename(sav_path)
     intro = str(args.introduction or "").strip()
-    category_value = str(args.category or "Discussion").strip() or "Discussion"
+    # Community rule: do not publish to Experiment via this tool.
+    category_value = "Discussion"
     tags = []
     if args.tags:
         tags = [t.strip() for t in str(args.tags).split(",") if t.strip()]

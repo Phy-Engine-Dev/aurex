@@ -522,21 +522,53 @@ def get_relations(
     user: Any,
     *,
     user_id: str,
-    display_type: str = "Following",
+    display_type: str | int = "Following",
     skip: int = 0,
     take: int = 20,
     query: str = "",
 ) -> list[dict[str, Any]]:
-    """Fetch user's followers/following list (best-effort).
+    """Fetch user's relations list (best-effort).
 
-    display_type: "Follower" | "Following"
+    display_type can be:
+      - Names: "Follower", "Following", "Banned", "Volunteer", "Editor", "Emeritus"
+      - Codes: 0..5 (plweb2-compatible):
+          0=Follower, 1=Following, 2=Banned, 3=Volunteer, 4=Editor/Admins, 5=Emeritus/Retired
     """
     user_id = (user_id or "").strip()
     if not user_id:
         raise PLARError("user_id is empty")
-    display_type = (display_type or "Following").strip()
-    if display_type not in ("Follower", "Following"):
-        raise PLARError("display_type must be 'Follower' or 'Following'")
+    if isinstance(display_type, int):
+        display_type_code = int(display_type)
+    else:
+        dt = (str(display_type or "Following") or "Following").strip()
+        # Accept numeric strings too.
+        try:
+            display_type_code = int(dt)
+        except Exception:
+            display_type_code = -1
+        if display_type_code < 0:
+            mapping = {
+                "follower": 0,
+                "followers": 0,
+                "following": 1,
+                "followings": 1,
+                "banned": 2,
+                "baned": 2,
+                "blocked": 2,
+                "volunteer": 3,
+                "volunteers": 3,
+                "editor": 4,
+                "editors": 4,
+                "admin": 4,
+                "admins": 4,
+                "administrator": 4,
+                "administrators": 4,
+                "emeritus": 5,
+                "retired": 5,
+            }
+            display_type_code = mapping.get(dt.casefold(), -1)
+    if display_type_code not in (0, 1, 2, 3, 4, 5):
+        raise PLARError("display_type must be a known name or an integer 0..5")
     skip = int(skip)
     if skip < 0:
         skip = 0
@@ -578,9 +610,15 @@ def get_relations(
 
     fn = getattr(user, "get_relations", None)
     if callable(fn):
-        return _extract_users(
-            fn(user_id=user_id, display_type=display_type, skip=skip, take=take, query=query)
-        )
+        last_e: Exception | None = None
+        for dt_variant in (display_type_code, str(display_type_code)):
+            try:
+                return _extract_users(
+                    fn(user_id=user_id, display_type=dt_variant, skip=skip, take=take, query=query)
+                )
+            except Exception as e:
+                last_e = e
+        raise PLARError(f"get_relations failed via user.get_relations: {last_e}") from last_e
 
     token = getattr(user, "token", None)
     auth_code = getattr(user, "auth_code", None)
@@ -593,13 +631,11 @@ def get_relations(
             "Missing dependency: requests (required for Physics Lab API calls). "
             "Install it with pip (e.g. 'pip install requests')."
         ) from e
-
-    display_type_num = 0 if display_type == "Follower" else 1
     resp = requests.post(
         "https://physics-api-cn.turtlesim.com/Users/GetRelations",
         json={
             "UserID": user_id,
-            "DisplayType": display_type_num,
+            "DisplayType": display_type_code,
             "Skip": skip,
             "Take": take,
             "Query": query,

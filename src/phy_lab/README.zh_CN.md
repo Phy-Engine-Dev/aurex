@@ -78,8 +78,15 @@ python src/phy_lab/agent.py run --config .phy_lab/config.json
 如果你希望避免在公共评论区被“多人接力回复”刷屏，可以开启一次性回复策略（默认开启）：
 
 - `agent.reply_once=true`：每个（target,user）只回复一次，之后对话会被关闭
-- `agent.reply_once_ttl_sec=0`：关闭后永久不再回复（也可以设置为一个秒数作为冷却时间）
+- `agent.reply_once_ttl_sec=0`：不启用冷却（推荐；你后续再次 `@aurex` 仍然会回复）
+- `agent.reply_once_ttl_sec=30`（示例）：启用冷却 30 秒；在冷却内同一（target,user）会被跳过
 - `agent.trigger_on_reply_to_self=false`：关闭“仅通过回复 aurex 就触发”的机制（避免非提问者把你拉进对话）
+
+站内“可读性/浏览”能力（`agent` 模式下会自动组合使用）：
+
+- 列表浏览：`list_plar latest|hot|featured|random`
+- 社交关系列表（与 plweb2 Friends 页一致）：`list_plar following|followers|banned|volunteers|editors|retired`
+- 打开并读取：`plar_get_user_board`（读取用户留言板）、`plar_open_content_page`（读取实验/讨论 + 最近评论）
 
 如果你希望启用外网搜索（联网检索 + 结合结果回答），可以设置：
 
@@ -220,6 +227,9 @@ python src/phy_lab/agent.py run --config .phy_lab/config.json --log-level DEBUG
 ```
 
 如果你需要把“评论原文”也写入 debug 日志，请在配置中设置 `agent.log_include_comment_content=true`（注意隐私风险）。
+如果你需要更详细的 Agent 工具调用轨迹（安全截断，不记录模型思维链），可以设置：
+- `agent.debug_log_llm_io=true`
+- `agent.debug_llm_max_chars=800`
 
 ## 联网搜索排查
 
