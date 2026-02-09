@@ -764,6 +764,11 @@ def _agent_tool_prompt(*, max_seconds: int) -> str:
         "- If you publish via circuit tool and it returns published=true, your FINAL answer MUST include:\n"
         "  - Category (always Discussion)\n"
         "  - SummaryID (the 24-hex id)\n"
+        "- Do NOT invent tool names or argument fields. Only use the schemas listed above.\n"
+        "- Never paste large blobs (Context JSON, excerpts, status-save JSON, circuit JSON, etc.) into tool args.\n"
+        "  - Keep tool-call JSON small; as a rule, keep args under ~500 characters.\n"
+        "  - If you need the current page data, it is already available via Context JSON; reference it implicitly.\n"
+        "  - For simulation, prefer simulate_status_save when Context JSON provides summary_id/category.\n"
         "- Prefer concise outputs; keep tool args minimal.\n"
         "\n"
         "list_plar kinds (examples):\n"
@@ -785,6 +790,56 @@ def _agent_tool_prompt(*, max_seconds: int) -> str:
         "  - {\"tool\":\"list_plar\",\"args\":{\"kind\":\"latest\",\"category\":\"both\",\"user_id\":\"<uid>\",\"take\":5}}\n"
         "- {\"tool\":\"plar_open_content_page\",\"args\":{\"summary_id\":\"<24hex>\",\"category\":\"Experiment\",\"take\":20,\"skip\":0}}  (read an experiment/discussion + recent comments)\n"
     )
+
+
+def _shrink_context_json_for_llm(context_json: dict[str, Any]) -> dict[str, Any]:
+    """Shrink noisy/huge context fields to reduce accidental echo in tool calls.
+
+    The full context is still available to tools via the `context_json` parameter passed
+    to `_agent_execute_tool`; this function only affects what we embed in the LLM prompt.
+    """
+
+    def _truncate_str(s: str, *, max_chars: int) -> str:
+        s2 = (s or "").strip("\n")
+        if len(s2) <= max_chars:
+            return s2
+        return s2[: max(0, max_chars - 40)] + f"...<truncated len={len(s2)}>"
+
+    def _walk(obj: Any, *, depth: int) -> Any:
+        if depth <= 0:
+            return "<omitted: depth_limit>"
+        if obj is None or isinstance(obj, (bool, int, float)):
+            return obj
+        if isinstance(obj, str):
+            return _truncate_str(obj, max_chars=4000)
+        if isinstance(obj, dict):
+            out: dict[str, Any] = {}
+            for k, v in obj.items():
+                ks = str(k)
+                if ks in ("summary_data_excerpt", "experiment_data_excerpt"):
+                    if isinstance(v, str) and v:
+                        out[ks] = f"<omitted: {len(v)} chars>"
+                    else:
+                        out[ks] = "<omitted>"
+                    continue
+                out[ks] = _walk(v, depth=depth - 1)
+            return out
+        if isinstance(obj, list):
+            max_items = 50
+            items = obj[:max_items]
+            out_list = [_walk(x, depth=depth - 1) for x in items]
+            if len(obj) > max_items:
+                out_list.append(f"<omitted: {len(obj) - max_items} more items>")
+            return out_list
+        try:
+            return _truncate_str(str(obj), max_chars=4000)
+        except Exception:
+            return "<unprintable>"
+
+    if not isinstance(context_json, dict):
+        return {"_context": "<invalid>"}
+    shrunk = _walk(context_json, depth=6)
+    return shrunk if isinstance(shrunk, dict) else {"_context": shrunk}
 
 
 def _agent_tool_result_message(*, tool: str, result: str) -> dict[str, str]:
@@ -1652,16 +1707,18 @@ def agent_mode_run(
                     "SIMULATION REQUEST DETECTED.\n"
                     "- You MUST use the simulation tools (simulate / simulate_verilog / simulate_status_save).\n"
                     "- Do NOT provide hand-waved 'by calculation' results unless tools are disabled or fail.\n"
-                    "- If Context JSON provides summary_id/category, prefer simulate_status_save."
+                    "- If Context JSON provides summary_id/category, prefer simulate_status_save.\n"
+                    "- Keep simulation tool args tiny; never paste circuit/status JSON into args."
                 ),
             }
         )
     if context_json is not None:
+        context_for_llm = _shrink_context_json_for_llm(context_json)
         messages.append(
             {
                 "role": "system",
                 "content": "Context JSON (current page):\n"
-                + json.dumps(context_json, ensure_ascii=False, indent=2),
+                + json.dumps(context_for_llm, ensure_ascii=False, indent=2),
             }
         )
     if history:

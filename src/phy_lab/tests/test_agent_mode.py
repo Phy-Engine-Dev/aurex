@@ -67,6 +67,23 @@ class _Cfg:
 
 
 class TestAgentMode(unittest.TestCase):
+    def test_shrink_context_omits_excerpts(self):
+        ctx = {
+            "summary_id": "abc",
+            "category": "Experiment",
+            "experiment_data_excerpt": "Z" * 12000,
+            "summary_data_excerpt": "Y" * 9000,
+            "body_text": "Hello",
+        }
+        shrunk = agent_mod._shrink_context_json_for_llm(ctx)
+        self.assertEqual(shrunk.get("summary_id"), "abc")
+        self.assertEqual(shrunk.get("category"), "Experiment")
+        self.assertIn("<omitted:", str(shrunk.get("experiment_data_excerpt")))
+        self.assertIn("<omitted:", str(shrunk.get("summary_data_excerpt")))
+        dumped = agent_mod.json.dumps(shrunk, ensure_ascii=False)
+        self.assertNotIn("Z" * 2000, dumped)
+        self.assertNotIn("Y" * 2000, dumped)
+
     def test_agent_mode_end_immediate(self):
         out = agent_mod.agent_mode_run(
             ollama=_SeqOllama(['{"tool":"end","final":"Hello world."}']),
