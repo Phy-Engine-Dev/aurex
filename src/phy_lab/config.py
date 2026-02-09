@@ -54,6 +54,11 @@ Political content (strict)
 - If asked, respond with a brief refusal in the user's language and offer to help with Physics Lab AR community topics instead.
 - Do not use web search for political content.
 - If the user asks you to search the web for political content, refuse (do not perform any web lookup).
+
+Single-reply policy (critical)
+- Reply ONLY to the author of the current comment.
+- Do NOT address or @mention any other users.
+- Provide a complete one-shot answer; do NOT ask follow-up questions or request more context.
 """
 
 
@@ -152,7 +157,17 @@ class AgentConfig:
     enable_publish: bool = False
     log_level: str = "INFO"
     log_include_comment_content: bool = False
+    # Debug-only: log sanitized LLM/tool I/O (never logs chain-of-thought fields).
+    debug_log_llm_io: bool = False
+    debug_llm_max_chars: int = 800
     system_prompt: str = DEFAULT_SYSTEM_PROMPT
+    # Reply constraints to reduce misunderstandings/spam in public threads.
+    reply_once: bool = True
+    # Cooldown for same (target,user) when reply_once=true. 0 disables cooldown (recommended).
+    reply_once_ttl_sec: int = 0
+    # If true, a direct reply to the agent account triggers even without an explicit @mention.
+    # This can cause unwanted replies in multi-user threads, so default is false.
+    trigger_on_reply_to_self: bool = False
     targets: list[TargetConfig] = field(default_factory=list)
 
 
@@ -506,9 +521,26 @@ def parse_config(data: dict[str, Any], *, source: str) -> Config:
         agent_obj.get("log_include_comment_content"),
         where="agent.log_include_comment_content",
     )
+    debug_log_llm_io = _optional_bool(
+        agent_obj.get("debug_log_llm_io"), where="agent.debug_log_llm_io"
+    )
+    debug_llm_max_chars = _optional_int(
+        agent_obj.get("debug_llm_max_chars"), where="agent.debug_llm_max_chars"
+    )
+    if debug_llm_max_chars is not None and debug_llm_max_chars < 0:
+        raise ConfigError("agent.debug_llm_max_chars must be >= 0")
     system_prompt = _optional_str(
         agent_obj.get("system_prompt"), where="agent.system_prompt"
     )
+    reply_once = _optional_bool(agent_obj.get("reply_once"), where="agent.reply_once")
+    reply_once_ttl_sec = _optional_int(
+        agent_obj.get("reply_once_ttl_sec"), where="agent.reply_once_ttl_sec"
+    )
+    trigger_on_reply_to_self = _optional_bool(
+        agent_obj.get("trigger_on_reply_to_self"), where="agent.trigger_on_reply_to_self"
+    )
+    if reply_once_ttl_sec is not None and reply_once_ttl_sec < 0:
+        raise ConfigError("agent.reply_once_ttl_sec must be >= 0")
 
     publish_category_final = publish_category or AgentConfig.publish_category
     if publish_category_final not in ("Experiment", "Discussion"):
@@ -693,7 +725,20 @@ def parse_config(data: dict[str, Any], *, source: str) -> Config:
         log_include_comment_content=log_include_comment_content
         if log_include_comment_content is not None
         else AgentConfig.log_include_comment_content,
+        debug_log_llm_io=debug_log_llm_io
+        if debug_log_llm_io is not None
+        else AgentConfig.debug_log_llm_io,
+        debug_llm_max_chars=debug_llm_max_chars
+        if debug_llm_max_chars is not None
+        else AgentConfig.debug_llm_max_chars,
         system_prompt=system_prompt or AgentConfig.system_prompt,
+        reply_once=reply_once if reply_once is not None else AgentConfig.reply_once,
+        reply_once_ttl_sec=reply_once_ttl_sec
+        if reply_once_ttl_sec is not None
+        else AgentConfig.reply_once_ttl_sec,
+        trigger_on_reply_to_self=trigger_on_reply_to_self
+        if trigger_on_reply_to_self is not None
+        else AgentConfig.trigger_on_reply_to_self,
         targets=_parse_targets(agent_obj.get("targets"), where="agent.targets"),
     )
 
@@ -809,6 +854,11 @@ def write_config(path: str, config: Config) -> None:
             "enable_publish": config.agent.enable_publish,
             "log_level": config.agent.log_level,
             "log_include_comment_content": config.agent.log_include_comment_content,
+            "debug_log_llm_io": bool(getattr(config.agent, "debug_log_llm_io", False)),
+            "debug_llm_max_chars": int(getattr(config.agent, "debug_llm_max_chars", 800) or 800),
+            "reply_once": bool(getattr(config.agent, "reply_once", True)),
+            "reply_once_ttl_sec": int(getattr(config.agent, "reply_once_ttl_sec", 0) or 0),
+            "trigger_on_reply_to_self": bool(getattr(config.agent, "trigger_on_reply_to_self", False)),
             "system_prompt": config.agent.system_prompt,
             "targets": [{"type": t.type, "id": t.id} for t in config.agent.targets],
         },

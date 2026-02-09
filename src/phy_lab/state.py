@@ -21,6 +21,7 @@ class AgentState:
     schema_version: int = 1
     targets: dict[str, TargetState] = field(default_factory=dict)
     conversations: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
+    closed_conversations: dict[str, int] = field(default_factory=dict)
     recent_request_timestamps_ms: list[int] = field(default_factory=list)
 
 
@@ -80,6 +81,18 @@ def parse_state(data: dict[str, Any], *, source: str) -> AgentState:
                 raise StateError(f"conversations[{key!r}] must be a list of objects")
             conversations[key] = list(value)
 
+    closed_obj = data.get("closed_conversations", {})
+    closed: dict[str, int] = {}
+    if closed_obj is not None:
+        if not isinstance(closed_obj, dict):
+            raise StateError("closed_conversations must be an object")
+        for key, value in closed_obj.items():
+            if not isinstance(key, str):
+                raise StateError("closed_conversations keys must be strings")
+            if not isinstance(value, int):
+                raise StateError(f"closed_conversations[{key!r}] must be an integer timestamp")
+            closed[key] = int(value)
+
     recent_obj = data.get("recent_request_timestamps_ms", [])
     recent: list[int] = []
     if recent_obj is not None:
@@ -91,6 +104,7 @@ def parse_state(data: dict[str, Any], *, source: str) -> AgentState:
         schema_version=1,
         targets=targets,
         conversations=conversations,
+        closed_conversations=closed,
         recent_request_timestamps_ms=recent,
     )
 
@@ -126,6 +140,7 @@ def save_state(path: str, state: AgentState) -> None:
             for key, target in state.targets.items()
         },
         "conversations": state.conversations,
+        "closed_conversations": state.closed_conversations,
         "recent_request_timestamps_ms": state.recent_request_timestamps_ms,
     }
     _atomic_write_json(path, data)

@@ -22,6 +22,7 @@ class TestState(unittest.TestCase):
                     processed_comment_keys=["c1", "c2"],
                 )
             },
+            closed_conversations={"User:abc|u1": 999},
         )
         with tempfile.TemporaryDirectory() as td:
             path = os.path.join(td, "state.json")
@@ -31,8 +32,9 @@ class TestState(unittest.TestCase):
             self.assertIn("User:abc", loaded.targets)
             self.assertEqual(loaded.targets["User:abc"].last_seen_timestamp_ms, 123)
             self.assertEqual(loaded.targets["User:abc"].processed_comment_keys, ["c1", "c2"])
+            self.assertIn("User:abc|u1", loaded.closed_conversations)
+            self.assertEqual(loaded.closed_conversations["User:abc|u1"], 999)
 
 
 if __name__ == "__main__":
     unittest.main()
-

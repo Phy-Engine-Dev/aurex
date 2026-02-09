@@ -9,7 +9,80 @@ from typing import Any
 
 
 class OllamaError(RuntimeError):
-    pass
+    def __init__(self, message: str, *, details: dict[str, Any] | None = None):
+        super().__init__(message)
+        self.details: dict[str, Any] = details or {}
+
+
+def _safe_response_preview(data: Any, *, max_chars: int = 500) -> str:
+    """Best-effort JSON preview that never includes chain-of-thought fields."""
+    try:
+        if isinstance(data, dict):
+            d: dict[str, Any] = dict(data)
+            msg = d.get("message")
+            if isinstance(msg, dict):
+                msg2: dict[str, Any] = dict(msg)
+                # Some models include a 'thinking' field; never log it.
+                if "thinking" in msg2:
+                    msg2["thinking"] = "<omitted>"
+                d["message"] = msg2
+            return json.dumps(d, ensure_ascii=False)[:max_chars]
+        return json.dumps(data, ensure_ascii=False)[:max_chars]
+    except Exception:
+        try:
+            return (str(data) or "")[:max_chars]
+        except Exception:
+            return ""
+
+def _tool_calls_to_agent_json(tool_calls: Any) -> str | None:
+    """Convert Ollama/OpenAI-style tool_calls into our agent JSON tool-call format.
+
+    Some models (notably gpt-oss) may return message.content="" but include tool calls in
+    message.tool_calls. Our agent expects the tool call to be encoded in content.
+    """
+    if not isinstance(tool_calls, list) or not tool_calls:
+        return None
+    tc0 = tool_calls[0]
+    if not isinstance(tc0, dict):
+        return None
+    func = tc0.get("function")
+    if not isinstance(func, dict):
+        return None
+    name = func.get("name")
+    if not isinstance(name, str) or not name.strip():
+        return None
+    name = name.strip()
+
+    # Known aliasing when models invent a namespace prefix.
+    aliases = {
+        "plar_list_plar": "list_plar",
+        "plar_search_plar": "search_plar",
+        "plar_web_search": "web_search",
+    }
+    tool = aliases.get(name, name)
+
+    arguments = func.get("arguments")
+    args_obj: dict[str, Any] = {}
+    if isinstance(arguments, dict):
+        args_obj = arguments
+    elif isinstance(arguments, str) and arguments.strip():
+        try:
+            parsed = json.loads(arguments)
+            if isinstance(parsed, dict):
+                args_obj = parsed
+        except Exception:
+            args_obj = {}
+
+    if tool == "end":
+        final = ""
+        for k in ("final", "answer", "content", "message", "text"):
+            v = args_obj.get(k)
+            if isinstance(v, str) and v.strip():
+                final = v.strip()
+                break
+        return json.dumps({"tool": "end", "final": final}, ensure_ascii=False)
+
+    return json.dumps({"tool": tool, "args": args_obj}, ensure_ascii=False)
 
 
 def _is_local_base_url(url: str) -> bool:
@@ -63,9 +136,10 @@ class OllamaClient:
             ) from e
 
         url = f"{self.base_url.rstrip('/')}/api/chat"
+        base_messages = self._apply_gptoss_optimization(list(messages or []))
         payload: dict[str, Any] = {
             "model": self.model,
-            "messages": self._apply_gptoss_optimization(list(messages or [])),
+            "messages": base_messages,
             "stream": False,
             "options": {"temperature": self.temperature, "num_predict": int(self.num_predict)},
         }
@@ -75,10 +149,18 @@ class OllamaClient:
         if _is_local_base_url(self.base_url):
             session.trust_env = False
 
+        retry_guard = (
+            "IMPORTANT:\n"
+            "- Your reply MUST include a non-empty final answer.\n"
+            "- Do NOT output only internal reasoning.\n"
+            "- If you are unsure, say so briefly in the final answer.\n"
+        )
+
         # Some Ollama builds/models can occasionally return an empty message.content.
         # Treat it as a transient server-side failure and retry once.
         max_attempts = 2
         last_data: Any = None
+        last_details: dict[str, Any] = {}
         for attempt in range(1, max_attempts + 1):
             try:
                 resp = session.post(url, json=payload, timeout=self.timeout_sec)
@@ -106,18 +188,39 @@ class OllamaClient:
             content = content.strip()
             if content:
                 return content
+            # Some models return tool calls with empty content.
+            tool_json = _tool_calls_to_agent_json(message.get("tool_calls"))
+            if isinstance(tool_json, str) and tool_json.strip():
+                return tool_json
+            thinking = message.get("thinking")
+            thinking_len = len(thinking) if isinstance(thinking, str) else 0
+            last_details = {
+                "model": self.model,
+                "base_url": self.base_url,
+                "attempt": attempt,
+                "max_attempts": max_attempts,
+                "content_len": len(content),
+                "had_thinking": bool(thinking_len),
+                "thinking_len": thinking_len,
+            }
             if attempt < max_attempts:
+                # Retry with an extra guard message to encourage a non-empty final output.
+                payload["messages"] = list(base_messages) + [{"role": "system", "content": retry_guard}]
                 continue
 
         # If we get here, every attempt returned empty content.
-        preview = ""
-        try:
-            preview = json.dumps(last_data, ensure_ascii=False)[:500]
-        except Exception:
-            preview = str(last_data)[:500]
+        preview = _safe_response_preview(last_data, max_chars=500)
+        detail_bits = []
+        if last_details:
+            if last_details.get("had_thinking"):
+                detail_bits.append(f"thinking_len={int(last_details.get('thinking_len') or 0)}")
+            detail_bits.append(f"attempts={int(last_details.get('max_attempts') or max_attempts)}")
+        details_str = (" (" + ", ".join(detail_bits) + ")") if detail_bits else ""
         raise OllamaError(
-            "Ollama returned empty 'message.content' (after retry). "
-            + (f"Response preview: {preview}" if preview else "")
+            "Ollama returned empty 'message.content' (after retry)"
+            + details_str
+            + (f". Response preview: {preview}" if preview else "."),
+            details=last_details or None,
         )
 
 

@@ -73,7 +73,13 @@ python src/phy_lab/agent.py run --config .phy_lab/config.json
 
 - `agent.user_targets_require_mention=false`
 
-补充：即使开启了 `require_mention=true`，当对方是“回复你/回复 aurex”（评论的 `ReplyID` 指向 aurex 的用户 ID）时，Agent 也会触发回复（用于覆盖某些客户端 @ 提及不显示在纯文本里的情况）。
+补充：如果你开启了 `agent.trigger_on_reply_to_self=true`，即使 `require_mention=true`，当对方是“回复你/回复 aurex”（评论的 `ReplyID` 指向 aurex 的用户 ID）时，Agent 也会触发回复（用于覆盖某些客户端 @ 提及不显示在纯文本里的情况）。默认建议关闭以避免刷屏。
+
+如果你希望避免在公共评论区被“多人接力回复”刷屏，可以开启一次性回复策略（默认开启）：
+
+- `agent.reply_once=true`：每个（target,user）只回复一次，之后对话会被关闭
+- `agent.reply_once_ttl_sec=0`：关闭后永久不再回复（也可以设置为一个秒数作为冷却时间）
+- `agent.trigger_on_reply_to_self=false`：关闭“仅通过回复 aurex 就触发”的机制（避免非提问者把你拉进对话）
 
 如果你希望启用外网搜索（联网检索 + 结合结果回答），可以设置：
 

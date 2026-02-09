@@ -73,7 +73,7 @@ Key settings:
 - `agent.mode`: `agent` | `traditional` (default: `agent`). `agent` treats every triggered comment as an agent task; `traditional` uses the older chat/summarize/search tool routing and does not expose agent mode.
 - `agent.require_mention`: when `true`, only replies to comments that contain `agent.mention_tag` (and optionally commands if enabled)
 - `agent.user_targets_require_mention`: override mention requirement for `User:*` targets (default: `true`; set `false` for chat-like message boards)
-- Trigger note: even with `require_mention=true`, the agent will reply when a comment is a direct reply to the agent account (i.e., comment `ReplyID` matches the agent `UserID`).
+- Trigger note: if `agent.trigger_on_reply_to_self=true`, the agent may reply even with `require_mention=true` when a comment is a direct reply to the agent account (i.e., comment `ReplyID` matches the agent `UserID`). Default is `false` to reduce spam in multi-user threads.
 - `agent.commands_enabled`: enable the `!command` interface (default: `false` for safety)
 - `agent.notifications_enabled`: poll the Notifications API and auto-discover targets (default: `true`)
 - `agent.notification_category_ids`: which notification categories to poll (default: `[0, 3]`)
@@ -85,6 +85,9 @@ Key settings:
 - `agent.auto_web_search`: let the LLM decide when to use web search (default: `true`, only effective when `web_search_enabled=true`)
 - `agent.web_search_fallback_to_ddg`: fallback to DuckDuckGo when Google is blocked/captcha (default: `true`)
 - `agent.auto_tool_routing`: let the LLM route natural language requests to tools (default: `true`)
+- `agent.reply_once`: reply at most once per (target,user) conversation key; subsequent triggers are ignored to avoid spam (default: `true`)
+- `agent.reply_once_ttl_sec`: cooldown for `reply_once` (0 means forever until `reset-state`) (default: `0`)
+- `agent.trigger_on_reply_to_self`: treat a direct reply-to-agent as a trigger even without an explicit mention (default: `false`)
 - Note on PLAR discovery: Physics Lab does not provide a full keyword search. Use list views (latest/hot/featured) and then open items by ID; `search` is lookup-only (user name/ID, experiment/discussion ID).
 - `agent.enable_publish`: allow publishing generated experiments (default: `false`)
 - `agent.auto_publish`: allow the LLM to publish when user explicitly requests it (default: `false`; requires `enable_publish=true`)

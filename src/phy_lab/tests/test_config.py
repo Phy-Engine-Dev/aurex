@@ -29,6 +29,8 @@ class TestConfig(unittest.TestCase):
                     "web_search_fallback_to_ddg": True,
                     "auto_tool_routing": True,
                     "auto_publish": True,
+                    "debug_log_llm_io": True,
+                    "debug_llm_max_chars": 1234,
                     "circuit_max_attempts": 3,
                     "publish_max_elements": 5000,
                     "overload_protection_enabled": True,
@@ -50,6 +52,8 @@ class TestConfig(unittest.TestCase):
         self.assertEqual(cfg.agent.web_search_fallback_to_ddg, True)
         self.assertEqual(cfg.agent.auto_tool_routing, True)
         self.assertEqual(cfg.agent.auto_publish, True)
+        self.assertEqual(cfg.agent.debug_log_llm_io, True)
+        self.assertEqual(cfg.agent.debug_llm_max_chars, 1234)
         self.assertEqual(cfg.agent.circuit_max_attempts, 3)
         self.assertEqual(cfg.agent.publish_max_elements, 5000)
         self.assertEqual(cfg.agent.overload_protection_enabled, True)

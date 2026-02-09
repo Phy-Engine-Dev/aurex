@@ -33,7 +33,7 @@ from config import (  # noqa: E402
     pick_state_path,
     resolve_path,
 )
-from ollama import OllamaClient, OllamaPool  # noqa: E402
+from ollama import OllamaClient, OllamaError, OllamaPool  # noqa: E402
 from phy_engine import (  # noqa: E402
     PhyEngineError,
     ensure_phyengine_lib,
@@ -163,6 +163,7 @@ def _safe_at_mention(handle: str) -> str | None:
 
 _AT_HANDLE_RE = re.compile(r"(?:@|＠)\s*([^\s:：]{1,64})")
 _HEX24_RE = re.compile(r"^[0-9a-fA-F]{24}$")
+_PUBLIC_MENTION_RE = re.compile(r"(?<![A-Za-z0-9_])(?:@|＠)\s*([A-Za-z0-9_\u4e00-\u9fff-]{1,32})")
 
 
 def _extract_safe_mentions(text: str) -> list[str]:
@@ -183,6 +184,20 @@ def _extract_safe_mentions(text: str) -> list[str]:
         if len(out) >= 5:
             break
     return out
+
+
+def _strip_public_mentions(text: str) -> str:
+    """Remove @mentions from model output to avoid pinging non-askers.
+
+    This deliberately avoids matching email addresses or Verilog '@(' syntax.
+    """
+    s = (text or "").strip()
+    if not s:
+        return s
+    s2 = _PUBLIC_MENTION_RE.sub("", s)
+    # Clean up repeated whitespace created by removals.
+    s2 = re.sub(r"[ \t]{2,}", " ", s2).strip()
+    return s2
 
 
 def _infer_publish_category(user_text: str, *, default_category: str) -> str:
@@ -341,6 +356,59 @@ def _format_exception_brief(e: BaseException) -> str:
     if len(msg) > 300:
         msg = msg[:299] + "…"
     return f"{e.__class__.__name__}: {msg}".rstrip(": ").strip()
+
+def _effective_system_prompt(*, cfg: Any, user_text: str) -> str:
+    base = str(getattr(getattr(cfg, "agent", None), "system_prompt", "") or "").rstrip()
+    # Always reinforce reply scope; optionally enforce one-shot reply semantics.
+    is_cjk = any("\u4e00" <= ch <= "\u9fff" for ch in (user_text or ""))
+    one_shot = bool(getattr(getattr(cfg, "agent", None), "reply_once", True))
+    if is_cjk:
+        extra = (
+            "关键约束（务必遵守）\n"
+            "- 只回复当前提问者（当前这条评论的作者），不要面向其他人说话。\n"
+            "- 不要 @ 提及或点名任何其他用户。\n"
+            "- 请在这一条回复里给出完整结论；不要要求对方补充信息或进行追问。\n"
+        )
+        if one_shot:
+            extra += "- 本次为一次性回复；回复后会直接关闭对话，你将不会再继续跟进。\n"
+    else:
+        extra = (
+            "Critical constraints (must follow)\n"
+            "- Reply ONLY to the author of the current comment.\n"
+            "- Do NOT address or @mention any other users.\n"
+            "- Provide a complete answer in this single reply; do not ask follow-up questions or request more context.\n"
+        )
+        if one_shot:
+            extra += "- This is a one-shot reply; after replying the conversation is closed and you will not follow up.\n"
+
+    return (base + "\n\n" + extra).strip() if base else extra.strip()
+
+
+def _is_conversation_closed(
+    state: AgentState, *, key: str, now_ms: int, ttl_sec: int
+) -> bool:
+    if not key:
+        return False
+    # ttl_sec <= 0 means "no cooldown": do not block future replies.
+    # reply_once is enforced per incoming comment anyway (we only post once per comment key).
+    if int(ttl_sec) <= 0:
+        return False
+    ts = state.closed_conversations.get(key)
+    if not isinstance(ts, int) or ts <= 0:
+        return False
+    return (int(now_ms) - int(ts)) < int(ttl_sec) * 1000
+
+
+def _mark_conversation_closed(state: AgentState, *, key: str, now_ms: int) -> None:
+    if not key:
+        return
+    state.closed_conversations[key] = int(now_ms)
+    # "Close" by dropping memory for this conversation.
+    state.conversations.pop(key, None)
+    # Keep the map bounded.
+    if len(state.closed_conversations) > 5000:
+        items = sorted(state.closed_conversations.items(), key=lambda kv: int(kv[1] or 0))
+        state.closed_conversations = dict(items[-4000:])
 
 
 def _guess_simulation_issue_codes(lines: list[str]) -> list[str]:
@@ -1207,8 +1275,9 @@ def agent_mode_run(
     start_ts = time.time()
     deadline = start_ts + float(max_seconds)
     tool_cutoff_ts = start_ts + float(max(0, int(max_seconds) - 60))
+    system_prompt = _effective_system_prompt(cfg=cfg, user_text=task)
     messages: list[dict[str, str]] = [
-        {"role": "system", "content": cfg.agent.system_prompt},
+        {"role": "system", "content": system_prompt},
         {"role": "system", "content": _agent_tool_prompt(max_seconds=max_seconds)},
     ]
     if context_json is not None:
@@ -1224,11 +1293,25 @@ def agent_mode_run(
         messages.extend(history[-8:])
     messages.append({"role": "user", "content": task})
 
+    debug_io = bool(getattr(getattr(cfg, "agent", None), "debug_log_llm_io", False)) and logger.isEnabledFor(
+        logging.DEBUG
+    )
+    debug_max = int(getattr(getattr(cfg, "agent", None), "debug_llm_max_chars", 800) or 800)
+
+    def _timeout_reply() -> str:
+        is_cjk = any("\u4e00" <= ch <= "\u9fff" for ch in (task or ""))
+        mins = int(max(0, int(max_seconds)) // 60) or 10
+        if is_cjk:
+            return f"抱歉，Agent 已超时（{mins} 分钟），本次任务未能完成。你可以重新 @我 并简化需求再试一次。"
+        return f"Sorry — agent timed out ({mins} minutes) and couldn't finish this task. Please @me again with a shorter request."
+
     last_raw = ""
     for step in range(1, int(max_steps) + 1):
         now = time.time()
         time_left = int(max(0.0, deadline - now))
         tools_enabled = now < tool_cutoff_ts
+        if now > deadline:
+            return _timeout_reply()
 
         # After 9 minutes (last 60s), tools are disabled: force final output and refuse tool calls.
         if not tools_enabled:
@@ -1243,10 +1326,27 @@ def agent_mode_run(
                     ),
                 }
             )
+            if debug_io:
+                logger.debug(
+                    "agent.llm_call: step=%d/%d tools_enabled=false time_left=%ds messages=%d",
+                    step,
+                    int(max_steps),
+                    time_left,
+                    len(messages),
+                )
             raw_final = ollama.chat(messages=messages)
+            if debug_io:
+                logger.debug(
+                    "agent.llm_out: step=%d len=%d preview=%r",
+                    step,
+                    len(raw_final or ""),
+                    truncate(raw_final or "", max_chars=debug_max),
+                )
             try:
                 tool, _args, final = _agent_parse_tool_call(raw_final)
                 if tool == "end":
+                    if debug_io:
+                        logger.debug("agent.tool_call: step=%d tool=end final_len=%d", step, len(final or ""))
                     out = safe_reply(final or "", max_chars=cfg.agent.max_reply_chars)
                     return out if out.strip() else "Done."
                 # Reject any other tool call and force one last retry for end.
@@ -1259,10 +1359,31 @@ def agent_mode_run(
                         ),
                     }
                 )
+                if debug_io:
+                    logger.debug(
+                        "agent.llm_call: step=%d/%d tools_enabled=false (retry_end) time_left=%ds messages=%d",
+                        step,
+                        int(max_steps),
+                        time_left,
+                        len(messages),
+                    )
                 raw_final2 = ollama.chat(messages=messages)
+                if debug_io:
+                    logger.debug(
+                        "agent.llm_out: step=%d (retry_end) len=%d preview=%r",
+                        step,
+                        len(raw_final2 or ""),
+                        truncate(raw_final2 or "", max_chars=debug_max),
+                    )
                 try:
                     tool2, _args2, final2 = _agent_parse_tool_call(raw_final2)
                     if tool2 == "end":
+                        if debug_io:
+                            logger.debug(
+                                "agent.tool_call: step=%d tool=end (retry_end) final_len=%d",
+                                step,
+                                len(final2 or ""),
+                            )
                         out = safe_reply(final2 or "", max_chars=cfg.agent.max_reply_chars)
                         return out if out.strip() else "Done."
                 except Exception:
@@ -1282,19 +1403,45 @@ def agent_mode_run(
             }
         )
         if now > deadline:
-            break
+            return _timeout_reply()
+        if debug_io:
+            logger.debug(
+                "agent.llm_call: step=%d/%d tools_enabled=true time_left=%ds messages=%d",
+                step,
+                int(max_steps),
+                time_left,
+                len(messages),
+            )
         raw = ollama.chat(messages=messages)
         last_raw = raw
         try:
             tool, args, final = _agent_parse_tool_call(raw)
         except Exception:
             # Fallback: treat as final answer.
+            if debug_io:
+                logger.debug(
+                    "agent.llm_out_unparsed: step=%d len=%d preview=%r",
+                    step,
+                    len(raw or ""),
+                    truncate(raw or "", max_chars=debug_max),
+                )
             out = safe_reply(raw, max_chars=cfg.agent.max_reply_chars)
             return out if out.strip() else "Done."
 
         if tool == "end":
+            if debug_io:
+                logger.debug("agent.tool_call: step=%d tool=end final_len=%d", step, len(final or ""))
             out = safe_reply(final or "", max_chars=cfg.agent.max_reply_chars)
             return out if out.strip() else "Done."
+
+        if debug_io:
+            arg_keys = sorted([k for k in (args or {}).keys() if isinstance(k, str)])[:20]
+            logger.debug(
+                "agent.tool_call: step=%d tool=%s arg_keys=%s",
+                step,
+                tool,
+                arg_keys,
+            )
 
         result = _agent_execute_tool(
             tool=tool,
@@ -1308,6 +1455,14 @@ def agent_mode_run(
             context_json=context_json,
             logger=logger,
         )
+        if debug_io:
+            logger.debug(
+                "agent.tool_result: step=%d tool=%s len=%d preview=%r",
+                step,
+                tool,
+                len(result or ""),
+                truncate(result or "", max_chars=debug_max),
+            )
         messages.append({"role": "assistant", "content": raw})
         messages.append(_agent_tool_result_message(tool=tool, result=result))
         # Always remind remaining time after each tool result.
@@ -1334,19 +1489,35 @@ def agent_mode_run(
             )
 
     # Budget exhausted: ask for end.
+    if time.time() > deadline:
+        return _timeout_reply()
     messages.append(
         {
             "role": "system",
             "content": "Agent mode budget reached. Call {\"tool\":\"end\",\"final\":\"...\"} with your best final answer now.",
         }
     )
+    if debug_io:
+        logger.debug(
+            "agent.llm_call: budget_reached tools_enabled=%s messages=%d",
+            (time.time() < tool_cutoff_ts),
+            len(messages),
+        )
     raw2 = ollama.chat(messages=messages)
     try:
         tool, _args, final = _agent_parse_tool_call(raw2)
         if tool == "end":
+            if debug_io:
+                logger.debug("agent.tool_call: budget_reached tool=end final_len=%d", len(final or ""))
             out = safe_reply(final or "", max_chars=cfg.agent.max_reply_chars)
             return out if out.strip() else "Done."
     except Exception:
+        if debug_io:
+            logger.debug(
+                "agent.llm_out_unparsed: budget_reached len=%d preview=%r",
+                len(raw2 or ""),
+                truncate(raw2 or "", max_chars=debug_max),
+            )
         pass
     out = safe_reply(raw2 or last_raw or "Done.", max_chars=cfg.agent.max_reply_chars)
     return out if out.strip() else "Done."
@@ -1860,6 +2031,7 @@ def _handle_comment(
     if not content:
         logger.debug("Skip comment: empty content")
         return None
+    system_prompt = _effective_system_prompt(cfg=cfg, user_text=content)
     author_id, nickname = _comment_author(comment)
     if getattr(cfg.agent, "log_include_comment_content", False):
         logger.debug("Incoming comment content: %r", truncate(content, max_chars=400))
@@ -1927,7 +2099,7 @@ def _handle_comment(
         if not arg:
             if experiment_context is not None:
                 logger.debug("Tool chat invoked (empty input, summarizing context)")
-                messages: list[dict[str, str]] = [{"role": "system", "content": cfg.agent.system_prompt}]
+                messages: list[dict[str, str]] = [{"role": "system", "content": system_prompt}]
                 messages.append(
                     {
                         "role": "system",
@@ -1951,7 +2123,7 @@ def _handle_comment(
             try:
                 route = _llm_route_tool(
                     ollama=ollama,
-                    system_prompt=cfg.agent.system_prompt,
+                    system_prompt=system_prompt,
                     user_text=arg,
                     context_json=experiment_context,
                     allow_agent=(agent_mode == "agent"),
@@ -1985,7 +2157,7 @@ def _handle_comment(
 
                 if action == "summarize":
                     if experiment_context is not None and _is_generic_summarize_arg(routed_arg):
-                        messages: list[dict[str, str]] = [{"role": "system", "content": cfg.agent.system_prompt}]
+                        messages: list[dict[str, str]] = [{"role": "system", "content": system_prompt}]
                         messages.append(
                             {
                                 "role": "system",
@@ -2005,7 +2177,7 @@ def _handle_comment(
                         return "Provide text to summarize."
                     reply = llm_summarize(
                         ollama=ollama,
-                        system_prompt=cfg.agent.system_prompt,
+                        system_prompt=system_prompt,
                         text=routed_arg,
                     )
                     return safe_reply(reply, max_chars=cfg.agent.max_reply_chars)
@@ -2156,7 +2328,7 @@ def _handle_comment(
                         )
                     except Exception as e:
                         return f"Web search failed: {e}"
-                    messages: list[dict[str, str]] = [{"role": "system", "content": cfg.agent.system_prompt}]
+                    messages: list[dict[str, str]] = [{"role": "system", "content": system_prompt}]
                     messages.append(
                         {
                             "role": "system",
@@ -2573,7 +2745,7 @@ def _handle_comment(
                 + json.dumps(experiment_context, ensure_ascii=False, indent=2)
                 + "\n\n"
             )
-        messages: list[dict[str, str]] = [{"role": "system", "content": cfg.agent.system_prompt}]
+        messages: list[dict[str, str]] = [{"role": "system", "content": system_prompt}]
         if context_blob:
             messages.append({"role": "system", "content": context_blob})
         messages.extend(history)
@@ -2585,7 +2757,7 @@ def _handle_comment(
             try:
                 use_web, query = _llm_decide_web_search(
                     ollama=ollama,
-                    system_prompt=cfg.agent.system_prompt,
+                    system_prompt=system_prompt,
                     user_text=arg,
                     context_json=experiment_context,
                 )
@@ -2697,7 +2869,7 @@ def _handle_comment(
                     if nickname:
                         ctx["title"] = f"{nickname} 的留言板"
 
-                messages: list[dict[str, str]] = [{"role": "system", "content": cfg.agent.system_prompt}]
+                messages: list[dict[str, str]] = [{"role": "system", "content": system_prompt}]
                 messages.append(
                     {
                         "role": "system",
@@ -2723,7 +2895,7 @@ def _handle_comment(
 
         if use_page_context:
             logger.debug("Tool summarize invoked (using page context)")
-            messages: list[dict[str, str]] = [{"role": "system", "content": cfg.agent.system_prompt}]
+            messages: list[dict[str, str]] = [{"role": "system", "content": system_prompt}]
             messages.append(
                 {
                     "role": "system",
@@ -2741,7 +2913,7 @@ def _handle_comment(
             return safe_reply(reply, max_chars=cfg.agent.max_reply_chars)
 
         logger.debug("Tool summarize invoked (len=%d)", len(arg))
-        reply = llm_summarize(ollama=ollama, system_prompt=cfg.agent.system_prompt, text=arg)
+        reply = llm_summarize(ollama=ollama, system_prompt=system_prompt, text=arg)
         return safe_reply(reply, max_chars=cfg.agent.max_reply_chars)
 
     if cmd in ("search", "find"):
@@ -2881,7 +3053,7 @@ def _handle_comment(
             )
         except Exception as e:
             return f"Web search failed: {e}"
-        messages: list[dict[str, str]] = [{"role": "system", "content": cfg.agent.system_prompt}]
+        messages: list[dict[str, str]] = [{"role": "system", "content": system_prompt}]
         messages.append(
             {
                 "role": "system",
@@ -3165,7 +3337,7 @@ def _process_target(
             mention_tag=cfg.agent.mention_tag,
             command_prefix=cfg.agent.command_prefix,
             commands_enabled=cfg.agent.commands_enabled,
-            reply_to_self=reply_to_self,
+            reply_to_self=bool(reply_to_self and getattr(cfg.agent, "trigger_on_reply_to_self", False)),
         )
         if logger.isEnabledFor(logging.DEBUG):
             startswith_prefix = bool(
@@ -3192,6 +3364,19 @@ def _process_target(
             continue
 
         now_ms = int(time.time() * 1000)
+
+        conversation_key = None
+        if isinstance(author_id, str) and author_id.strip():
+            conversation_key = f"{target_key}|{author_id.strip()}"
+        if bool(getattr(cfg.agent, "reply_once", True)) and conversation_key:
+            ttl_sec = int(getattr(cfg.agent, "reply_once_ttl_sec", 0) or 0)
+            if _is_conversation_closed(state, key=conversation_key, now_ms=now_ms, ttl_sec=ttl_sec):
+                logger.info("[%s] Skip comment: reply cooldown active", target_key)
+                target_state.processed_comment_keys.append(key)
+                processed.add(key)
+                target_state.last_seen_timestamp_ms = max(target_state.last_seen_timestamp_ms, ts)
+                continue
+
         if bool(getattr(cfg.agent, "overload_protection_enabled", True)):
             window_ms = int(getattr(cfg.agent, "overload_window_sec", 600) or 600) * 1000
             max_req = int(getattr(cfg.agent, "overload_max_requests", 40) or 40)
@@ -3225,19 +3410,16 @@ def _process_target(
                     logger.warning("[%s] Failed to post busy reply: %s", target_key, e)
 
                 record_request_timestamp(state, ts_ms=now_ms)
+                if bool(getattr(cfg.agent, "reply_once", True)) and conversation_key:
+                    _mark_conversation_closed(state, key=conversation_key, now_ms=now_ms)
                 target_state.processed_comment_keys.append(key)
                 processed.add(key)
                 target_state.last_seen_timestamp_ms = max(target_state.last_seen_timestamp_ms, ts)
                 prune_processed_keys(target_state, keep_last=500)
                 continue
-
-        conversation_key = None
-        if isinstance(author_id, str) and author_id.strip():
-            conversation_key = f"{target_key}|{author_id.strip()}"
-        history = (
-            get_conversation_history(state, key=conversation_key, max_turns=12)
-            if conversation_key
-            else []
+        reply_once = bool(getattr(cfg.agent, "reply_once", True))
+        history = [] if reply_once else (
+            get_conversation_history(state, key=conversation_key, max_turns=12) if conversation_key else []
         )
 
         experiment_context: dict[str, Any] | None = None
@@ -3281,7 +3463,7 @@ def _process_target(
 
         if reply:
             prefix = safe_mention_prefix(nickname) if nickname else None
-            post_body = f"{prefix or ''}{reply}".strip()
+            post_body = f"{prefix or ''}{_strip_public_mentions(reply)}".strip()
             try:
                 if dry_run:
                     logger.info("[%s] DRY RUN reply: %s", target_key, post_body)
@@ -3304,30 +3486,34 @@ def _process_target(
             logger.debug("[%s] No reply generated for this comment", target_key)
 
         if conversation_key:
-            user_text = strip_leading_mention(content, mention_tag=cfg.agent.mention_tag)
-            normalized_user_turn = user_text
-            if cfg.agent.commands_enabled:
-                cmd_name, cmd_arg = parse_command(
-                    user_text, prefix=cfg.agent.command_prefix
-                )
-                normalized_user_turn = cmd_arg if cmd_name is not None else user_text
-            append_conversation_turn(
-                state,
-                key=conversation_key,
-                role="user",
-                content=normalized_user_turn,
-                ts_ms=ts,
-                keep_last=20,
-            )
-            if reply:
+            if reply_once:
+                if reply:
+                    _mark_conversation_closed(state, key=conversation_key, now_ms=now_ms)
+            else:
+                user_text = strip_leading_mention(content, mention_tag=cfg.agent.mention_tag)
+                normalized_user_turn = user_text
+                if cfg.agent.commands_enabled:
+                    cmd_name, cmd_arg = parse_command(
+                        user_text, prefix=cfg.agent.command_prefix
+                    )
+                    normalized_user_turn = cmd_arg if cmd_name is not None else user_text
                 append_conversation_turn(
                     state,
                     key=conversation_key,
-                    role="assistant",
-                    content=reply,
-                    ts_ms=int(time.time() * 1000),
+                    role="user",
+                    content=normalized_user_turn,
+                    ts_ms=ts,
                     keep_last=20,
                 )
+                if reply:
+                    append_conversation_turn(
+                        state,
+                        key=conversation_key,
+                        role="assistant",
+                        content=reply,
+                        ts_ms=int(time.time() * 1000),
+                        keep_last=20,
+                    )
 
         target_state.processed_comment_keys.append(key)
         processed.add(key)
@@ -3523,7 +3709,7 @@ def _scan_and_enqueue(
             mention_tag=cfg.agent.mention_tag,
             command_prefix=cfg.agent.command_prefix,
             commands_enabled=cfg.agent.commands_enabled,
-            reply_to_self=reply_to_self,
+            reply_to_self=bool(reply_to_self and getattr(cfg.agent, "trigger_on_reply_to_self", False)),
         )
         if not triggered:
             with state_lock:
@@ -3536,6 +3722,25 @@ def _scan_and_enqueue(
                     pending_min_ts_ms=pending.min_ts(target_key),
                 )
             continue
+
+        conversation_key = None
+        if isinstance(author_id, str) and author_id.strip():
+            conversation_key = f"{target_key}|{author_id.strip()}"
+        if bool(getattr(cfg.agent, "reply_once", True)) and conversation_key:
+            ttl_sec = int(getattr(cfg.agent, "reply_once_ttl_sec", 0) or 0)
+            with state_lock:
+                if _is_conversation_closed(state, key=conversation_key, now_ms=int(time.time() * 1000), ttl_sec=ttl_sec):
+                    target_state = get_target_state(state, target_key)
+                    target_state.processed_comment_keys.append(key)
+                    processed.add(key)
+                    _update_last_seen_capped(
+                        target_state=target_state,
+                        ts_ms=ts,
+                        pending_min_ts_ms=pending.min_ts(target_key),
+                    )
+                    pending.remove(target_key, key)
+                    logger.info("[%s] Skip enqueue: reply cooldown active", target_key)
+                    continue
 
         # Reserve this comment for a worker.
         pending.add(target_key, key, ts)
@@ -3919,6 +4124,25 @@ def _process_work_item(
     content = _comment_content(comment) or ""
 
     now_ms = int(time.time() * 1000)
+    conversation_key = None
+    if isinstance(author_id, str) and author_id.strip():
+        conversation_key = f"{target_key}|{author_id.strip()}"
+    if bool(getattr(cfg.agent, "reply_once", True)) and conversation_key:
+        ttl_sec = int(getattr(cfg.agent, "reply_once_ttl_sec", 0) or 0)
+        with state_lock:
+            if _is_conversation_closed(state, key=conversation_key, now_ms=now_ms, ttl_sec=ttl_sec):
+                target_state = get_target_state(state, target_key)
+                target_state.processed_comment_keys.append(key)
+                _update_last_seen_capped(
+                    target_state=target_state,
+                    ts_ms=ts,
+                    pending_min_ts_ms=pending.min_ts(target_key),
+                )
+                prune_processed_keys(target_state, keep_last=500)
+                pending.remove(target_key, key)
+                save_state(state_path, state)
+                logger.info("[%s] Skip reply: reply cooldown active", target_key)
+                return
     if bool(getattr(cfg.agent, "overload_protection_enabled", True)):
         window_ms = int(getattr(cfg.agent, "overload_window_sec", 600) or 600) * 1000
         max_req = int(getattr(cfg.agent, "overload_max_requests", 40) or 40)
@@ -3944,6 +4168,8 @@ def _process_work_item(
 
             with state_lock:
                 record_request_timestamp(state, ts_ms=now_ms)
+                if bool(getattr(cfg.agent, "reply_once", True)) and conversation_key:
+                    _mark_conversation_closed(state, key=conversation_key, now_ms=now_ms)
                 target_state = get_target_state(state, target_key)
                 target_state.processed_comment_keys.append(key)
                 _update_last_seen_capped(
@@ -3956,14 +4182,10 @@ def _process_work_item(
                 save_state(state_path, state)
             return
 
-    conversation_key = None
-    if isinstance(author_id, str) and author_id.strip():
-        conversation_key = f"{target_key}|{author_id.strip()}"
     with state_lock:
-        history = (
-            get_conversation_history(state, key=conversation_key, max_turns=12)
-            if conversation_key
-            else []
+        reply_once = bool(getattr(cfg.agent, "reply_once", True))
+        history = [] if reply_once else (
+            get_conversation_history(state, key=conversation_key, max_turns=12) if conversation_key else []
         )
 
     experiment_context: dict[str, Any] | None = None
@@ -4008,62 +4230,102 @@ def _process_work_item(
             comments=comments,
         )
 
-    reply = _handle_comment(
-        comment=comment,
-        user=user,
-        ollama=ollama,
-        cache_dir=cache_dir,
-        config_base_dir=config_base_dir,
-        cfg=cfg,
-        dry_run=dry_run,
-        logger=logger,
-        conversation_key=conversation_key,
-        experiment_context=experiment_context,
-        history=history,
-    )
+    reply: str | None = None
+    try:
+        reply = _handle_comment(
+            comment=comment,
+            user=user,
+            ollama=ollama,
+            cache_dir=cache_dir,
+            config_base_dir=config_base_dir,
+            cfg=cfg,
+            dry_run=dry_run,
+            logger=logger,
+            conversation_key=conversation_key,
+            experiment_context=experiment_context,
+            history=history,
+        )
+    except Exception as e:
+        # Avoid getting stuck retrying the same comment forever: we will mark it processed below.
+        details = getattr(e, "details", None)
+        if isinstance(e, OllamaError) and isinstance(details, dict) and details:
+            logger.warning(
+                "[%s] LLM failed (comment=%s): %s details=%s",
+                target_key,
+                key,
+                e,
+                {k: details.get(k) for k in ("attempt", "max_attempts", "had_thinking", "thinking_len", "content_len")},
+                exc_info=True,
+            )
+        else:
+            logger.warning("[%s] Handle comment failed (comment=%s): %s", target_key, key, e, exc_info=True)
+
+        # Public-facing fallback (one sentence) so the user gets an answer and the thread doesn't spam.
+        msg_low = (str(e) or "").casefold()
+        is_timeout = any(x in msg_low for x in ("timeout", "timed out", "readtimeout", "connecttimeout"))
+        is_cjk = any("\u4e00" <= ch <= "\u9fff" for ch in (content or ""))
+        if is_cjk:
+            reply = "抱歉，本次请求超时（Agent 未能在限制时间内完成）。请稍后再试。" if is_timeout else "抱歉，我这次生成回复失败，请稍后再试。"
+        else:
+            reply = (
+                "Sorry — the request timed out (agent couldn't finish within the time limit). Please try again later."
+                if is_timeout
+                else "Sorry — I failed to generate a reply this time. Please try again later."
+            )
 
     with state_lock:
         record_request_timestamp(state, ts_ms=now_ms)
 
+    posted_ok = False
     if reply:
         prefix = safe_mention_prefix(nickname) if nickname else None
-        post_body = f"{prefix or ''}{reply}".strip()
+        post_body = f"{prefix or ''}{_strip_public_mentions(reply)}".strip()
         if dry_run:
             logger.info("[%s] DRY RUN reply: %s", target_key, post_body)
+            posted_ok = True
         else:
-            post_comment(
-                user,
-                target_id=target.id,
-                target_type=target.type,
-                content=post_body,
-                reply_id=author_id,
-            )
-            logger.info("[%s] Replied to %s", target_key, nickname or author_id or "unknown")
+            try:
+                post_comment(
+                    user,
+                    target_id=target.id,
+                    target_type=target.type,
+                    content=post_body,
+                    reply_id=author_id,
+                )
+                posted_ok = True
+                logger.info("[%s] Replied to %s", target_key, nickname or author_id or "unknown")
+            except Exception as e:
+                # Still mark the comment processed to avoid dead loops; the user can re-comment to retry.
+                logger.warning("[%s] Posting reply failed (comment=%s): %s", target_key, key, e, exc_info=True)
 
     with state_lock:
         if conversation_key:
-            user_text = strip_leading_mention(content, mention_tag=cfg.agent.mention_tag)
-            normalized_user_turn = user_text
-            if cfg.agent.commands_enabled:
-                cmd_name, cmd_arg = parse_command(user_text, prefix=cfg.agent.command_prefix)
-                normalized_user_turn = cmd_arg if cmd_name is not None else user_text
-            append_conversation_turn(
-                state,
-                key=conversation_key,
-                role="user",
-                content=normalized_user_turn,
-                ts_ms=ts,
-                keep_last=20,
-            )
-            if reply:
+            if bool(getattr(cfg.agent, "reply_once", True)):
+                if reply and posted_ok:
+                    _mark_conversation_closed(state, key=conversation_key, now_ms=now_ms)
+            else:
+                user_text = strip_leading_mention(content, mention_tag=cfg.agent.mention_tag)
+                normalized_user_turn = user_text
+                if cfg.agent.commands_enabled:
+                    cmd_name, cmd_arg = parse_command(user_text, prefix=cfg.agent.command_prefix)
+                    normalized_user_turn = cmd_arg if cmd_name is not None else user_text
                 append_conversation_turn(
                     state,
                     key=conversation_key,
-                    role="assistant",
-                    content=reply,
-                    ts_ms=int(time.time() * 1000),
+                    role="user",
+                    content=normalized_user_turn,
+                    ts_ms=ts,
                     keep_last=20,
                 )
+                if reply:
+                    append_conversation_turn(
+                        state,
+                        key=conversation_key,
+                        role="assistant",
+                        content=reply,
+                        ts_ms=int(time.time() * 1000),
+                        keep_last=20,
+                    )
 
         target_state = get_target_state(state, target_key)
         target_state.processed_comment_keys.append(key)
@@ -4125,9 +4387,25 @@ def _worker_loop(
             )
             logger.info("[worker-%d] Done %s", worker_id, item.comment_key)
         except Exception as e:
-            # On failure, drop from pending so it can be re-queued later.
-            pending.remove(f"{item.target.type}:{item.target.id}", item.comment_key)
-            logger.warning("[worker-%d] Failed %s: %s", worker_id, item.comment_key, e)
+            # Safety net: never allow a single broken comment to dead-loop forever.
+            target_key = f"{item.target.type}:{item.target.id}"
+            pending.remove(target_key, item.comment_key)
+            logger.warning("[worker-%d] Failed %s: %s", worker_id, item.comment_key, e, exc_info=True)
+            try:
+                with state_lock:
+                    target_state = get_target_state(state, target_key)
+                    if item.comment_key not in target_state.processed_comment_keys:
+                        target_state.processed_comment_keys.append(item.comment_key)
+                    _update_last_seen_capped(
+                        target_state=target_state,
+                        ts_ms=int(item.comment_ts_ms),
+                        pending_min_ts_ms=pending.min_ts(target_key),
+                    )
+                    prune_processed_keys(target_state, keep_last=500)
+                    save_state(state_path, state)
+            except Exception:
+                # Do not crash the worker due to state issues.
+                logger.debug("[worker-%d] Failed to mark comment processed after error", worker_id, exc_info=True)
         finally:
             work_q.task_done()
             capacity.release()
@@ -4493,6 +4771,7 @@ def _cmd_reset_state(args: argparse.Namespace) -> int:
                 del state.targets[k]
     if scope in ("all", "conversations"):
         state.conversations = {}
+        state.closed_conversations = {}
 
     try:
         save_state(state_path, state)
