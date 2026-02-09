@@ -52,12 +52,15 @@ def _tool_calls_to_agent_json(tool_calls: Any) -> str | None:
     if not isinstance(name, str) or not name.strip():
         return None
     name = name.strip()
+    if name.startswith("tool_"):
+        name = name[len("tool_") :].strip()
 
     # Known aliasing when models invent a namespace prefix.
     aliases = {
         "plar_list_plar": "list_plar",
         "plar_search_plar": "search_plar",
         "plar_web_search": "web_search",
+        "google": "web_search",
     }
     tool = aliases.get(name, name)
 

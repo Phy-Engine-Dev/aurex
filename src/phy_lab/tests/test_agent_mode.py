@@ -106,6 +106,35 @@ class TestAgentMode(unittest.TestCase):
             )
         self.assertEqual(out.strip(), "Done.")
 
+    def test_agent_mode_accepts_tool_prefix_names(self):
+        replies = [
+            '{"tool":"tool_list_plar","args":{"kind":"hot","category":"Experiment","take":5}}',
+            '{"tool":"end","final":"OK"}',
+        ]
+        seen = {"tool": None}
+
+        def _exec(*, tool, args, **_kw):
+            seen["tool"] = tool
+            return "tool_ok"
+
+        with mock.patch.object(agent_mod, "_agent_execute_tool", side_effect=_exec):
+            out = agent_mod.agent_mode_run(
+                ollama=_SeqOllama(replies),
+                user=object(),
+                cfg=_Cfg(),
+                cache_dir="cache",
+                config_base_dir=".",
+                dry_run=True,
+                logger=agent_mod.logging.getLogger("t"),
+                task="whatever",
+                context_json=None,
+                history=[],
+                max_seconds=120,
+                max_steps=3,
+            )
+        self.assertEqual(seen["tool"], "list_plar")
+        self.assertEqual(out.strip(), "OK")
+
     def test_agent_mode_last_minute_rejects_tools(self):
         # max_seconds=1 => tool cutoff at 0s => tools disabled immediately.
         replies = [

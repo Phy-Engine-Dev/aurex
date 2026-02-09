@@ -132,6 +132,42 @@ class TestOllamaClient(unittest.TestCase):
             out = c.chat(messages=[{"role": "user", "content": "x"}])
         self.assertIn('"tool": "list_plar"', out)
 
+    def test_empty_content_with_tool_calls_tool_prefix_is_stripped(self):
+        class _Resp:
+            ok = True
+
+            def json(self):
+                return {
+                    "message": {
+                        "content": "",
+                        "tool_calls": [
+                            {
+                                "id": "call_x",
+                                "function": {
+                                    "name": "tool_list_plar",
+                                    "arguments": {"kind": "hot", "category": "Experiment", "take": 5},
+                                },
+                            }
+                        ],
+                    }
+                }
+
+        class _Session:
+            def __init__(self):
+                self.trust_env = True
+
+            def post(self, *_a, **_kw):
+                return _Resp()
+
+        fake_requests = types.ModuleType("requests")
+        fake_requests.Session = _Session  # type: ignore[attr-defined]
+        fake_requests.RequestException = Exception  # type: ignore[attr-defined]
+
+        with mock.patch.dict(sys.modules, {"requests": fake_requests}):
+            c = OllamaClient(base_url="http://127.0.0.1:11434", model="m")
+            out = c.chat(messages=[{"role": "user", "content": "x"}])
+        self.assertIn('"tool": "list_plar"', out)
+
 
 if __name__ == "__main__":
     unittest.main()

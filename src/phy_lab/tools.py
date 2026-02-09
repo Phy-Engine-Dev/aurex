@@ -2577,11 +2577,46 @@ def web_search_baidu(
 class CircuitBuildResult:
     published: bool
     summary_id: str | None = None
+    category: str | None = None
     artifact_dir: str | None = None
     artifact_verilog_path: str | None = None
     artifact_sav_path: str | None = None
     publish_block_reason: str | None = None
     plsav_elements: int | None = None
+
+
+def _best_effort_write_publish_debug(
+    *,
+    cache_dir: str,
+    record: dict[str, Any],
+) -> None:
+    """Write a lightweight local debug trail for publishing.
+
+    This helps diagnose cases where the client reports 'published' but the user can't find the item.
+    Never raises.
+    """
+    try:
+        os.makedirs(cache_dir, exist_ok=True)
+    except Exception:
+        return
+
+    try:
+        last_path = os.path.join(cache_dir, "publish_last.json")
+        tmp = last_path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(record, f, ensure_ascii=False, indent=2)
+            f.write("\n")
+        os.replace(tmp, last_path)
+    except Exception:
+        pass
+
+    try:
+        hist_path = os.path.join(cache_dir, "publish_history.jsonl")
+        with open(hist_path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(record, ensure_ascii=False))
+            f.write("\n")
+    except Exception:
+        pass
 
 
 def _write_artifacts(
@@ -2754,6 +2789,7 @@ def build_and_maybe_publish_circuit(
                 artifact_sav_path=artifact_sav,
                 publish_block_reason="too_large",
                 plsav_elements=plsav_elements,
+                category=str(publish_category_value or "") or None,
             )
 
         if keep_temp or (not enable_publish) or dry_run:
@@ -2770,6 +2806,7 @@ def build_and_maybe_publish_circuit(
                 artifact_verilog_path=artifact_verilog,
                 artifact_sav_path=artifact_sav,
                 plsav_elements=plsav_elements,
+                category=str(publish_category_value or "") or None,
             )
 
         info = upload_sav_as_experiment(
@@ -2782,9 +2819,34 @@ def build_and_maybe_publish_circuit(
             tags=publish_tags,
         )
 
+        summary_id = info.get("summary_id")
+        if not isinstance(summary_id, str) or not summary_id.strip():
+            summary_id = None
+        else:
+            summary_id = summary_id.strip()
+        category = info.get("category")
+        if not isinstance(category, str) or not category.strip():
+            category = str(publish_category_value or "") or None
+        else:
+            category = category.strip()
+
+        _best_effort_write_publish_debug(
+            cache_dir=cache_dir,
+            record={
+                "ts": int(time.time()),
+                "published": True,
+                "summary_id": summary_id,
+                "category": category,
+                "title": truncate(title or "", max_chars=120) or None,
+                "tags": publish_tags or None,
+                "plsav_elements": plsav_elements,
+            },
+        )
+
         return CircuitBuildResult(
             published=True,
-            summary_id=str(info.get("summary_id")),
+            summary_id=summary_id,
+            category=category,
             artifact_dir=artifact_dir,
             artifact_verilog_path=artifact_verilog,
             artifact_sav_path=artifact_sav,

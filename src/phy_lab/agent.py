@@ -574,6 +574,51 @@ def _agent_parse_tool_call(raw: str) -> tuple[str, dict[str, Any], str]:
     if not isinstance(args, dict):
         args = {}
 
+    # Normalize common model variants:
+    # - tool names with a "tool_" prefix (e.g. "tool_list_plar")
+    # - wrapper objects: {"tool":"list_plar","args":{"tool":"list_plar","args":{...}}}
+    # - aliases used by other router modes (e.g. "google" -> "web_search")
+    def _normalize_tool_name(name: str) -> str:
+        t = (name or "").strip()
+        if t.startswith("tool_"):
+            t = t[len("tool_") :].strip()
+        aliases = {
+            "plar_list_plar": "list_plar",
+            "plar_search_plar": "search_plar",
+            "plar_web_search": "web_search",
+            "google": "web_search",
+            "web": "web_search",
+            "websearch": "web_search",
+        }
+        return aliases.get(t, t)
+
+    tool = _normalize_tool_name(tool)
+    if isinstance(args.get("tool"), str) and args.get("tool") and tool not in (
+        "end",
+        "list_plar",
+        "search_plar",
+        "web_search",
+        "plar_query_experiments",
+        "plar_get_user_by_name",
+        "plar_get_user_by_id",
+        "plar_get_experiment_context",
+        "plar_get_status_save",
+        "plar_get_comments",
+        "simulate",
+        "simulate_verilog",
+        "simulate_status_save",
+        "circuit",
+    ):
+        tool2 = _normalize_tool_name(str(args.get("tool") or ""))
+        if tool2:
+            tool = tool2
+    # Unwrap nested args at most once.
+    if isinstance(args.get("args"), dict) and (
+        set(args.keys()).issubset({"tool", "args", "name", "action"})
+        or ("query" in args.get("args", {}) and "query" not in args)
+    ):
+        args = dict(args.get("args") or {})
+
     final = ""
     if tool == "end":
         for k in ("final", "answer", "content", "message", "text"):
@@ -581,6 +626,12 @@ def _agent_parse_tool_call(raw: str) -> tuple[str, dict[str, Any], str]:
             if isinstance(v, str) and v.strip():
                 final = v.strip()
                 break
+        if not final and isinstance(args, dict):
+            for k in ("final", "answer", "content", "message", "text"):
+                v = args.get(k)
+                if isinstance(v, str) and v.strip():
+                    final = v.strip()
+                    break
     return tool, args, final
 
 
@@ -610,7 +661,7 @@ def _agent_tool_prompt(*, max_seconds: int) -> str:
         "- simulate {text:str}\n"
         "- simulate_verilog {text:str}\n"
         "- simulate_status_save {summary_id:str, category:str, question?:str}\n"
-        "- circuit {spec:str, publish?:bool}\n"
+        "- circuit {spec:str, publish?:bool, category?:\"Experiment\"|\"Discussion\"}\n"
         "- end {final:str}\n"
         "\n"
         "Tool policies:\n"
@@ -621,6 +672,9 @@ def _agent_tool_prompt(*, max_seconds: int) -> str:
         "  - Use search_plar ONLY to LOOKUP by user name/id or content id.\n"
         "  - For discovery, use list_plar (latest/hot/featured/following/followers) and then open by ID.\n"
         "- Publishing is only allowed when the user explicitly asks AND config enables it; otherwise keep publish=false.\n"
+        "- If you publish via circuit tool and it returns published=true, your FINAL answer MUST include:\n"
+        "  - Category (Experiment or Discussion)\n"
+        "  - SummaryID (the 24-hex id)\n"
         "- Prefer concise outputs; keep tool args minimal.\n"
         "\n"
         "list_plar kinds (examples):\n"
@@ -1212,11 +1266,20 @@ def _agent_execute_tool(
             if not spec:
                 return "ERROR: missing args.spec"
             publish_wanted = bool(args.get("publish"))
+            category_override = str(args.get("category") or "").strip()
+            if category_override not in ("", "Experiment", "Discussion"):
+                category_override = ""
             enable_publish_run = (
                 bool(getattr(cfg.agent, "enable_publish", False))
                 and bool(getattr(cfg.agent, "auto_publish", False))
                 and publish_wanted
                 and (not dry_run)
+            )
+            default_cat = str(getattr(cfg.agent, "publish_category", "Discussion") or "Discussion")
+            publish_category_value = (
+                category_override
+                or _infer_publish_category(spec, default_category=default_cat)
+                or default_cat
             )
             res = build_and_maybe_publish_circuit(
                 ollama=ollama,
@@ -1232,15 +1295,33 @@ def _agent_execute_tool(
                 publish_max_elements=int(getattr(cfg.agent, "publish_max_elements", 5000) or 5000),
                 title=truncate(f"Auto Circuit: {spec}", max_chars=60),
                 introduction=truncate(f"Spec:\n{spec}", max_chars=600),
-                publish_category_value=str(
-                    getattr(cfg.agent, "publish_category", "Discussion") or "Discussion"
-                ),
+                publish_category_value=publish_category_value,
                 publish_tags=list(getattr(cfg.agent, "publish_tags", []) or []),
             )
+            category = (
+                str(getattr(res, "category", "") or "").strip()
+                or publish_category_value.strip()
+            )
+            summary_id = getattr(res, "summary_id", None)
+            open_hint = None
+            if isinstance(summary_id, str) and summary_id.strip():
+                prefix = "experiment" if category == "Experiment" else "discussion"
+                open_hint = f"{prefix}:{summary_id.strip()}"
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug(
+                    "circuit.publish_result: published=%s category=%s summary_id=%s elements=%s block_reason=%s",
+                    bool(getattr(res, "published", False)),
+                    category or None,
+                    summary_id,
+                    getattr(res, "plsav_elements", None),
+                    getattr(res, "publish_block_reason", None),
+                )
             return json.dumps(
                 {
                     "published": bool(getattr(res, "published", False)),
                     "summary_id": getattr(res, "summary_id", None),
+                    "category": category or None,
+                    "open_hint": open_hint,
                     "plsav_elements": getattr(res, "plsav_elements", None),
                     "publish_block_reason": getattr(res, "publish_block_reason", None),
                 },
@@ -2552,9 +2633,14 @@ def _handle_comment(
                         )
 
                     if enable_publish and res.published:
+                        cat = str(getattr(res, "category", "") or "").strip() or str(publish_category_value or "").strip()
+                        open_hint = None
+                        if isinstance(res.summary_id, str) and res.summary_id.strip():
+                            prefix = "experiment" if cat == "Experiment" else "discussion"
+                            open_hint = f"{prefix}:{res.summary_id.strip()}"
                         return safe_reply(
                             "Done. I generated Verilog, compiled to .sav with -O4 and '--layout hier', and published it.\n"
-                            f"Category: {publish_category_value}\nSummaryID: {res.summary_id}",
+                            f"Category: {cat}\nSummaryID: {res.summary_id}\nOpen hint: {open_hint or ''}".rstrip(),
                             max_chars=cfg.agent.max_reply_chars,
                         )
                     return safe_reply(
@@ -2718,9 +2804,14 @@ def _handle_comment(
                         )
 
                     if enable_publish and res.published:
+                        cat = str(getattr(res, "category", "") or "").strip() or str(publish_category_value or "").strip()
+                        open_hint = None
+                        if isinstance(res.summary_id, str) and res.summary_id.strip():
+                            prefix = "experiment" if cat == "Experiment" else "discussion"
+                            open_hint = f"{prefix}:{res.summary_id.strip()}"
                         return safe_reply(
                             "Done. I generated Verilog, compiled to .sav with -O4 and '--layout hier', and published it.\n"
-                            f"Category: {publish_category_value}\nSummaryID: {res.summary_id}",
+                            f"Category: {cat}\nSummaryID: {res.summary_id}\nOpen hint: {open_hint or ''}".rstrip(),
                             max_chars=cfg.agent.max_reply_chars,
                         )
                     return safe_reply(
@@ -3134,8 +3225,15 @@ def _handle_comment(
             )
 
         if res.published:
+            cat = str(getattr(res, "category", "") or "").strip() or str(publish_category_value or "").strip()
+            open_hint = None
+            if isinstance(res.summary_id, str) and res.summary_id.strip():
+                prefix = "experiment" if cat == "Experiment" else "discussion"
+                open_hint = f"{prefix}:{res.summary_id.strip()}"
             return safe_reply(
-                f"Your circuit has been generated and published. SummaryID: {res.summary_id}\n"
+                f"Your circuit has been generated and published.\n"
+                f"Category: {cat}\nSummaryID: {res.summary_id}\nOpen hint: {open_hint or ''}".rstrip()
+                + "\n"
                 f"Introduction: {introduction}",
                 max_chars=cfg.agent.max_reply_chars,
             )
