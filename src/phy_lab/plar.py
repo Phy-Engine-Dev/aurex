@@ -148,6 +148,10 @@ def query_experiments(
     days: int | str | None = None,
     sort: int | str | None = None,
     user_id: str | None = None,
+    tags: list[str] | None = None,
+    exclude_tags: list[str] | None = None,
+    languages: list[str] | None = None,
+    exclude_languages: list[str] | None = None,
 ) -> list[dict[str, Any]]:
     # plweb2 typing hints suggest `Take` is effectively capped (commonly 24).
     # Some servers reject larger values with `Input.Field.Invalid`.
@@ -163,6 +167,14 @@ def query_experiments(
         from_skip = None
     if isinstance(user_id, str) and not user_id.strip():
         user_id = None
+    if tags is not None and not isinstance(tags, list):
+        raise PLARError("tags must be a list[str] or null")
+    if exclude_tags is not None and not isinstance(exclude_tags, list):
+        raise PLARError("exclude_tags must be a list[str] or null")
+    if languages is not None and not isinstance(languages, list):
+        raise PLARError("languages must be a list[str] or null")
+    if exclude_languages is not None and not isinstance(exclude_languages, list):
+        raise PLARError("exclude_languages must be a list[str] or null")
 
     def _sort_variants(v: int | str | None) -> list[int | str]:
         if v is None:
@@ -252,9 +264,10 @@ def query_experiments(
 
         def _post(
             *,
-            exclude_languages: Any,
-            exclude_tags: Any,
-            tags: Any,
+            exclude_languages_value: Any,
+            exclude_tags_value: Any,
+            tags_value: Any,
+            languages_value: Any,
             from_value: Any,
             skip_value: int,
             days_value: int | str,
@@ -265,11 +278,11 @@ def query_experiments(
                 json={
                     "Query": {
                         "Category": cat_val,
-                        "Languages": [],
+                        "Languages": languages_value,
                         # Some servers are picky about null vs [], so we allow retries.
-                        "ExcludeLanguages": exclude_languages,
-                        "Tags": tags,
-                        "ExcludeTags": exclude_tags,
+                        "ExcludeLanguages": exclude_languages_value,
+                        "Tags": tags_value,
+                        "ExcludeTags": exclude_tags_value,
                         "ModelTags": None,
                         "ModelID": None,
                         "ParentID": None,
@@ -296,15 +309,29 @@ def query_experiments(
             return resp.json()
 
         # Try to follow plweb2 first (null exclude fields).
-        exclude_variants = [
-            (None, None),
-            ([], None),
-            (None, []),
-            ([], []),
-        ]
-        # Many clients send Tags=null when no tag filtering is intended.
-        # Try None first for "all tags", then [] as a compatibility fallback.
-        tags_variants = [None, []]
+        exclude_lang_variants: list[Any]
+        if exclude_languages is not None:
+            exclude_lang_variants = [exclude_languages]
+        else:
+            exclude_lang_variants = [None, []]
+
+        exclude_tag_variants: list[Any]
+        if exclude_tags is not None:
+            exclude_tag_variants = [exclude_tags]
+        else:
+            exclude_tag_variants = [None, []]
+
+        lang_list = languages if languages is not None else []
+        language_variants: list[Any] = [lang_list, []] if lang_list else [[]]
+
+        # Many clients send Tags as [] when no tag filtering is intended.
+        # Some servers accept null; we keep a compatibility fallback when tags is not specified.
+        if tags is None:
+            tags_variants: list[Any] = [None, [], []]
+        else:
+            # If caller requested tags filtering, do not silently change semantics.
+            tags_variants = [tags]
+
         page_variants = [
             (from_skip, int(skip)),
             (None, int(skip)),
@@ -316,25 +343,28 @@ def query_experiments(
         days_variants = _days_variants(days)
         for from_value, skip_value in page_variants:
             for tags_value in tags_variants:
-                for ex_langs, ex_tags in exclude_variants:
-                    for days_value in days_variants:
-                        for sort_value in sort_variants:
-                            last = _post(
-                                exclude_languages=ex_langs,
-                                exclude_tags=ex_tags,
-                                tags=tags_value,
-                                from_value=from_value,
-                                skip_value=int(skip_value),
-                                days_value=days_value,
-                                sort_value=sort_value,
-                            )
-                            if not isinstance(last, dict):
-                                continue
-                            st = last.get("Status")
-                            msg = str(last.get("Message") or "")
-                            if st == 400 and ("Input." in msg and "Invalid" in msg):
-                                continue
-                            return last
+                for languages_value in language_variants:
+                    for ex_langs in exclude_lang_variants:
+                        for ex_tags in exclude_tag_variants:
+                            for days_value in days_variants:
+                                for sort_value in sort_variants:
+                                    last = _post(
+                                        exclude_languages_value=ex_langs,
+                                        exclude_tags_value=ex_tags,
+                                        tags_value=tags_value,
+                                        languages_value=languages_value,
+                                        from_value=from_value,
+                                        skip_value=int(skip_value),
+                                        days_value=days_value,
+                                        sort_value=sort_value,
+                                    )
+                                    if not isinstance(last, dict):
+                                        continue
+                                    st = last.get("Status")
+                                    msg = str(last.get("Message") or "")
+                                    if st == 400 and ("Input." in msg and "Invalid" in msg):
+                                        continue
+                                    return last
         return last
 
     # Prefer direct HTTP when possible to ensure request shape matches plweb2 (null vs []).
@@ -351,11 +381,11 @@ def query_experiments(
         try:
             result = qe(
                 category=category,
-                tags=[],
-                exclude_tags=None,
-                languages=[],
-                exclude_languages=None,
-                user_id=None,
+                tags=tags or [],
+                exclude_tags=exclude_tags,
+                languages=languages or [],
+                exclude_languages=exclude_languages,
+                user_id=user_id,
                 take=take,
                 skip=skip,
                 from_skip=from_skip,
@@ -486,6 +516,103 @@ def get_user_by_id(
     )
     resp.raise_for_status()
     return _extract_data(resp.json())
+
+
+def get_relations(
+    user: Any,
+    *,
+    user_id: str,
+    display_type: str = "Following",
+    skip: int = 0,
+    take: int = 20,
+    query: str = "",
+) -> list[dict[str, Any]]:
+    """Fetch user's followers/following list (best-effort).
+
+    display_type: "Follower" | "Following"
+    """
+    user_id = (user_id or "").strip()
+    if not user_id:
+        raise PLARError("user_id is empty")
+    display_type = (display_type or "Following").strip()
+    if display_type not in ("Follower", "Following"):
+        raise PLARError("display_type must be 'Follower' or 'Following'")
+    skip = int(skip)
+    if skip < 0:
+        skip = 0
+    take = int(take)
+    if take <= 0:
+        take = 20
+    if take > 100:
+        take = 100
+    query = (query or "").strip()
+
+    def _extract_users(result: Any) -> list[dict[str, Any]]:
+        if not isinstance(result, dict):
+            raise PLARError(f"Unexpected get_relations response type: {type(result).__name__}")
+        status = result.get("Status")
+        if status is not None:
+            try:
+                st = int(status)
+            except Exception:
+                st = None
+            if st is not None and st != 200:
+                msg = str(result.get("Message") or "").strip()
+                raise PLARError(f"GetRelations failed (status={st}): {msg}".rstrip())
+        data = result.get("Data")
+        if data is None and "data" in result:
+            data = result.get("data")
+
+        if isinstance(data, dict):
+            values = data.get("$values")
+            if isinstance(values, list):
+                return [x for x in values if isinstance(x, dict)]
+            # Some wrappers might return users under other keys.
+            for k in ("Users", "users", "Relations", "relations"):
+                v = data.get(k)
+                if isinstance(v, list):
+                    return [x for x in v if isinstance(x, dict)]
+        if isinstance(data, list):
+            return [x for x in data if isinstance(x, dict)]
+        return []
+
+    fn = getattr(user, "get_relations", None)
+    if callable(fn):
+        return _extract_users(
+            fn(user_id=user_id, display_type=display_type, skip=skip, take=take, query=query)
+        )
+
+    token = getattr(user, "token", None)
+    auth_code = getattr(user, "auth_code", None)
+    if not isinstance(token, str) or not token.strip() or not isinstance(auth_code, str) or not auth_code.strip():
+        raise PLARError("get_relations is not callable and token/auth_code are missing")
+    try:
+        import requests  # type: ignore
+    except ImportError as e:  # pragma: no cover
+        raise PLARError(
+            "Missing dependency: requests (required for Physics Lab API calls). "
+            "Install it with pip (e.g. 'pip install requests')."
+        ) from e
+
+    display_type_num = 0 if display_type == "Follower" else 1
+    resp = requests.post(
+        "https://physics-api-cn.turtlesim.com/Users/GetRelations",
+        json={
+            "UserID": user_id,
+            "DisplayType": display_type_num,
+            "Skip": skip,
+            "Take": take,
+            "Query": query,
+        },
+        headers={
+            "Content-Type": "application/json",
+            "x-API-Token": token,
+            "x-API-AuthCode": auth_code,
+        },
+        timeout=_requests_default_timeout_sec,
+    )
+    resp.raise_for_status()
+    return _extract_users(resp.json())
 
 
 def get_messages(

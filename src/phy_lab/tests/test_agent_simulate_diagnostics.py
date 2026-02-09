@@ -19,6 +19,7 @@ class _FakeOllama:
 
 class _Cfg:
     class _Agent:
+        mode = "traditional"
         system_prompt = "sys"
         max_reply_chars = 2000
         mention_tag = "@aurex"

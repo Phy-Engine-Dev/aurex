@@ -40,6 +40,10 @@ python src/phy_lab/agent.py init --config .phy_lab/config.json
 
 - `src/phy_lab/config.example.json`
 
+如果你使用 `gpt-oss:*` 模型，并希望强化推理质量，可以在 `ollama` 下开启：
+
+- `ollama.gptoss-optimization=true`（会注入 Harmony 风格头部 `reasoning: high`；不会改变工具/输出格式要求）
+
 ## 运行（推荐先 dry-run）
 
 单次轮询、不发帖（最安全）：
@@ -56,7 +60,10 @@ python src/phy_lab/agent.py run --config .phy_lab/config.json
 
 ## 评论区交互方式
 
-默认（更安全）：只要评论中包含配置的提及标签（默认 `@aurex`）就会触发回复，并以自然语言进行对话与工具调用。
+本项目支持两种模式（`agent.mode`）：
+
+- `agent`（推荐）：把每条触发的评论当作“代理任务”来完成（可多步调用站内查询/仿真/编译/联网搜索等），最终给出结论。
+- `traditional`：传统机器人模式（对话/总结/搜索/生成电路/仿真等），不提供代理接口。
 
 可选（调试/高级用户）：启用 `!command` 指令模式，需要在配置里设置：
 
@@ -78,6 +85,10 @@ python src/phy_lab/agent.py run --config .phy_lab/config.json
 - `agent.auto_web_search=true`（让模型自动判断何时需要联网搜索）
 
 当你选择 `duckduckgo-search` 时，需要安装依赖：`pip install duckduckgo-search`
+
+补充：物实社区不提供“全站关键词搜索”。因此站内定位/发现通常只能通过：
+- 列表型浏览（最新/最热门/精选）+ 人工筛选
+- 通过 ID/用户名直接定位（用户 ID、实验/讨论 ID）
 
 登录密码不建议写入配置文件。需要无人值守运行时，请使用环境变量（优先级最高）：
 - `PHY_LAB_PASSWORD` 或 `PHYSICSLAB_PASSWORD`
@@ -117,18 +128,19 @@ python src/phy_lab/agent.py run --config .phy_lab/config.json
 ```text
 @aurex 介绍一下这个实验
 @aurex summarize 这是一段很长的文章……
+@aurex agent 帮我先在站内搜索“运放”，再结合网页资料总结常见用法
 @aurex search 逻辑电路
 @aurex simulate V=5 R1=100ohm R2=200ohm
 @aurex 生成电路 帮我实现一个围棋 9x9 的输入输出接口……
 ```
 
-当启用 `agent.commands_enabled=true` 时，可用指令：
+当 `agent.mode=traditional` 且启用 `agent.commands_enabled=true` 时，可用指令：
 
 - `!help`：显示帮助
 - `!chat <内容>`：对话
 - `!summarize <文本>`：总结（请直接粘贴文本；当前不会自动抓取网页）
 - `!summarize`：当你在实验/讨论目标下使用时，会基于当前内容的上下文信息生成总结
-- `!search <关键词>`：搜索（仅对“近期作品”做 best-effort 扫描匹配，受 API 限制）
+- `!search <@用户名|uid:<id>|experiment:<id>|discussion:<id>>`：仅支持“定位/查询”（不支持关键词搜索）
 - `!circuit <需求>`：生成电路（Verilog→`.sav`），并在允许发布时自动发布
 - `!simulate <参数>`：直流仿真演示（目前支持 VDC + 两个电阻串联）
 
@@ -137,7 +149,8 @@ python src/phy_lab/agent.py run --config .phy_lab/config.json
 ```text
 @aurex !chat 解释一下 RC 低通的截止频率
 @aurex !summarize 这是一段很长的文章……
-@aurex !search 逻辑电路
+@aurex !search @someone
+@aurex !search experiment:0123456789abcdef01234567
 @aurex !simulate V=5 R1=100ohm R2=200ohm
 @aurex !circuit 帮我实现一个围棋 9x9 的输入输出接口……
 ```

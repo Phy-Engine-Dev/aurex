@@ -7,6 +7,7 @@ from dataclasses import dataclass, field
 from typing import Any, Literal, Sequence
 
 TargetType = Literal["User", "Experiment", "Discussion"]
+AgentMode = Literal["traditional", "agent"]
 
 DEFAULT_NOTIFICATION_CATEGORY_IDS: list[int] = [0, 3]
 DEFAULT_VERILOG2PLSAV_ARGS: list[str] = ["-O4", "--layout", "hier"]
@@ -72,6 +73,9 @@ class OllamaConfig:
     temperature: float = 0.2
     num_predict: int = 2048
     max_parallel_requests: int = 1
+    # Enable gpt-oss prompt tuning (Harmony-style header + high reasoning hint).
+    # This is applied client-side (does not require server support).
+    gptoss_optimization: bool = False
 
 
 @dataclass(frozen=True)
@@ -102,6 +106,7 @@ class TargetConfig:
 
 @dataclass(frozen=True)
 class AgentConfig:
+    mode: AgentMode = "agent"
     include_self_wall: bool = True
     poll_interval_sec: float = 15.0
     take: int = 20
@@ -287,6 +292,10 @@ def parse_config(data: dict[str, Any], *, source: str) -> Config:
     max_parallel_requests = _optional_int(
         ollama_obj.get("max_parallel_requests"), where="ollama.max_parallel_requests"
     )
+    gptoss_optimization = _optional_bool(
+        ollama_obj.get("gptoss-optimization", ollama_obj.get("gptoss_optimization")),
+        where="ollama.gptoss-optimization",
+    )
 
     endpoints = [u for u in (base_urls or []) if isinstance(u, str) and u.strip()]
     if not endpoints:
@@ -309,6 +318,9 @@ def parse_config(data: dict[str, Any], *, source: str) -> Config:
         temperature=temperature if temperature is not None else OllamaConfig.temperature,
         num_predict=num_predict if num_predict is not None else OllamaConfig.num_predict,
         max_parallel_requests=max_parallel_final,
+        gptoss_optimization=bool(gptoss_optimization)
+        if gptoss_optimization is not None
+        else OllamaConfig.gptoss_optimization,
     )
 
     storage_obj = _require_mapping(data.get("storage", {}), where="storage")
@@ -370,6 +382,7 @@ def parse_config(data: dict[str, Any], *, source: str) -> Config:
     )
 
     agent_obj = _require_mapping(data.get("agent", {}), where="agent")
+    mode = _optional_str(agent_obj.get("mode"), where="agent.mode")
     include_self_wall = _optional_bool(
         agent_obj.get("include_self_wall"), where="agent.include_self_wall"
     )
@@ -558,7 +571,15 @@ def parse_config(data: dict[str, Any], *, source: str) -> Config:
     if simulation_ai_max_probes is not None and simulation_ai_max_probes < 0:
         raise ConfigError("agent.simulation_ai_max_probes must be >= 0")
 
+    mode_final: AgentMode = AgentConfig.mode
+    if mode is not None:
+        m = mode.strip().lower()
+        if m not in ("traditional", "agent"):
+            raise ConfigError("agent.mode must be one of: traditional, agent")
+        mode_final = "agent" if m == "agent" else "traditional"
+
     agent = AgentConfig(
+        mode=mode_final,
         include_self_wall=include_self_wall
         if include_self_wall is not None
         else AgentConfig.include_self_wall,
@@ -723,6 +744,7 @@ def write_config(path: str, config: Config) -> None:
             "temperature": config.ollama.temperature,
             "num_predict": config.ollama.num_predict,
             "max_parallel_requests": config.ollama.max_parallel_requests,
+            "gptoss-optimization": bool(getattr(config.ollama, "gptoss_optimization", False)),
         },
         "storage": {
             "cache_dir": config.storage.cache_dir,
@@ -741,6 +763,7 @@ def write_config(path: str, config: Config) -> None:
             "run_timeout_sec": config.phy_engine.run_timeout_sec,
         },
         "agent": {
+            "mode": config.agent.mode,
             "include_self_wall": config.agent.include_self_wall,
             "poll_interval_sec": config.agent.poll_interval_sec,
             "take": config.agent.take,
@@ -807,12 +830,15 @@ def init_config_interactive(path: str, *, overwrite: bool = False) -> None:
         or "http://127.0.0.1:11434"
     )
     mention_tag = input("Mention tag (default: @aurex): ").strip() or "@aurex"
+    mode = input("Agent mode (agent|traditional, default: agent): ").strip().lower() or "agent"
+    if mode not in ("agent", "traditional"):
+        mode = "agent"
 
     config = Config(
         schema_version=1,
         account=AccountConfig(email=email, password=None),
         ollama=OllamaConfig(base_url=base_url, model=model),
-        agent=AgentConfig(mention_tag=mention_tag),
+        agent=AgentConfig(mention_tag=mention_tag, mode=mode),  # type: ignore[arg-type]
     )
     write_config(path, config)
 

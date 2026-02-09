@@ -25,6 +25,7 @@ class _FakeOllama:
 
 class _Cfg:
     class _Agent:
+        mode = "traditional"
         system_prompt = "sys"
         max_reply_chars = 2000
         mention_tag = "@aurex"
@@ -40,36 +41,36 @@ class _Cfg:
 
 
 class TestAgentSearchFlow(unittest.TestCase):
-    def test_search_command_calls_llm_to_summarize_hits(self):
-        ollama = _FakeOllama()
-
-        def _fake_hits(**_kw):
-            return [{"ID": "abc", "Subject": "S"}]
+    def test_search_command_does_not_keyword_search(self):
+        # search/find are lookup-only; ensure we never call the legacy recent-scan search.
+        def _fake_get_user(_user, *, name):
+            return {"User": {"ID": "u1", "Nickname": name}}
 
         comment = {"Content": "!search opamp"}
-        with mock.patch.object(agent_mod, "search_recent_experiments", side_effect=_fake_hits):
-            out = agent_mod._handle_comment(
-                comment=comment,
-                user=object(),
-                ollama=ollama,
-                cache_dir="cache",
-                config_base_dir=".",
-                cfg=_Cfg(),
-                dry_run=True,
-                logger=agent_mod.logging.getLogger("t"),
-                conversation_key=None,
-                experiment_context=None,
-                history=[],
-            )
-        self.assertEqual(out, "OK")
-        # Ensure LLM got results JSON in system message.
-        blob = "\n".join(m.get("content", "") for m in ollama.calls[-1] if m.get("role") == "system")
-        self.assertIn("Internal Physics Lab search results", blob)
-        self.assertIn("abc", blob)
+        with mock.patch.object(
+            agent_mod, "search_recent_experiments", side_effect=AssertionError("keyword search should not run")
+        ):
+            with mock.patch.object(agent_mod, "get_user_by_name", side_effect=_fake_get_user):
+                out = agent_mod._handle_comment(
+                    comment=comment,
+                    user=object(),
+                    ollama=_FakeOllama(),
+                    cache_dir="cache",
+                    config_base_dir=".",
+                    cfg=_Cfg(),
+                    dry_run=True,
+                    logger=agent_mod.logging.getLogger("t"),
+                    conversation_key=None,
+                    experiment_context=None,
+                    history=[],
+                )
+        self.assertIn("Nickname: opamp", out)
+        self.assertIn("ID: u1", out)
 
     def test_auto_routed_user_search_returns_user_info(self):
         class _Cfg2:
             class _Agent:
+                mode = "traditional"
                 system_prompt = "sys"
                 max_reply_chars = 2000
                 mention_tag = "@aurex"
@@ -114,6 +115,7 @@ class TestAgentSearchFlow(unittest.TestCase):
     def test_search_command_at_user_queries_user_api(self):
         class _Cfg3:
             class _Agent:
+                mode = "traditional"
                 system_prompt = "sys"
                 max_reply_chars = 2000
                 mention_tag = "@aurex"
@@ -150,6 +152,7 @@ class TestAgentSearchFlow(unittest.TestCase):
     def test_auto_routed_search_is_ignored_without_explicit_search_intent(self):
         class _Cfg2:
             class _Agent:
+                mode = "traditional"
                 system_prompt = "sys"
                 max_reply_chars = 2000
                 mention_tag = "@aurex"
@@ -194,6 +197,7 @@ class TestAgentSearchFlow(unittest.TestCase):
     def test_circuit_command_defaults_to_discussion_category(self):
         class _Cfg4:
             class _Agent:
+                mode = "traditional"
                 system_prompt = "sys"
                 max_reply_chars = 2000
                 mention_tag = "@aurex"

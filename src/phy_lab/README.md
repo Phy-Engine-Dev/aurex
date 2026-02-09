@@ -1,6 +1,6 @@
 # phy_lab (Industrial Auto-Reply Agent for Physics Lab AR)
 
-`phy_lab` is a Python agent that logs into a Physics Lab AR account, monitors comment boards, and replies using a local Ollama model. It can also run tool workflows (summarization, basic experiment search, and optional Verilog→`.sav` generation via Phy-Engine).
+`phy_lab` is a Python agent that logs into a Physics Lab AR account, monitors comment boards, and replies using a local Ollama model. It can also run tool workflows (summarization, ID/user lookup + list browsing, and optional Verilog→`.sav` generation via Phy-Engine).
 
 This repository vendors `physicsLab` under `third-parties/physicsLab` and a CMake-buildable `Phy-Engine` under `third-parties/Phy-Engine`. `phy_lab` treats both as dependencies and keeps its own runtime artifacts in a controlled cache directory.
 
@@ -69,6 +69,8 @@ Key settings:
 
 - `account.email`: login email (password is prompted at runtime)
 - `ollama.base_url`, `ollama.model`: Ollama endpoint/model
+- `ollama.gptoss-optimization`: when using `gpt-oss:*` models, inject a small Harmony-style header (`reasoning: high`) to improve reasoning without changing tool/output rules (default: `false`)
+- `agent.mode`: `agent` | `traditional` (default: `agent`). `agent` treats every triggered comment as an agent task; `traditional` uses the older chat/summarize/search tool routing and does not expose agent mode.
 - `agent.require_mention`: when `true`, only replies to comments that contain `agent.mention_tag` (and optionally commands if enabled)
 - `agent.user_targets_require_mention`: override mention requirement for `User:*` targets (default: `true`; set `false` for chat-like message boards)
 - Trigger note: even with `require_mention=true`, the agent will reply when a comment is a direct reply to the agent account (i.e., comment `ReplyID` matches the agent `UserID`).
@@ -83,6 +85,7 @@ Key settings:
 - `agent.auto_web_search`: let the LLM decide when to use web search (default: `true`, only effective when `web_search_enabled=true`)
 - `agent.web_search_fallback_to_ddg`: fallback to DuckDuckGo when Google is blocked/captcha (default: `true`)
 - `agent.auto_tool_routing`: let the LLM route natural language requests to tools (default: `true`)
+- Note on PLAR discovery: Physics Lab does not provide a full keyword search. Use list views (latest/hot/featured) and then open items by ID; `search` is lookup-only (user name/ID, experiment/discussion ID).
 - `agent.enable_publish`: allow publishing generated experiments (default: `false`)
 - `agent.auto_publish`: allow the LLM to publish when user explicitly requests it (default: `false`; requires `enable_publish=true`)
 - `agent.circuit_max_attempts`: max compile retries for circuit generation (default: `3`)
@@ -107,24 +110,28 @@ Debug commands (require login):
 
 ## Comment Interface
 
-Default mode is natural language only: mention the agent and ask directly.
+This agent supports two modes (`agent.mode`):
 
-Optional command mode exists for debugging and power users (`agent.commands_enabled=true`).
+- **`agent` (recommended)**: every triggered comment is treated as a multi-step agent task (may use tools, PLAR queries, and optional web search) and ends with a final answer.
+- **`traditional`**: classic bot mode with chat/summarize/search/circuit/simulate handlers (no agent autopilot).
 
 Supported interactions (natural language):
 
-- `@aurex <question>` — chat with full page context (when on Experiment/Discussion)
-- `@aurex summarize <text>` — summarize
-- `@aurex search <query>` — search recent experiments (best effort)
-- `@aurex simulate V=5 R1=100ohm R2=200ohm` — DC simulation demo (requires `phy_engine.auto_build=true` or `phy_engine.phyengine_lib_path`)
-- `@aurex generate circuit <spec>` / `@aurex circuit <spec>` — generate Verilog + `.sav` (publishing requires explicit enablement in config)
+- In `agent` mode: `@aurex <task>` (or `@aurex agent <task>`) — multi-step tool agent and final answer.
+- In `traditional` mode:
+  - `@aurex <question>` — chat with full page context (when on Experiment/Discussion)
+  - `@aurex summarize <text>` — summarize
+  - `@aurex search <@name|uid:<id>|experiment:<id>|discussion:<id>>` — lookup only (no keyword search)
+  - `@aurex simulate V=5 R1=100ohm R2=200ohm` — DC simulation demo (requires `phy_engine.auto_build=true` or `phy_engine.phyengine_lib_path`)
+  - `@aurex generate circuit <spec>` / `@aurex circuit <spec>` — generate Verilog + `.sav` (publishing requires explicit enablement in config)
 - `@aurex google <query>` — web search + answer (uses `agent.web_search_provider`; requires `agent.web_search_enabled=true`)
 
 Examples:
 
 - `@aurex Explain RC cutoff frequency`
 - `@aurex Summarize this experiment`
-- `@aurex search logic circuit`
+- `@aurex search @someone`
+- `@aurex search experiment:0123456789abcdef01234567`
 - `@aurex generate circuit Build a 9x9 Go board input/output interface`
 
 If you enable command mode (`agent.commands_enabled=true`), `!help`, `!chat`, `!summarize`, `!search`, `!circuit`, `!simulate` are also available.

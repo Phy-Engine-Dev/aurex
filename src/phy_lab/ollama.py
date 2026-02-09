@@ -28,6 +28,31 @@ class OllamaClient:
     timeout_sec: int = 120
     temperature: float = 0.2
     num_predict: int = 2048
+    gptoss_optimization: bool = False
+
+    def _apply_gptoss_optimization(self, messages: list[dict[str, str]]) -> list[dict[str, str]]:
+        if not self.gptoss_optimization:
+            return messages
+        model_low = (self.model or "").casefold()
+        if "gpt-oss" not in model_low:
+            return messages
+        # Avoid duplicating the header if the caller already inserted it.
+        if messages:
+            m0 = messages[0]
+            if isinstance(m0, dict) and m0.get("role") == "system":
+                c0 = str(m0.get("content") or "")
+                if "reasoning: high" in c0 and "harmony" in c0.casefold():
+                    return messages
+        header = (
+            "Harmony\n"
+            "reasoning: high\n"
+            "\n"
+            "Guidance:\n"
+            "- Do thorough internal reasoning.\n"
+            "- Do NOT reveal chain-of-thought.\n"
+            "- Follow all formatting/output instructions in later system messages.\n"
+        )
+        return [{"role": "system", "content": header}] + list(messages)
 
     def chat(self, *, messages: list[dict[str, str]]) -> str:
         try:
@@ -40,7 +65,7 @@ class OllamaClient:
         url = f"{self.base_url.rstrip('/')}/api/chat"
         payload: dict[str, Any] = {
             "model": self.model,
-            "messages": messages,
+            "messages": self._apply_gptoss_optimization(list(messages or [])),
             "stream": False,
             "options": {"temperature": self.temperature, "num_predict": int(self.num_predict)},
         }

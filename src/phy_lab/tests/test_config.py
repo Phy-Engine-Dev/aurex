@@ -81,6 +81,7 @@ class TestConfig(unittest.TestCase):
                     "base_urls": ["127.0.0.1:11434", "127.0.0.1:11435"],
                     "model": "gpt-oss:latest",
                     "max_parallel_requests": 2,
+                    "gptoss-optimization": True,
                 },
                 "agent": {"targets": []},
             },
@@ -89,6 +90,7 @@ class TestConfig(unittest.TestCase):
         self.assertEqual(cfg.ollama.base_url, "http://127.0.0.1:11434")
         self.assertEqual(cfg.ollama.base_urls, ["http://127.0.0.1:11434", "http://127.0.0.1:11435"])
         self.assertEqual(cfg.ollama.max_parallel_requests, 2)
+        self.assertEqual(cfg.ollama.gptoss_optimization, True)
 
     def test_parse_web_search_provider_duckduckgo_search_alias(self):
         cfg = parse_config(

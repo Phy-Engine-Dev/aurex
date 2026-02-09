@@ -107,8 +107,16 @@ def _http_get_text(
             return raw.decode("utf-8", errors="replace")
 
 
-def render_help(*, command_prefix: str) -> str:
+def render_help(*, command_prefix: str, mode: str = "traditional") -> str:
     p = command_prefix or "!"
+    mode = (mode or "traditional").strip().lower()
+    if mode == "agent":
+        return (
+            "Supported interactions:\n"
+            "- Mention the agent and describe your task (agent mode):\n"
+            f"  - {p}agent <task>\n"
+            f"  - {p}help\n"
+        )
     return (
         "Supported interactions:\n"
         "- Mention the agent and ask naturally, e.g. '@aurex introduce this experiment'.\n"
@@ -116,7 +124,7 @@ def render_help(*, command_prefix: str) -> str:
         f"  - {p}help\n"
         f"  - {p}chat <text>\n"
         f"  - {p}summarize <text>\n"
-        f"  - {p}search <query>\n"
+        f"  - {p}search <@name|uid:<id>|experiment:<id>|discussion:<id>>  (lookup only; no keyword search)\n"
         f"  - {p}circuit <spec>  (optional publish; requires config enablement)\n"
         f"  - {p}simulate <spec>  (DC series VDC+2R demo)\n"
         f"  - {p}google <query>  (optional web search)\n"

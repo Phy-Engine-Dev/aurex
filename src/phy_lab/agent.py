@@ -47,6 +47,7 @@ from plar import (  # noqa: E402
     get_comments,
     get_experiment_context,
     get_messages,
+    get_relations,
     get_user_by_id,
     get_user_by_name,
     get_status_save,
@@ -161,6 +162,7 @@ def _safe_at_mention(handle: str) -> str | None:
 
 
 _AT_HANDLE_RE = re.compile(r"(?:@|＠)\s*([^\s:：]{1,64})")
+_HEX24_RE = re.compile(r"^[0-9a-fA-F]{24}$")
 
 
 def _extract_safe_mentions(text: str) -> list[str]:
@@ -364,6 +366,64 @@ def _is_probable_user_not_found_error(e: BaseException) -> bool:
     msg = (str(e) or "").casefold()
     return ("status=404" in msg) or ("notfound" in msg) or ("not found" in msg)
 
+def _is_probable_content_not_found_error(e: BaseException) -> bool:
+    msg = (str(e) or "").casefold()
+    return ("content.not.found" in msg) or ("status=404" in msg) or ("not found" in msg)
+
+def _parse_plar_lookup_query(query: str) -> dict[str, str]:
+    """Parse a restricted PLAR lookup query.
+
+    Supported:
+      - user name: @name, user:<name>, 用户:<name>
+      - user id: uid:<id>, user_id:<id>, 用户id:<id>
+      - content id: experiment:<id>, discussion:<id>, 实验:<id>, 讨论:<id>, or a bare 24-hex ID (treated as content id)
+
+    Returns a dict with keys:
+      - kind: user_name|user_id|content_id
+      - value: normalized lookup key
+      - category: Experiment|Discussion|both (only for content_id)
+    """
+    q = (query or "").strip()
+    if not q:
+        return {"kind": "user_name", "value": ""}
+
+    # @user
+    if q.startswith(("@", "＠")):
+        return {"kind": "user_name", "value": q[1:].strip()}
+
+    low = q.casefold()
+
+    def _split_after_prefix(prefixes: tuple[str, ...]) -> str | None:
+        for p in prefixes:
+            if low.startswith(p):
+                return q[len(p) :].strip()
+        return None
+
+    # user name
+    name = _split_after_prefix(("user:", "user ", "用户:", "用户 ", "nickname:", "name:"))
+    if name is not None:
+        return {"kind": "user_name", "value": name}
+
+    # user id
+    uid = _split_after_prefix(("uid:", "uid ", "user_id:", "user_id ", "userid:", "用户id:", "用户id ", "用户id：", "用户id "))
+    if uid is not None:
+        return {"kind": "user_id", "value": uid}
+
+    # content id (explicit)
+    exp_id = _split_after_prefix(("experiment:", "experiment ", "exp:", "exp ", "实验:", "实验 ", "实验："))
+    if exp_id is not None:
+        return {"kind": "content_id", "value": exp_id, "category": "Experiment"}
+    disc_id = _split_after_prefix(("discussion:", "discussion ", "disc:", "disc ", "讨论:", "讨论 ", "讨论："))
+    if disc_id is not None:
+        return {"kind": "content_id", "value": disc_id, "category": "Discussion"}
+
+    # bare id (prefer treating as content id)
+    if _HEX24_RE.match(q) is not None:
+        return {"kind": "content_id", "value": q, "category": "both"}
+
+    # Fallback: treat as user name (NOT keyword search).
+    return {"kind": "user_name", "value": q}
+
 
 def _render_simulation_failure(
     *,
@@ -426,6 +486,871 @@ def _try_parse_json_object(text: str) -> dict[str, Any] | None:
     return obj if isinstance(obj, dict) else None
 
 
+def _agent_parse_tool_call(raw: str) -> tuple[str, dict[str, Any], str]:
+    """Parse a tool call JSON from the LLM.
+
+    Returns (tool_name, args, final_text).
+    - For non-end tools, final_text is "".
+    - For tool=end, args may be empty and final_text carries the intended reply.
+    """
+    obj = _try_parse_json_object(raw)
+    if not obj:
+        raise ValueError("no JSON tool call found")
+
+    tool = obj.get("tool") or obj.get("name") or obj.get("action")
+    if not isinstance(tool, str) or not tool.strip():
+        raise ValueError("missing tool name")
+    tool = tool.strip()
+
+    args = obj.get("args")
+    if not isinstance(args, dict):
+        args = {}
+
+    final = ""
+    if tool == "end":
+        for k in ("final", "answer", "content", "message", "text"):
+            v = obj.get(k)
+            if isinstance(v, str) and v.strip():
+                final = v.strip()
+                break
+    return tool, args, final
+
+
+def _agent_tool_prompt(*, max_seconds: int) -> str:
+    tool_cutoff_seconds = max(0, int(max_seconds) - 60)
+    return (
+        "You are running in AGENT MODE (multi-step tool use).\n"
+        f"Time budget: {int(max_seconds)} seconds.\n"
+        f"Tool-call cutoff: after {tool_cutoff_seconds} seconds, tool calls are DISABLED; the last 60 seconds are reserved for final reasoning.\n"
+        "\n"
+        "How to use tools:\n"
+        "- To call a tool, output STRICT JSON only, no prose. Schema:\n"
+        "  {\"tool\":\"<name>\",\"args\":{...}}\n"
+        "- When you are ready to reply to the user, end by calling:\n"
+        "  {\"tool\":\"end\",\"final\":\"...\"}\n"
+        "\n"
+        "Available tools:\n"
+        "- web_search {query:str}\n"
+        "- search_plar {query:str}  (LOOKUP ONLY: user name/id, or experiment/discussion id; NOT keyword search)\n"
+        "- list_plar {kind:str, ...}\n"
+        "- plar_query_experiments {category:str, take?:int, skip?:int, days?:int, sort?:str}\n"
+        "- plar_get_user_by_name {name:str}\n"
+        "- plar_get_user_by_id {user_id:str}\n"
+        "- plar_get_experiment_context {summary_id:str, category:str}\n"
+        "- plar_get_status_save {summary_id:str, category:str}\n"
+        "- plar_get_comments {target_type:str, target_id:str, take?:int, skip?:int}\n"
+        "- simulate {text:str}\n"
+        "- simulate_verilog {text:str}\n"
+        "- simulate_status_save {summary_id:str, category:str, question?:str}\n"
+        "- circuit {spec:str, publish?:bool}\n"
+        "- end {final:str}\n"
+        "\n"
+        "Tool policies:\n"
+        "- If 'Context JSON (current page)' is present, use it directly; do NOT ask the user to provide context.\n"
+        "- Only use web_search when needed for external/up-to-date info.\n"
+        "- Never produce political content.\n"
+        "- Physics Lab search limitation: do NOT assume a true keyword search exists.\n"
+        "  - Use search_plar ONLY to LOOKUP by user name/id or content id.\n"
+        "  - For discovery, use list_plar (latest/hot/featured/following/followers) and then open by ID.\n"
+        "- Publishing is only allowed when the user explicitly asks AND config enables it; otherwise keep publish=false.\n"
+        "- Prefer concise outputs; keep tool args minimal.\n"
+        "\n"
+        "list_plar kinds (examples):\n"
+        "- {\"tool\":\"list_plar\",\"args\":{\"kind\":\"latest\",\"category\":\"both\",\"take\":10}}\n"
+        "- {\"tool\":\"list_plar\",\"args\":{\"kind\":\"hot\",\"category\":\"Experiment\",\"days\":14,\"take\":10}}\n"
+        "- {\"tool\":\"list_plar\",\"args\":{\"kind\":\"featured\",\"category\":\"Discussion\",\"take\":10}}\n"
+        "- {\"tool\":\"list_plar\",\"args\":{\"kind\":\"following\",\"take\":50}}\n"
+        "- {\"tool\":\"list_plar\",\"args\":{\"kind\":\"followers\",\"take\":50}}\n"
+        "- {\"tool\":\"list_plar\",\"args\":{\"kind\":\"staff\"}}  (filters your following list by Verification)\n"
+    )
+
+
+def _agent_tool_result_message(*, tool: str, result: str) -> dict[str, str]:
+    # Keep tool output bounded to avoid blowing up prompt size.
+    return {
+        "role": "system",
+        "content": f"Tool result ({tool}):\n" + truncate(str(result or ""), max_chars=8000),
+    }
+
+
+def _agent_execute_tool(
+    *,
+    tool: str,
+    args: dict[str, Any],
+    user: Any,
+    ollama: OllamaClient,
+    cfg: Any,
+    cache_dir: str,
+    config_base_dir: str,
+    dry_run: bool,
+    context_json: dict[str, Any] | None,
+    logger: logging.Logger,
+) -> str:
+    try:
+        tool = (tool or "").strip()
+        args = args or {}
+
+        if tool == "web_search":
+            query = str(args.get("query") or "").strip()
+            if not query:
+                return "ERROR: missing args.query"
+            if _looks_political_sensitive(query):
+                return _political_refusal_message(query)
+            if not bool(getattr(cfg.agent, "web_search_enabled", False)):
+                return "ERROR: web_search disabled (set agent.web_search_enabled=true)"
+            return web_search(
+                query=query,
+                cache_dir=cache_dir,
+                provider=str(getattr(cfg.agent, "web_search_provider", "google") or "google"),
+                proxy=str(getattr(cfg.agent, "web_search_proxy", "") or ""),
+                timeout_sec=int(getattr(cfg.agent, "web_search_timeout_sec", 20) or 20),
+                ttl_sec=int(getattr(cfg.agent, "web_search_cache_ttl_sec", 3600) or 3600),
+                max_results=int(getattr(cfg.agent, "web_search_max_results", 5) or 5),
+                fallback_to_ddg=bool(getattr(cfg.agent, "web_search_fallback_to_ddg", True)),
+                user_agent=str(getattr(cfg.agent, "web_search_user_agent", "") or ""),
+                searxng_base_url=str(getattr(cfg.agent, "web_search_searxng_base_url", "") or ""),
+            )
+
+        if tool == "search_plar":
+            query = str(args.get("query") or "").strip()
+            if not query:
+                return "ERROR: missing args.query"
+            if _looks_political_sensitive(query):
+                return _political_refusal_message(query)
+            spec = _parse_plar_lookup_query(query)
+            kind = spec.get("kind")
+            value = (spec.get("value") or "").strip()
+            if kind == "user_name":
+                if not value:
+                    return "ERROR: empty user name"
+                try:
+                    data = get_user_by_name(user, name=value)
+                except Exception as e:
+                    if _is_probable_user_not_found_error(e):
+                        return "No user found."
+                    return f"Lookup failed: {_format_exception_brief(e)}"
+                u = data.get("User") if isinstance(data, dict) else None
+                if not isinstance(u, dict):
+                    return "No user found."
+                out = {
+                    "type": "user",
+                    "id": best_effort_extract_text(u.get("ID"))
+                    or best_effort_extract_text(u.get("UserID"))
+                    or None,
+                    "nickname": best_effort_extract_text(u.get("Nickname")) or None,
+                    "verification": best_effort_extract_text(u.get("Verification")) or None,
+                    "signature": best_effort_extract_text(u.get("Signature")) or None,
+                }
+                return json.dumps(out, ensure_ascii=False, indent=2)
+
+            if kind == "user_id":
+                if not value:
+                    return "ERROR: empty user_id"
+                try:
+                    data = get_user_by_id(user, user_id=value)
+                except Exception as e:
+                    if _is_probable_user_not_found_error(e):
+                        return "No user found."
+                    return f"Lookup failed: {_format_exception_brief(e)}"
+                u = data.get("User") if isinstance(data, dict) else None
+                if not isinstance(u, dict):
+                    return "No user found."
+                out = {
+                    "type": "user",
+                    "id": best_effort_extract_text(u.get("ID"))
+                    or best_effort_extract_text(u.get("UserID"))
+                    or None,
+                    "nickname": best_effort_extract_text(u.get("Nickname")) or None,
+                    "verification": best_effort_extract_text(u.get("Verification")) or None,
+                    "signature": best_effort_extract_text(u.get("Signature")) or None,
+                }
+                return json.dumps(out, ensure_ascii=False, indent=2)
+
+            if kind == "content_id":
+                if not value:
+                    return "ERROR: empty content id"
+                category = (spec.get("category") or "both").strip()
+                tried: list[str] = []
+                last_err: BaseException | None = None
+
+                def _try(cat: str) -> dict[str, Any] | None:
+                    nonlocal last_err
+                    tried.append(cat)
+                    try:
+                        ctx = get_experiment_context(
+                            user,
+                            summary_id=value,
+                            category_value=cat,
+                            cache_dir=cache_dir,
+                            ttl_sec=300,
+                        )
+                    except Exception as e:
+                        last_err = e
+                        return None
+                    if not isinstance(ctx, dict):
+                        return None
+                    subj = best_effort_extract_text(ctx.get("subject") or ctx.get("Subject") or ctx.get("title"))
+                    return {
+                        "type": "content",
+                        "id": value,
+                        "category": cat,
+                        "subject": subj or None,
+                    }
+
+                if category == "Experiment":
+                    hit = _try("Experiment")
+                    if hit is not None:
+                        return json.dumps(hit, ensure_ascii=False, indent=2)
+                elif category == "Discussion":
+                    hit = _try("Discussion")
+                    if hit is not None:
+                        return json.dumps(hit, ensure_ascii=False, indent=2)
+                else:
+                    hit = _try("Experiment")
+                    if hit is not None:
+                        return json.dumps(hit, ensure_ascii=False, indent=2)
+                    hit = _try("Discussion")
+                    if hit is not None:
+                        return json.dumps(hit, ensure_ascii=False, indent=2)
+
+                if last_err is not None and _is_probable_content_not_found_error(last_err):
+                    return json.dumps(
+                        {"type": "content", "id": value, "found": False, "tried": tried},
+                        ensure_ascii=False,
+                        indent=2,
+                    )
+                return f"Lookup failed: {_format_exception_brief(last_err) if last_err is not None else 'unknown error'}"
+
+            return "ERROR: unsupported search_plar query (lookup only)"
+
+        if tool == "list_plar":
+            kind = str(args.get("kind") or "").strip().lower()
+            if not kind:
+                return "ERROR: missing args.kind"
+
+            def _parse_tags(v: Any) -> list[str] | None:
+                if v is None:
+                    return None
+                if isinstance(v, list):
+                    out = []
+                    for x in v:
+                        s = str(x or "").strip()
+                        if s:
+                            out.append(s)
+                    return out
+                s = str(v or "").strip()
+                if not s:
+                    return None
+                if "," in s:
+                    return [p.strip() for p in s.split(",") if p.strip()]
+                return [s]
+
+            def _compact(items: list[dict[str, Any]]) -> dict[str, Any]:
+                compact: list[dict[str, Any]] = []
+                last_id: str | None = None
+                for it in items:
+                    if not isinstance(it, dict):
+                        continue
+                    sid = best_effort_extract_text(it.get("ID")) or best_effort_extract_text(it.get("Id"))
+                    if sid:
+                        last_id = sid
+                    compact.append(
+                        {
+                            "id": sid,
+                            "category": best_effort_extract_text(it.get("Category")) or None,
+                            "subject": best_effort_extract_text(it.get("Subject"))
+                            or best_effort_extract_text(it.get("Title"))
+                            or None,
+                            "user_id": best_effort_extract_text(it.get("UserID")) or None,
+                            "tags": it.get("Tags") if isinstance(it.get("Tags"), list) else None,
+                        }
+                    )
+                return {"items": compact, "next_from": last_id}
+
+            # QueryExperiments-backed lists (plweb2-aligned).
+            if kind in (
+                "latest",
+                "latest_experiments",
+                "new",
+                "recent",
+                "hot",
+                "popular",
+                "hot_experiments",
+                "popular_experiments",
+                "featured",
+                "精选",
+                "random",
+            ):
+                category = str(args.get("category") or "").strip()
+                if not category:
+                    category = "Discussion" if kind in ("featured", "精选") else "Experiment"
+                take = int(args.get("take") or 10)
+                skip = int(args.get("skip") or 0)
+                from_id = str(args.get("from") or args.get("from_skip") or "").strip() or None
+                days = args.get("days")
+                days_i = None
+                if days is not None:
+                    try:
+                        days_i = int(days)
+                    except Exception:
+                        days_i = None
+                if take < 1:
+                    take = 10
+                if take > 24:
+                    take = 24
+                if skip < 0:
+                    skip = 0
+
+                user_id = str(args.get("user_id") or "").strip() or None
+                tags = _parse_tags(args.get("tags"))
+                if tags is None:
+                    tags = []
+                sort: int | str | None
+                if kind in ("hot", "popular", "hot_experiments", "popular_experiments"):
+                    sort = "Popularity"
+                elif kind in ("random",):
+                    sort = "Random"
+                else:
+                    sort = "Default"
+
+                if kind in ("featured", "精选") and not tags:
+                    tags = ["精选"]
+
+                def _query(cat: str) -> dict[str, Any]:
+                    items = query_experiments(
+                        user,
+                        category=cat,
+                        take=take,
+                        skip=skip,
+                        from_skip=from_id,
+                        days=days_i,
+                        sort=sort,
+                        user_id=user_id,
+                        tags=tags,
+                    )
+                    obj = _compact(items)
+                    obj.update({"category": cat, "take": take, "skip": skip, "from": from_id, "sort": sort, "days": days_i, "user_id": user_id, "tags": tags})
+                    # plweb2 pagination typically uses skip += Take and from = last.ID
+                    obj["next_skip"] = skip + min(len(obj.get("items") or []), take)
+                    return obj
+
+                if category.lower() in ("both", "all", "*"):
+                    out = {"kind": kind, "category": "both", "experiment": _query("Experiment"), "discussion": _query("Discussion")}
+                    return json.dumps(out, ensure_ascii=False, indent=2)
+
+                out = {"kind": kind, **_query(category)}
+                return json.dumps(out, ensure_ascii=False, indent=2)
+
+            # Relations lists.
+            if kind in ("following", "关注", "followings"):
+                uid = str(args.get("user_id") or getattr(user, "user_id", "") or "").strip()
+                if not uid:
+                    return "ERROR: missing user_id and current user_id is unavailable"
+                take = int(args.get("take") or 50)
+                skip = int(args.get("skip") or 0)
+                query = str(args.get("query") or "").strip()
+                users = get_relations(user, user_id=uid, display_type="Following", skip=skip, take=take, query=query)
+                compact = []
+                for u in users[:take]:
+                    compact.append(
+                        {
+                            "id": best_effort_extract_text(u.get("ID")) or best_effort_extract_text(u.get("UserID")) or None,
+                            "nickname": best_effort_extract_text(u.get("Nickname")) or best_effort_extract_text(u.get("Name")) or None,
+                            "verification": best_effort_extract_text(u.get("Verification")) or None,
+                        }
+                    )
+                return json.dumps(compact, ensure_ascii=False, indent=2)
+
+            if kind in ("followers", "粉丝", "follower"):
+                uid = str(args.get("user_id") or getattr(user, "user_id", "") or "").strip()
+                if not uid:
+                    return "ERROR: missing user_id and current user_id is unavailable"
+                take = int(args.get("take") or 50)
+                skip = int(args.get("skip") or 0)
+                query = str(args.get("query") or "").strip()
+                users = get_relations(user, user_id=uid, display_type="Follower", skip=skip, take=take, query=query)
+                compact = []
+                for u in users[:take]:
+                    compact.append(
+                        {
+                            "id": best_effort_extract_text(u.get("ID")) or best_effort_extract_text(u.get("UserID")) or None,
+                            "nickname": best_effort_extract_text(u.get("Nickname")) or best_effort_extract_text(u.get("Name")) or None,
+                            "verification": best_effort_extract_text(u.get("Verification")) or None,
+                        }
+                    )
+                return json.dumps(compact, ensure_ascii=False, indent=2)
+
+            if kind in ("staff", "admins", "admin", "管理员"):
+                uid = str(args.get("user_id") or getattr(user, "user_id", "") or "").strip()
+                if not uid:
+                    return "ERROR: missing user_id and current user_id is unavailable"
+                take = int(args.get("take") or 80)
+                users = get_relations(user, user_id=uid, display_type="Following", skip=0, take=take, query="")
+                staff = []
+                for u in users:
+                    ver = best_effort_extract_text(u.get("Verification"))
+                    if ver in ("Volunteer", "Editor", "Emeritus", "Administrator"):
+                        staff.append(
+                            {
+                                "id": best_effort_extract_text(u.get("ID")) or best_effort_extract_text(u.get("UserID")) or None,
+                                "nickname": best_effort_extract_text(u.get("Nickname")) or best_effort_extract_text(u.get("Name")) or None,
+                                "verification": ver,
+                            }
+                        )
+                return json.dumps(staff, ensure_ascii=False, indent=2)
+
+            return "ERROR: unknown list_plar kind (try: latest|hot|featured|random|following|followers|staff)"
+
+        if tool == "plar_query_experiments":
+            category = str(args.get("category") or "").strip() or "Experiment"
+            take = int(args.get("take") or 20)
+            skip = int(args.get("skip") or 0)
+            days = args.get("days")
+            sort = str(args.get("sort") or "").strip() or None
+            days_i = None
+            if days is not None:
+                try:
+                    days_i = int(days)
+                except Exception:
+                    days_i = None
+            if take < 1:
+                take = 1
+            if take > 50:
+                take = 50
+            if skip < 0:
+                skip = 0
+            items = query_experiments(
+                user,
+                category=category,
+                take=take,
+                skip=skip,
+                from_skip=None,
+                days=days_i,
+                sort=sort,
+            )
+            compact: list[dict[str, Any]] = []
+            for it in items[: min(len(items), 30)]:
+                if not isinstance(it, dict):
+                    continue
+                compact.append(
+                    {
+                        "id": best_effort_extract_text(it.get("ID"))
+                        or best_effort_extract_text(it.get("Id"))
+                        or None,
+                        "category": best_effort_extract_text(it.get("Category")) or None,
+                        "subject": best_effort_extract_text(it.get("Subject"))
+                        or best_effort_extract_text(it.get("Title"))
+                        or None,
+                    }
+                )
+            return json.dumps(compact, ensure_ascii=False, indent=2)
+
+        if tool == "plar_get_user_by_name":
+            name = str(args.get("name") or "").strip()
+            if not name:
+                return "ERROR: missing args.name"
+            data = get_user_by_name(user, name=name)
+            u = data.get("User") if isinstance(data, dict) else None
+            if not isinstance(u, dict):
+                return "No user found."
+            out = {
+                "id": best_effort_extract_text(u.get("ID"))
+                or best_effort_extract_text(u.get("UserID"))
+                or None,
+                "nickname": best_effort_extract_text(u.get("Nickname")) or None,
+                "verification": best_effort_extract_text(u.get("Verification")) or None,
+                "signature": truncate(
+                    best_effort_extract_text(u.get("Signature")), max_chars=200
+                )
+                or None,
+            }
+            return json.dumps(out, ensure_ascii=False, indent=2)
+
+        if tool == "plar_get_user_by_id":
+            user_id = str(args.get("user_id") or "").strip()
+            if not user_id:
+                return "ERROR: missing args.user_id"
+            data = get_user_by_id(user, user_id=user_id)
+            u = data.get("User") if isinstance(data, dict) else None
+            if not isinstance(u, dict):
+                return "No user found."
+            out = {
+                "id": best_effort_extract_text(u.get("ID"))
+                or best_effort_extract_text(u.get("UserID"))
+                or None,
+                "nickname": best_effort_extract_text(u.get("Nickname")) or None,
+                "verification": best_effort_extract_text(u.get("Verification")) or None,
+                "signature": truncate(
+                    best_effort_extract_text(u.get("Signature")), max_chars=200
+                )
+                or None,
+            }
+            return json.dumps(out, ensure_ascii=False, indent=2)
+
+        if tool == "plar_get_experiment_context":
+            summary_id = str(args.get("summary_id") or "").strip()
+            category = str(args.get("category") or "").strip() or "Experiment"
+            if not summary_id:
+                return "ERROR: missing args.summary_id"
+            ctx = get_experiment_context(
+                user,
+                summary_id=summary_id,
+                category_value=category,
+                cache_dir=cache_dir,
+                ttl_sec=300,
+                max_json_chars=20_000,
+            )
+            return json.dumps(ctx, ensure_ascii=False, indent=2)
+
+        if tool == "plar_get_status_save":
+            summary_id = str(args.get("summary_id") or "").strip()
+            category = str(args.get("category") or "").strip() or "Experiment"
+            if not summary_id:
+                return "ERROR: missing args.summary_id"
+            status = get_status_save(
+                user,
+                summary_id=summary_id,
+                category_value=category,
+                cache_dir=cache_dir,
+                ttl_sec=300,
+            )
+            # Do not dump the whole thing: it's huge.
+            els = status.get("Elements")
+            wires = status.get("Wires")
+            sample: list[dict[str, Any]] = []
+            if isinstance(els, list):
+                for el in els[:30]:
+                    if not isinstance(el, dict):
+                        continue
+                    sample.append(
+                        {
+                            "ModelID": best_effort_extract_text(el.get("ModelID")) or None,
+                            "Label": best_effort_extract_text(el.get("Label")) or None,
+                        }
+                    )
+            return json.dumps(
+                {
+                    "elements_count": len(els) if isinstance(els, list) else None,
+                    "wires_count": len(wires) if isinstance(wires, list) else None,
+                    "elements_sample": sample,
+                },
+                ensure_ascii=False,
+                indent=2,
+            )
+
+        if tool == "plar_get_comments":
+            target_type = str(args.get("target_type") or "").strip() or "Discussion"
+            target_id = str(args.get("target_id") or "").strip()
+            if not target_id:
+                return "ERROR: missing args.target_id"
+            take = int(args.get("take") or 20)
+            skip = int(args.get("skip") or 0)
+            if take < 1:
+                take = 1
+            if take > 50:
+                take = 50
+            if skip < 0:
+                skip = 0
+            comments = get_comments(
+                user, target_id=target_id, target_type=target_type, take=take, skip=skip
+            )
+            return json.dumps(
+                _recent_comments_context(comments, limit=12),
+                ensure_ascii=False,
+                indent=2,
+            )
+
+        if tool == "simulate":
+            text = str(args.get("text") or "").strip()
+            if not text:
+                text = json.dumps(context_json, ensure_ascii=False) if context_json else ""
+            if not text:
+                return "ERROR: missing args.text"
+            if bool(getattr(cfg.agent, "simulation_ai_enabled", True)):
+                try:
+                    reply = simulate_ai_script_circuit_with_phyengine(
+                        ollama=ollama,
+                        text=text,
+                        context_json=context_json,
+                        phy_engine_cfg=cfg.phy_engine,
+                        config_base_dir=config_base_dir,
+                        max_components=int(
+                            getattr(cfg.agent, "simulation_ai_max_components", 30) or 30
+                        ),
+                        max_probes=int(getattr(cfg.agent, "simulation_ai_max_probes", 20) or 20),
+                    )
+                    if _looks_like_pe_script_parse_failure(reply):
+                        reply = simulate_ai_circuit_with_phyengine(
+                            ollama=ollama,
+                            text=text,
+                            context_json=context_json,
+                            phy_engine_cfg=cfg.phy_engine,
+                            config_base_dir=config_base_dir,
+                            max_attempts=3,
+                            max_components=int(
+                                getattr(cfg.agent, "simulation_ai_max_components", 30) or 30
+                            ),
+                            max_probes=int(
+                                getattr(cfg.agent, "simulation_ai_max_probes", 20) or 20
+                            ),
+                        )
+                    return reply
+                except Exception as e:
+                    logger.info("Agent tool simulate failed; falling back to demo: %s", e)
+            return simulate_series_vdc_resistors(
+                text=text,
+                phy_engine_cfg=cfg.phy_engine,
+                config_base_dir=config_base_dir,
+            )
+
+        if tool == "simulate_verilog":
+            text = str(args.get("text") or "").strip()
+            if not text:
+                return "ERROR: missing args.text"
+            return simulate_ai_verilog_with_phyengine(
+                ollama=ollama,
+                text=text,
+                context_json=context_json,
+                phy_engine_cfg=cfg.phy_engine,
+                config_base_dir=config_base_dir,
+                cache_dir=cache_dir,
+                max_attempts=2,
+                max_elements=int(getattr(cfg.agent, "simulation_max_elements", 300) or 300),
+            )
+
+        if tool == "simulate_status_save":
+            summary_id = str(args.get("summary_id") or "").strip()
+            category = str(args.get("category") or "").strip() or "Experiment"
+            question = str(args.get("question") or "").strip() or "simulate"
+            if not summary_id:
+                return "ERROR: missing args.summary_id"
+            status = get_status_save(
+                user,
+                summary_id=summary_id,
+                category_value=category,
+                cache_dir=cache_dir,
+                ttl_sec=300,
+            )
+            return simulate_status_save_with_phyengine(
+                text=question,
+                status_save=status,
+                phy_engine_cfg=cfg.phy_engine,
+                config_base_dir=config_base_dir,
+                max_elements=int(getattr(cfg.agent, "simulation_max_elements", 300) or 300),
+            )
+
+        if tool == "circuit":
+            spec = str(args.get("spec") or "").strip()
+            if not spec:
+                return "ERROR: missing args.spec"
+            publish_wanted = bool(args.get("publish"))
+            enable_publish_run = (
+                bool(getattr(cfg.agent, "enable_publish", False))
+                and bool(getattr(cfg.agent, "auto_publish", False))
+                and publish_wanted
+                and (not dry_run)
+            )
+            res = build_and_maybe_publish_circuit(
+                ollama=ollama,
+                user=user,
+                spec=spec,
+                cache_dir=cache_dir,
+                phy_engine_cfg=cfg.phy_engine,
+                config_base_dir=config_base_dir,
+                keep_temp=bool(getattr(cfg.storage, "keep_temp", False)),
+                enable_publish=bool(enable_publish_run),
+                dry_run=dry_run,
+                max_attempts=int(getattr(cfg.agent, "circuit_max_attempts", 3) or 3),
+                publish_max_elements=int(getattr(cfg.agent, "publish_max_elements", 5000) or 5000),
+                title=truncate(f"Auto Circuit: {spec}", max_chars=60),
+                introduction=truncate(f"Spec:\n{spec}", max_chars=600),
+                publish_category_value=str(
+                    getattr(cfg.agent, "publish_category", "Discussion") or "Discussion"
+                ),
+                publish_tags=list(getattr(cfg.agent, "publish_tags", []) or []),
+            )
+            return json.dumps(
+                {
+                    "published": bool(getattr(res, "published", False)),
+                    "summary_id": getattr(res, "summary_id", None),
+                    "plsav_elements": getattr(res, "plsav_elements", None),
+                    "publish_block_reason": getattr(res, "publish_block_reason", None),
+                },
+                ensure_ascii=False,
+                indent=2,
+            )
+
+        return f"ERROR: unknown tool '{tool}'"
+    except Exception as e:
+        return f"ERROR: {e.__class__.__name__}: {truncate(str(e) or '', max_chars=1800)}"
+
+
+def agent_mode_run(
+    *,
+    ollama: OllamaClient,
+    user: Any,
+    cfg: Any,
+    cache_dir: str,
+    config_base_dir: str,
+    dry_run: bool,
+    logger: logging.Logger,
+    task: str,
+    context_json: dict[str, Any] | None,
+    history: list[dict[str, str]],
+    max_seconds: int = 600,
+    max_steps: int = 18,
+) -> str:
+    task = (task or "").strip()
+    if not task:
+        return render_help(command_prefix=getattr(cfg.agent, "command_prefix", "!"), mode="agent")
+
+    start_ts = time.time()
+    deadline = start_ts + float(max_seconds)
+    tool_cutoff_ts = start_ts + float(max(0, int(max_seconds) - 60))
+    messages: list[dict[str, str]] = [
+        {"role": "system", "content": cfg.agent.system_prompt},
+        {"role": "system", "content": _agent_tool_prompt(max_seconds=max_seconds)},
+    ]
+    if context_json is not None:
+        messages.append(
+            {
+                "role": "system",
+                "content": "Context JSON (current page):\n"
+                + json.dumps(context_json, ensure_ascii=False, indent=2),
+            }
+        )
+    if history:
+        # Keep it short; agent mode can re-query if needed.
+        messages.extend(history[-8:])
+    messages.append({"role": "user", "content": task})
+
+    last_raw = ""
+    for step in range(1, int(max_steps) + 1):
+        now = time.time()
+        time_left = int(max(0.0, deadline - now))
+        tools_enabled = now < tool_cutoff_ts
+
+        # After 9 minutes (last 60s), tools are disabled: force final output and refuse tool calls.
+        if not tools_enabled:
+            messages.append(
+                {
+                    "role": "system",
+                    "content": (
+                        f"TOOLS DISABLED (last 60s). Time remaining: {time_left}s.\n"
+                        "You must stop calling tools and immediately output:\n"
+                        "{\"tool\":\"end\",\"final\":\"...\"}\n"
+                        "If you attempt any other tool call, it will be rejected."
+                    ),
+                }
+            )
+            raw_final = ollama.chat(messages=messages)
+            try:
+                tool, _args, final = _agent_parse_tool_call(raw_final)
+                if tool == "end":
+                    out = safe_reply(final or "", max_chars=cfg.agent.max_reply_chars)
+                    return out if out.strip() else "Done."
+                # Reject any other tool call and force one last retry for end.
+                messages.append(
+                    {
+                        "role": "system",
+                        "content": (
+                            "REJECTED: tool calls are disabled in the last 60 seconds. "
+                            "Output ONLY: {\"tool\":\"end\",\"final\":\"...\"}"
+                        ),
+                    }
+                )
+                raw_final2 = ollama.chat(messages=messages)
+                try:
+                    tool2, _args2, final2 = _agent_parse_tool_call(raw_final2)
+                    if tool2 == "end":
+                        out = safe_reply(final2 or "", max_chars=cfg.agent.max_reply_chars)
+                        return out if out.strip() else "Done."
+                except Exception:
+                    out = safe_reply(raw_final2, max_chars=cfg.agent.max_reply_chars)
+                    return out if out.strip() else "Done."
+                out = safe_reply(raw_final2, max_chars=cfg.agent.max_reply_chars)
+                return out if out.strip() else "Done."
+            except Exception:
+                out = safe_reply(raw_final, max_chars=cfg.agent.max_reply_chars)
+                return out if out.strip() else "Done."
+
+        # Normal tool-enabled phase.
+        messages.append(
+            {
+                "role": "system",
+                "content": f"Time remaining: {time_left}s. Tools enabled: true. Step {step}/{int(max_steps)}.",
+            }
+        )
+        if now > deadline:
+            break
+        raw = ollama.chat(messages=messages)
+        last_raw = raw
+        try:
+            tool, args, final = _agent_parse_tool_call(raw)
+        except Exception:
+            # Fallback: treat as final answer.
+            out = safe_reply(raw, max_chars=cfg.agent.max_reply_chars)
+            return out if out.strip() else "Done."
+
+        if tool == "end":
+            out = safe_reply(final or "", max_chars=cfg.agent.max_reply_chars)
+            return out if out.strip() else "Done."
+
+        result = _agent_execute_tool(
+            tool=tool,
+            args=args,
+            user=user,
+            ollama=ollama,
+            cfg=cfg,
+            cache_dir=cache_dir,
+            config_base_dir=config_base_dir,
+            dry_run=dry_run,
+            context_json=context_json,
+            logger=logger,
+        )
+        messages.append({"role": "assistant", "content": raw})
+        messages.append(_agent_tool_result_message(tool=tool, result=result))
+        # Always remind remaining time after each tool result.
+        now2 = time.time()
+        time_left2 = int(max(0.0, deadline - now2))
+        if now2 >= tool_cutoff_ts:
+            messages.append(
+                {
+                    "role": "system",
+                    "content": (
+                        f"Time remaining: {time_left2}s. Tools will be DISABLED now; next message MUST be end."
+                    ),
+                }
+            )
+        else:
+            cutoff_left = int(max(0.0, tool_cutoff_ts - now2))
+            messages.append(
+                {
+                    "role": "system",
+                    "content": (
+                        f"Time remaining: {time_left2}s. Tool-call cutoff in {cutoff_left}s (then only end allowed)."
+                    ),
+                }
+            )
+
+    # Budget exhausted: ask for end.
+    messages.append(
+        {
+            "role": "system",
+            "content": "Agent mode budget reached. Call {\"tool\":\"end\",\"final\":\"...\"} with your best final answer now.",
+        }
+    )
+    raw2 = ollama.chat(messages=messages)
+    try:
+        tool, _args, final = _agent_parse_tool_call(raw2)
+        if tool == "end":
+            out = safe_reply(final or "", max_chars=cfg.agent.max_reply_chars)
+            return out if out.strip() else "Done."
+    except Exception:
+        pass
+    out = safe_reply(raw2 or last_raw or "Done.", max_chars=cfg.agent.max_reply_chars)
+    return out if out.strip() else "Done."
+
 def _llm_decide_web_search(
     *,
     ollama: OllamaClient,
@@ -477,32 +1402,56 @@ def _llm_route_tool(
     system_prompt: str,
     user_text: str,
     context_json: dict[str, Any] | None,
+    allow_agent: bool,
 ) -> dict[str, Any] | None:
+    allow_agent = bool(allow_agent)
+    allowed_action_lines = [
+        "- chat",
+        "- summarize",
+        "- search_plar  (LOOKUP ONLY: user name/id, or experiment/discussion id; NOT keyword search)",
+        "- google  (web search)",
+        "- circuit  (generate Verilog and compile to .sav)",
+        "- simulate  (run a local circuit simulation demo)",
+    ]
+    if allow_agent:
+        allowed_action_lines.insert(2, "- agent  (multi-step tool agent)")
+    allowed_actions = "\n".join(allowed_action_lines) + "\n"
+
+    schema_actions = "chat|summarize"
+    if allow_agent:
+        schema_actions += "|agent"
+    schema_actions += "|search_plar|google|circuit|simulate"
+
+    agent_example = (
+        "- User: 'Do a full investigation: search web + search PLAR and then answer' -> action=agent\n"
+        if allow_agent
+        else ""
+    )
     router_prompt = (
         "You are a tool router for a Physics Lab AR community agent.\n"
         "Select the best action for the user request.\n\n"
         "Allowed actions:\n"
-        "- chat\n"
-        "- summarize\n"
-        "- search_plar  (search within Physics Lab community; best-effort over recent items)\n"
-        "- google  (web search)\n"
-        "- circuit  (generate Verilog and compile to .sav)\n"
-        "- simulate  (run a local circuit simulation demo)\n\n"
+        + allowed_actions
+        + "\n"
         "Internal search policy (important):\n"
-        "- Choose search_plar ONLY when the user explicitly asks you to search/find/recommend items in the Physics Lab community.\n"
-        "- Do NOT choose search_plar as a default for general Q&A. It often returns no results.\n"
-        "- If the user is not clearly asking for a search, prefer chat (or ask a short clarifying question).\n"
-        "- If you choose search_plar, keep arg as concise keywords, or 'user: <name>' for user lookups.\n\n"
+        "- search_plar is LOOKUP-ONLY; it does NOT support keyword search across experiments.\n"
+        "- Choose search_plar ONLY when the user provides (or clearly asks for) an ID or a user handle/name.\n"
+        "- For discovery/recommendations (latest/hot/featured), choose agent so you can use list_plar.\n"
+        "- If the user is not clearly asking for lookup/search, prefer chat (or ask a short clarifying question).\n\n"
         "Publishing policy:\n"
         "- Only set publish=true if the user explicitly asks to publish/share/post the experiment.\n"
         "- Otherwise publish=false.\n\n"
         "Examples:\n"
         "- User: 'Please implement a 4-bit adder and publish it as an experiment' -> action=circuit, publish=true\n"
         "- User: 'Summarize this' (on an experiment page) -> action=summarize\n"
-        "- User: 'Search for op amp experiments' -> action=search_plar\n"
+        + agent_example
+        + "- User: 'Find @someone' -> action=search_plar\n"
+        "- User: 'Open experiment 0123456789abcdef01234567' -> action=search_plar\n"
         "- User: 'Look this up online' -> action=google\n\n"
         "Output STRICT JSON only, no prose. Schema:\n"
-        "{\"action\":\"chat|summarize|search_plar|google|circuit|simulate\",\"arg\":\"...\",\"publish\":true|false}\n"
+        + "{\"action\":\""
+        + schema_actions
+        + "\",\"arg\":\"...\",\"publish\":true|false}\n"
     )
     messages: list[dict[str, str]] = [
         {"role": "system", "content": system_prompt},
@@ -528,7 +1477,9 @@ def _llm_route_tool(
     if not isinstance(action, str):
         return None
     action = action.strip()
-    if action not in ("chat", "summarize", "search_plar", "google", "circuit", "simulate"):
+    if action not in ("chat", "summarize", "agent", "search_plar", "google", "circuit", "simulate"):
+        return None
+    if action == "agent" and not allow_agent:
         return None
     if not isinstance(arg, str):
         arg = ""
@@ -812,6 +1763,7 @@ def _infer_nl_tool(text: str) -> tuple[str, str]:
 
     for key, aliases in (
         ("summarize", ("summarize", "summary")),
+        ("agent", ("agent", "agentmode", "autopilot")),
         ("search", ("search", "find")),
         ("circuit", ("circuit", "verilog")),
         ("simulate", ("simulate", "simulation")),
@@ -830,6 +1782,9 @@ def _infer_nl_tool(text: str) -> tuple[str, str]:
 
     if text.startswith(("总结", "概括")):
         return "summarize", text[2:].strip()
+    if text.startswith(("代理", "Agent", "agent")) and ("操作" in text or "模式" in text):
+        # e.g. "agent 操作：xxx" / "代理模式 xxx"
+        return "agent", re.sub(r"^[^:：]*[:：]?", "", text).strip()
     if text.startswith(("搜索", "查找")):
         return "search", text[2:].strip()
     if text.startswith("生成电路"):
@@ -931,8 +1886,42 @@ def _handle_comment(
         cmd = "chat"
         arg = text
 
+    agent_mode = str(getattr(getattr(cfg, "agent", None), "mode", "agent") or "agent").strip().lower()
+    if agent_mode == "agent":
+        # Agent-only mode: every triggered comment becomes an agent task.
+        if cmd in ("", "help", "h", "?"):
+            return render_help(command_prefix=cfg.agent.command_prefix, mode="agent")
+
+        task = text.strip()
+        if cfg.agent.commands_enabled and cfg.agent.command_prefix and task.startswith(cfg.agent.command_prefix):
+            cmd2, arg2 = parse_command(task, prefix=cfg.agent.command_prefix)
+            if cmd2 in ("", "help", "h", "?"):
+                return render_help(command_prefix=cfg.agent.command_prefix, mode="agent")
+            # Treat any legacy command as a task; prefer the argument text.
+            task = (arg2 or cmd2 or "").strip()
+
+        if not task:
+            if experiment_context is not None:
+                task = "请总结当前页面，并直接回答用户可能关心的关键点。"
+            else:
+                task = "请根据最近对话，直接完成用户的任务；如果任务不明确，请只问 1 个澄清问题。"
+
+        reply = agent_mode_run(
+            ollama=ollama,
+            user=user,
+            cfg=cfg,
+            cache_dir=cache_dir,
+            config_base_dir=config_base_dir,
+            dry_run=dry_run,
+            logger=logger,
+            task=task,
+            context_json=experiment_context,
+            history=history,
+        )
+        return reply if (reply or "").strip() else "Done."
+
     if cmd in ("", "help", "h", "?"):
-        return render_help(command_prefix=cfg.agent.command_prefix)
+        return render_help(command_prefix=cfg.agent.command_prefix, mode="traditional")
 
     if cmd == "chat":
         if not arg:
@@ -954,7 +1943,7 @@ def _handle_comment(
                 )
                 reply = ollama.chat(messages=messages)
                 return safe_reply(reply, max_chars=cfg.agent.max_reply_chars)
-            return render_help(command_prefix=cfg.agent.command_prefix)
+            return render_help(command_prefix=cfg.agent.command_prefix, mode="traditional")
         logger.debug("Tool chat invoked (len=%d)", len(arg))
 
         # LLM-driven tool routing for natural language requests.
@@ -965,6 +1954,7 @@ def _handle_comment(
                     system_prompt=cfg.agent.system_prompt,
                     user_text=arg,
                     context_json=experiment_context,
+                    allow_agent=(agent_mode == "agent"),
                 )
             except Exception as e:
                 logger.debug("Tool router failed: %s", e)
@@ -1020,47 +2010,35 @@ def _handle_comment(
                     )
                     return safe_reply(reply, max_chars=cfg.agent.max_reply_chars)
 
+                if action == "agent":
+                    run_task = routed_arg or arg
+                    if not run_task:
+                        return "Provide a task description."
+                    logger.info("Agent mode invoked (auto_routed=true task_len=%d)", len(run_task))
+                    return agent_mode_run(
+                        ollama=ollama,
+                        user=user,
+                        cfg=cfg,
+                        cache_dir=cache_dir,
+                        config_base_dir=config_base_dir,
+                        dry_run=dry_run,
+                        logger=logger,
+                        task=run_task,
+                        context_json=experiment_context,
+                        history=history,
+                    )
+
                 if action == "search_plar":
                     if not routed_arg:
                         return "Provide a query string."
                     if _looks_political_sensitive(routed_arg):
                         return _political_refusal_message(routed_arg)
-                    q_raw = routed_arg.strip()
-                    q = q_raw
-                    is_at_user = q.startswith(("@", "＠"))
-                    if is_at_user:
-                        q = q[1:].strip()
-                        if q:
-                            try:
-                                data = get_user_by_name(user, name=q)
-                            except Exception as e:
-                                if _is_probable_user_not_found_error(e):
-                                    return "No user found."
-                                return f"Search failed: {e}"
-                            u = data.get("User") if isinstance(data, dict) else None
-                            if not isinstance(u, dict):
-                                return "No user found."
-                            uid = best_effort_extract_text(u.get("ID")) or best_effort_extract_text(
-                                u.get("UserID")
-                            )
-                            nick = best_effort_extract_text(u.get("Nickname")) or "(no nickname)"
-                            ver = best_effort_extract_text(u.get("Verification"))
-                            lines = ["User:", f"- Nickname: {nick}", f"- ID: {uid or '(unknown)'}"]
-                            if ver:
-                                lines.append(f"- Verification: {ver}")
-                            return safe_reply(
-                                "\n".join(lines),
-                                max_chars=cfg.agent.max_reply_chars,
-                            )
-                    if q.casefold().startswith(("user:", "user ", "用户:", "用户 ")):
-                        name = q.split(None, 1)[1].strip() if " " in q else q.split(":", 1)[1].strip()
-                        try:
-                            data = get_user_by_name(user, name=name)
-                        except Exception as e:
-                            return f"Search failed: {e}"
-                        u = data.get("User") if isinstance(data, dict) else None
-                        if not isinstance(u, dict):
-                            return "No user found."
+
+                    spec = _parse_plar_lookup_query(routed_arg)
+                    kind = spec.get("kind")
+                    value = (spec.get("value") or "").strip()
+
+                    def _render_user(u: dict[str, Any]) -> str:
                         uid = best_effort_extract_text(u.get("ID")) or best_effort_extract_text(
                             u.get("UserID")
                         )
@@ -1069,82 +2047,92 @@ def _handle_comment(
                         lines = ["User:", f"- Nickname: {nick}", f"- ID: {uid or '(unknown)'}"]
                         if ver:
                             lines.append(f"- Verification: {ver}")
-                        return safe_reply(
-                            "\n".join(lines),
-                            max_chars=cfg.agent.max_reply_chars,
-                        )
-                    try:
-                        hits = search_recent_experiments(
-                            user=user, query=routed_arg, max_scan=200, max_results=5
-                        )
-                    except Exception as e:
-                        logger.warning("Local search failed: %s", _public_error_text(e, max_chars=2000))
-                        return f"Search failed: {e}"
-                    if not hits:
-                        # If no experiment hits, try a last-chance user lookup for simple nicknames.
-                        q2 = q_raw.lstrip("@＠").strip()
-                        if q2 and (" " not in q2) and (":" not in q2) and (2 <= len(q2) <= 32):
+                        return "\n".join(lines)
+
+                    if kind == "user_name":
+                        if not value:
+                            return "Search is lookup-only. Try '@name' or 'user: name'."
+                        try:
+                            data = get_user_by_name(user, name=value)
+                        except Exception as e:
+                            if _is_probable_user_not_found_error(e):
+                                return "No user found."
+                            return f"Lookup failed: {e}"
+                        u = data.get("User") if isinstance(data, dict) else None
+                        if not isinstance(u, dict):
+                            return "No user found."
+                        return safe_reply(_render_user(u), max_chars=cfg.agent.max_reply_chars)
+
+                    if kind == "user_id":
+                        if not value:
+                            return "Search is lookup-only. Try 'uid: <id>'."
+                        try:
+                            data = get_user_by_id(user, user_id=value)
+                        except Exception as e:
+                            if _is_probable_user_not_found_error(e):
+                                return "No user found."
+                            return f"Lookup failed: {e}"
+                        u = data.get("User") if isinstance(data, dict) else None
+                        if not isinstance(u, dict):
+                            return "No user found."
+                        return safe_reply(_render_user(u), max_chars=cfg.agent.max_reply_chars)
+
+                    if kind == "content_id":
+                        if not value:
+                            return "Search is lookup-only. Try 'experiment:<id>' or 'discussion:<id>'."
+                        category = (spec.get("category") or "both").strip()
+                        tried: list[str] = []
+                        last_err: BaseException | None = None
+
+                        def _try(cat: str) -> dict[str, Any] | None:
+                            nonlocal last_err
+                            tried.append(cat)
                             try:
-                                data = get_user_by_name(user, name=q2)
-                                u = data.get("User") if isinstance(data, dict) else None
-                                if isinstance(u, dict):
-                                    uid = best_effort_extract_text(u.get("ID")) or best_effort_extract_text(
-                                        u.get("UserID")
-                                    )
-                                    nick = best_effort_extract_text(u.get("Nickname")) or "(no nickname)"
-                                    ver = best_effort_extract_text(u.get("Verification"))
-                                    lines = ["User:", f"- Nickname: {nick}", f"- ID: {uid or '(unknown)'}"]
-                                    if ver:
-                                        lines.append(f"- Verification: {ver}")
-                                    return safe_reply(
-                                        "\n".join(lines),
-                                        max_chars=cfg.agent.max_reply_chars,
-                                    )
-                            except Exception:
-                                pass
-                        return safe_reply(
-                            format_experiment_hits(hits),
-                            max_chars=cfg.agent.max_reply_chars,
-                        )
+                                ctx = get_experiment_context(
+                                    user,
+                                    summary_id=value,
+                                    category_value=cat,
+                                    cache_dir=cache_dir,
+                                    ttl_sec=300,
+                                )
+                            except Exception as e:
+                                last_err = e
+                                return None
+                            return ctx if isinstance(ctx, dict) else None
 
-                    # AI整理搜索结果 -> 输出给用户（更贴近“先搜再整理”的流程）。
-                    packed: list[dict[str, Any]] = []
-                    for item in hits[:5]:
-                        packed.append(
-                            {
-                                "id": best_effort_extract_text(item.get("ID"))
-                                or best_effort_extract_text(item.get("Id")),
-                                "subject": best_effort_extract_text(item.get("Subject")),
-                                "title": best_effort_extract_text(item.get("Title")),
-                                "summary": best_effort_extract_text(item.get("Summary")),
-                                "description": best_effort_extract_text(item.get("Description")),
-                                "category": best_effort_extract_text(item.get("Category")),
-                                "user_id": best_effort_extract_text(item.get("UserID")),
-                            }
-                        )
+                        ctx = None
+                        if category == "Experiment":
+                            ctx = _try("Experiment")
+                        elif category == "Discussion":
+                            ctx = _try("Discussion")
+                        else:
+                            ctx = _try("Experiment") or _try("Discussion")
 
-                    messages: list[dict[str, str]] = [{"role": "system", "content": cfg.agent.system_prompt}]
-                    messages.append(
-                        {
-                            "role": "system",
-                            "content": "Internal Physics Lab search results (top matches, JSON):\n"
-                            + json.dumps(packed, ensure_ascii=False, indent=2),
-                        }
-                    )
-                    messages.append(
-                        {
-                            "role": "user",
-                            "content": (
-                                "Use the search results above to help the user.\n"
-                                "- If the user asked to find experiments, list the best matches with ID and 1-line reason.\n"
-                                "- If the user asked a question, use the most relevant result(s) and cite the IDs/subjects you relied on.\n"
-                                "- If results seem unrelated, say so briefly and suggest a better query.\n\n"
-                                f"User query:\n{routed_arg}"
-                            ),
-                        }
-                    )
-                    reply = ollama.chat(messages=messages)
-                    return safe_reply(reply, max_chars=cfg.agent.max_reply_chars)
+                        if ctx is None:
+                            if last_err is not None and _is_probable_content_not_found_error(last_err):
+                                return safe_reply(
+                                    f"No content found. (tried: {', '.join(tried)})",
+                                    max_chars=cfg.agent.max_reply_chars,
+                                )
+                            return f"Lookup failed: {last_err}"
+
+                        subject = (
+                            best_effort_extract_text(
+                                ctx.get("subject") or ctx.get("Subject") or ctx.get("title")
+                            )
+                            or "(no subject)"
+                        )
+                        cat = best_effort_extract_text(ctx.get("category") or ctx.get("Category")) or (
+                            tried[-1] if tried else None
+                        )
+                        lines = ["Content:"]
+                        if cat:
+                            lines.append(f"- Category: {cat}")
+                        lines.append(f"- Subject: {subject}")
+                        lines.append(f"- ID: {value}")
+                        return safe_reply("\n".join(lines), max_chars=cfg.agent.max_reply_chars)
+
+                    return "search_plar is lookup-only: @name/user:name/uid:<id>/experiment:<id>/discussion:<id>."
 
                 if action == "google":
                     if not routed_arg:
@@ -1640,6 +2628,26 @@ def _handle_comment(
         reply = ollama.chat(messages=messages)
         return safe_reply(reply, max_chars=cfg.agent.max_reply_chars)
 
+    if cmd in ("agent", "op", "autopilot"):
+        run_task = (arg or "").strip()
+        if not run_task:
+            return "Provide a task description for agent mode."
+        if agent_mode != "agent":
+            return "Agent mode is disabled. Set agent.mode=agent in config to enable it."
+        logger.info("Agent mode invoked (cmd=%s task_len=%d)", cmd, len(run_task))
+        return agent_mode_run(
+            ollama=ollama,
+            user=user,
+            cfg=cfg,
+            cache_dir=cache_dir,
+            config_base_dir=config_base_dir,
+            dry_run=dry_run,
+            logger=logger,
+            task=run_task,
+            context_json=experiment_context,
+            history=history,
+        )
+
     if cmd in ("summarize", "sum"):
         # Allow summarizing another user's message board by name/ID.
         nick, uid = _extract_user_board_query(arg)
@@ -1741,131 +2749,114 @@ def _handle_comment(
             return "Provide a query string."
         if _looks_political_sensitive(arg):
             return _political_refusal_message(arg)
-        q_raw = arg.strip()
-        q = q_raw
-        is_at_user = q.startswith(("@", "＠"))
-        if is_at_user:
-            name = q[1:].strip()
-            if not name:
-                return "Provide a username after '@'."
-            logger.debug("Tool search(@user) invoked (name=%r)", name[:80])
+        spec = _parse_plar_lookup_query(arg)
+        kind = spec.get("kind")
+        value = (spec.get("value") or "").strip()
+
+        def _render_user(u: dict[str, Any]) -> str:
+            uid = best_effort_extract_text(u.get("ID")) or best_effort_extract_text(u.get("UserID"))
+            nick = best_effort_extract_text(u.get("Nickname")) or "(no nickname)"
+            ver = best_effort_extract_text(u.get("Verification"))
+            sig = best_effort_extract_text(u.get("Signature"))
+            lines = ["User:"]
+            lines.append(f"- Nickname: {nick}")
+            if uid:
+                lines.append(f"- ID: {uid}")
+            if ver:
+                lines.append(f"- Verification: {ver}")
+            if sig:
+                lines.append(f"- Signature: {truncate(sig, max_chars=120)}")
+            return "\n".join(lines)
+
+        if kind == "user_name":
+            if not value:
+                return "Search is lookup-only. Try '@name' or 'user: name'."
+            logger.debug("Tool search(lookup user_name) invoked (name=%r)", value[:80])
             try:
-                data = get_user_by_name(user, name=name)
+                data = get_user_by_name(user, name=value)
             except Exception as e:
                 if _is_probable_user_not_found_error(e):
                     return "No user found."
-                logger.warning("User search failed: %s", _public_error_text(e, max_chars=2000))
-                return f"Search failed: {e}"
+                logger.warning("User lookup failed: %s", _public_error_text(e, max_chars=2000))
+                return f"Lookup failed: {e}"
             u = data.get("User") if isinstance(data, dict) else None
             if not isinstance(u, dict):
                 return "No user found."
-            uid = best_effort_extract_text(u.get("ID")) or best_effort_extract_text(u.get("UserID"))
-            nick = best_effort_extract_text(u.get("Nickname")) or "(no nickname)"
-            ver = best_effort_extract_text(u.get("Verification"))
-            sig = best_effort_extract_text(u.get("Signature"))
-            lines = ["User:"]
-            lines.append(f"- Nickname: {nick}")
-            if uid:
-                lines.append(f"- ID: {uid}")
-            if ver:
-                lines.append(f"- Verification: {ver}")
-            if sig:
-                lines.append(f"- Signature: {truncate(sig, max_chars=120)}")
-            return safe_reply("\n".join(lines), max_chars=cfg.agent.max_reply_chars)
-        if q.casefold().startswith(("user:", "user ", "用户:", "用户 ")):
-            name = q.split(None, 1)[1].strip() if " " in q else q.split(":", 1)[1].strip()
-            logger.debug("Tool search(user) invoked (name=%r)", name[:80])
+            return safe_reply(_render_user(u), max_chars=cfg.agent.max_reply_chars)
+
+        if kind == "user_id":
+            if not value:
+                return "Search is lookup-only. Try 'uid: <id>'."
+            logger.debug("Tool search(lookup user_id) invoked (id=%r)", value[:80])
             try:
-                data = get_user_by_name(user, name=name)
+                data = get_user_by_id(user, user_id=value)
             except Exception as e:
-                logger.warning("User search failed: %s", _public_error_text(e, max_chars=2000))
-                return f"Search failed: {e}"
+                if _is_probable_user_not_found_error(e):
+                    return "No user found."
+                logger.warning("User lookup failed: %s", _public_error_text(e, max_chars=2000))
+                return f"Lookup failed: {e}"
             u = data.get("User") if isinstance(data, dict) else None
             if not isinstance(u, dict):
                 return "No user found."
-            uid = best_effort_extract_text(u.get("ID")) or best_effort_extract_text(u.get("UserID"))
-            nick = best_effort_extract_text(u.get("Nickname")) or "(no nickname)"
-            ver = best_effort_extract_text(u.get("Verification"))
-            sig = best_effort_extract_text(u.get("Signature"))
-            lines = ["User:"]
-            lines.append(f"- Nickname: {nick}")
-            if uid:
-                lines.append(f"- ID: {uid}")
-            if ver:
-                lines.append(f"- Verification: {ver}")
-            if sig:
-                lines.append(f"- Signature: {truncate(sig, max_chars=120)}")
-            return safe_reply("\n".join(lines), max_chars=cfg.agent.max_reply_chars)
-        logger.debug("Tool search invoked (query=%r)", arg[:200])
-        try:
-            hits = search_recent_experiments(user=user, query=arg, max_scan=200, max_results=5)
-        except Exception as e:
-            logger.warning("Local search failed: %s", _public_error_text(e, max_chars=2000))
-            return f"Search failed: {e}"
-        if not hits:
-            # If no experiment hits, try a last-chance user lookup for simple nicknames.
-            q2 = q_raw.lstrip("@＠").strip()
-            if q2 and (" " not in q2) and (":" not in q2) and (2 <= len(q2) <= 32):
-                try:
-                    data = get_user_by_name(user, name=q2)
-                    u = data.get("User") if isinstance(data, dict) else None
-                    if isinstance(u, dict):
-                        uid = best_effort_extract_text(u.get("ID")) or best_effort_extract_text(
-                            u.get("UserID")
-                        )
-                        nick = best_effort_extract_text(u.get("Nickname")) or "(no nickname)"
-                        ver = best_effort_extract_text(u.get("Verification"))
-                        sig = best_effort_extract_text(u.get("Signature"))
-                        lines = ["User:"]
-                        lines.append(f"- Nickname: {nick}")
-                        if uid:
-                            lines.append(f"- ID: {uid}")
-                        if ver:
-                            lines.append(f"- Verification: {ver}")
-                        if sig:
-                            lines.append(f"- Signature: {truncate(sig, max_chars=120)}")
-                        return safe_reply("\n".join(lines), max_chars=cfg.agent.max_reply_chars)
-                except Exception:
-                    pass
-            return safe_reply(format_experiment_hits(hits), max_chars=cfg.agent.max_reply_chars)
+            return safe_reply(_render_user(u), max_chars=cfg.agent.max_reply_chars)
 
-        packed: list[dict[str, Any]] = []
-        for item in hits[:5]:
-            packed.append(
-                {
-                    "id": best_effort_extract_text(item.get("ID"))
-                    or best_effort_extract_text(item.get("Id")),
-                    "subject": best_effort_extract_text(item.get("Subject")),
-                    "title": best_effort_extract_text(item.get("Title")),
-                    "summary": best_effort_extract_text(item.get("Summary")),
-                    "description": best_effort_extract_text(item.get("Description")),
-                    "category": best_effort_extract_text(item.get("Category")),
-                    "user_id": best_effort_extract_text(item.get("UserID")),
-                }
+        if kind == "content_id":
+            if not value:
+                return "Search is lookup-only. Try 'experiment:<id>' or 'discussion:<id>'."
+            category = (spec.get("category") or "both").strip()
+            logger.debug(
+                "Tool search(lookup content_id) invoked (id=%r category=%s)", value[:80], category
             )
+            tried: list[str] = []
+            last_err: BaseException | None = None
 
-        messages: list[dict[str, str]] = [{"role": "system", "content": cfg.agent.system_prompt}]
-        messages.append(
-            {
-                "role": "system",
-                "content": "Internal Physics Lab search results (top matches, JSON):\n"
-                + json.dumps(packed, ensure_ascii=False, indent=2),
-            }
-        )
-        messages.append(
-            {
-                "role": "user",
-                "content": (
-                    "Use the search results above to help the user.\n"
-                    "- If the user asked to find experiments, list the best matches with ID and 1-line reason.\n"
-                    "- If the user asked a question, use the most relevant result(s) and cite the IDs/subjects you relied on.\n"
-                    "- If results seem unrelated, say so briefly and suggest a better query.\n\n"
-                    f"User query:\n{arg}"
-                ),
-            }
-        )
-        reply = ollama.chat(messages=messages)
-        return safe_reply(reply, max_chars=cfg.agent.max_reply_chars)
+            def _try(cat: str) -> dict[str, Any] | None:
+                nonlocal last_err
+                tried.append(cat)
+                try:
+                    ctx = get_experiment_context(
+                        user,
+                        summary_id=value,
+                        category_value=cat,
+                        cache_dir=cache_dir,
+                        ttl_sec=300,
+                    )
+                except Exception as e:
+                    last_err = e
+                    return None
+                return ctx if isinstance(ctx, dict) else None
+
+            ctx = None
+            if category == "Experiment":
+                ctx = _try("Experiment")
+            elif category == "Discussion":
+                ctx = _try("Discussion")
+            else:
+                ctx = _try("Experiment") or _try("Discussion")
+
+            if ctx is None:
+                if last_err is not None and _is_probable_content_not_found_error(last_err):
+                    return safe_reply(
+                        f"No content found. (tried: {', '.join(tried)})",
+                        max_chars=cfg.agent.max_reply_chars,
+                    )
+                return f"Lookup failed: {last_err}"
+
+            subject = (
+                best_effort_extract_text(ctx.get("subject") or ctx.get("Subject") or ctx.get("title"))
+                or "(no subject)"
+            )
+            cat = best_effort_extract_text(ctx.get("category") or ctx.get("Category")) or (
+                tried[-1] if tried else None
+            )
+            lines = ["Content:"]
+            if cat:
+                lines.append(f"- Category: {cat}")
+            lines.append(f"- Subject: {subject}")
+            lines.append(f"- ID: {value}")
+            return safe_reply("\n".join(lines), max_chars=cfg.agent.max_reply_chars)
+
+        return "Search is lookup-only: @name/user:name/uid:<id>/experiment:<id>/discussion:<id>."
 
     if cmd in ("google", "web", "websearch"):
         if not arg:
@@ -3267,6 +4258,7 @@ def _cmd_run(args: argparse.Namespace) -> int:
                 timeout_sec=cfg.ollama.request_timeout_sec,
                 temperature=cfg.ollama.temperature,
                 num_predict=int(getattr(cfg.ollama, "num_predict", 2048) or 2048),
+                gptoss_optimization=bool(getattr(cfg.ollama, "gptoss_optimization", False)),
             )
         )
 
@@ -3772,6 +4764,7 @@ def _cmd_simtest(args: argparse.Namespace) -> int:
         timeout_sec=int(getattr(cfg.ollama, "request_timeout_sec", 240) or 240),
         temperature=float(getattr(cfg.ollama, "temperature", 0.2) or 0.2),
         num_predict=int(getattr(cfg.ollama, "num_predict", 2048) or 2048),
+        gptoss_optimization=bool(getattr(cfg.ollama, "gptoss_optimization", False)),
     )
     print(f"ollama.base_url={base_url}")
     print(f"ollama.model={cfg.ollama.model}")
