@@ -2066,17 +2066,16 @@ def web_search_duckduckgo(
         ).hexdigest()
         cache_path = os.path.join(cache_root, f"{digest}.json")
         cached = _cache_get(cache_path, ttl_sec=int(ttl_sec))
+        kwargs: dict[str, Any] = {}
+        items: list[dict[str, Any]] = []
         if cached is not None:
             try:
                 data = json.loads(cached)
                 if isinstance(data, list):
                     items = [x for x in data if isinstance(x, dict)]
-                else:
-                    items = []
             except Exception:
                 items = []
         else:
-            kwargs: dict[str, Any] = {}
             try:
                 sig = inspect.signature(DDGS)
                 params = sig.parameters
@@ -2099,30 +2098,30 @@ def web_search_duckduckgo(
             if "timeout" in params:
                 kwargs["timeout"] = float(timeout_sec)
 
-        try:
-            ddgs = DDGS(**kwargs) if kwargs else DDGS()
-        except RecursionError as e:
-            # Some environments / library versions can trigger recursive proxy/session wiring.
-            lib_error_note = f"duckduckgo-search init failed: {e}"
-            return None
-        try:
-            results = ddgs.text(q, max_results=n)  # type: ignore[call-arg]
-        except TypeError:
-            results = ddgs.text(q, n)  # type: ignore[misc]
-        except RecursionError as e:
-            lib_error_note = f"duckduckgo-search failed: {e}"
-            return None
+            try:
+                ddgs = DDGS(**kwargs) if kwargs else DDGS()
+            except RecursionError as e:
+                # Some environments / library versions can trigger recursive proxy/session wiring.
+                lib_error_note = f"duckduckgo-search init failed: {e}"
+                return None
+            try:
+                results = ddgs.text(q, max_results=n)  # type: ignore[call-arg]
+            except TypeError:
+                results = ddgs.text(q, n)  # type: ignore[misc]
+            except RecursionError as e:
+                lib_error_note = f"duckduckgo-search failed: {e}"
+                return None
 
-        try:
-            raw_items = list(results)
-        except TypeError:
-            raw_items = results if isinstance(results, list) else []
-        except RecursionError as e:
-            lib_error_note = f"duckduckgo-search failed: {e}"
-            return None
+            try:
+                raw_items = list(results)
+            except TypeError:
+                raw_items = results if isinstance(results, list) else []
+            except RecursionError as e:
+                lib_error_note = f"duckduckgo-search failed: {e}"
+                return None
 
-        items = [x for x in raw_items if isinstance(x, dict)]
-        _cache_put(cache_path, json.dumps(items, ensure_ascii=False))
+            items = [x for x in raw_items if isinstance(x, dict)]
+            _cache_put(cache_path, json.dumps(items, ensure_ascii=False))
 
         pairs: list[tuple[str, str]] = []
         seen: set[str] = set()

@@ -26,12 +26,29 @@ def _as_list(value: Any) -> list[Any] | None:
     return None
 
 
+def _parse_status_save(value: Any) -> dict[str, Any] | None:
+    if isinstance(value, dict):
+        return value
+    if isinstance(value, str):
+        s = value.strip()
+        if not s:
+            return None
+        try:
+            obj = json.loads(s)
+        except Exception:
+            return None
+        return obj if isinstance(obj, dict) else None
+    return None
+
+
 def _find_status_save(obj: Any, *, depth: int = 0, max_depth: int = 6) -> dict[str, Any] | None:
     if depth > max_depth:
         return None
     if isinstance(obj, dict):
-        if "StatusSave" in obj and isinstance(obj.get("StatusSave"), dict):
-            return obj.get("StatusSave")
+        if "StatusSave" in obj:
+            status = _parse_status_save(obj.get("StatusSave"))
+            if status is not None:
+                return status
         for v in obj.values():
             found = _find_status_save(v, depth=depth + 1, max_depth=max_depth)
             if found is not None:
@@ -48,8 +65,8 @@ def plsav_counts_from_data(data: Any) -> PlSavCounts:
     status = None
     if isinstance(data, dict):
         exp = data.get("Experiment")
-        if isinstance(exp, dict) and isinstance(exp.get("StatusSave"), dict):
-            status = exp.get("StatusSave")
+        if isinstance(exp, dict):
+            status = _parse_status_save(exp.get("StatusSave"))
     if status is None:
         status = _find_status_save(data)
 
@@ -96,4 +113,3 @@ def load_plsav_counts(
         raise PlSavError(f"Invalid .sav JSON: {e}") from e
 
     return plsav_counts_from_data(data)
-

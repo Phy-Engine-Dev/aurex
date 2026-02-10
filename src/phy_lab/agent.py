@@ -8,6 +8,7 @@ import json
 import logging
 import os
 import re
+import secrets
 import shutil
 import sys
 import threading
@@ -444,7 +445,7 @@ def _effective_system_prompt(*, cfg: Any, user_text: str) -> str:
         extra = (
             "关键约束（务必遵守）\n"
             "- 只回复当前提问者（当前这条评论的作者），不要面向其他人说话。\n"
-            "- 不要 @ 提及或点名任何其他用户。\n"
+            "- 不要 @ 提及任何其他用户（如需引用他人昵称/用户名，用普通文字即可，但不要 @）。\n"
             "- 请在这一条回复里给出完整结论；不要要求对方补充信息或进行追问。\n"
         )
         if one_shot:
@@ -453,7 +454,7 @@ def _effective_system_prompt(*, cfg: Any, user_text: str) -> str:
         extra = (
             "Critical constraints (must follow)\n"
             "- Reply ONLY to the author of the current comment.\n"
-            "- Do NOT address or @mention any other users.\n"
+            "- Do NOT @mention any other users (you may refer to a user by plain text name if needed, but no @mentions).\n"
             "- Provide a complete answer in this single reply; do not ask follow-up questions or request more context.\n"
         )
         if one_shot:
@@ -658,6 +659,11 @@ def _agent_parse_tool_call(raw: str) -> tuple[str, dict[str, Any], str]:
     # - aliases used by other router modes (e.g. "google" -> "web_search")
     def _normalize_tool_name(name: str) -> str:
         t = (name or "").strip()
+        # Common namespaces/prefixes some models invent.
+        for pfx in ("tool.", "tools.", "tool:", "tool/"):
+            if t.startswith(pfx):
+                t = t[len(pfx) :].strip()
+                break
         if t.startswith("tool_"):
             t = t[len("tool_") :].strip()
         aliases = {
@@ -703,6 +709,12 @@ def _agent_parse_tool_call(raw: str) -> tuple[str, dict[str, Any], str]:
     ):
         args = dict(args.get("args") or {})
 
+    # Heuristic repairs for common model schema mixups.
+    # Example: tool=plar_get_user_by_name but args look like list_plar (kind/category/user_id/take).
+    if tool == "plar_get_user_by_name" and not str(args.get("name") or "").strip():
+        if any(k in args for k in ("kind", "category", "take", "skip", "from", "days", "tags", "user_id")):
+            tool = "list_plar"
+
     final = ""
     if tool == "end":
         for k in ("final", "answer", "content", "message", "text"):
@@ -735,15 +747,17 @@ def _agent_tool_prompt(*, max_seconds: int) -> str:
         "Available tools:\n"
         "- web_search {query:str}\n"
         "- search_plar {query:str}  (LOOKUP ONLY: user name/id, or experiment/discussion id; NOT keyword search)\n"
-        "- list_plar {kind:str, ...}\n"
+        "- list_plar {kind:str, ...}  (LIST WORKS: supports user_id filter; use take=1 for 'first item')\n"
         "- plar_query_experiments {category:str, take?:int, skip?:int, days?:int, sort?:str}\n"
         "- plar_get_user_by_name {name:str}\n"
         "- plar_get_user_by_id {user_id:str}\n"
-        "- plar_get_user_board {user_id:str, take?:int, skip?:int}\n"
+        "- plar_get_user_board {user_id:str, take?:int, skip?:int}  (留言板评论/board; NOT the user's works list)\n"
         "- plar_get_experiment_context {summary_id:str, category:str}\n"
         "- plar_open_content_page {summary_id:str, category:\"Experiment\"|\"Discussion\", take?:int, skip?:int}\n"
         "- plar_get_status_save {summary_id:str, category:str}\n"
         "- plar_get_comments {target_type:str, target_id:str, take?:int, skip?:int}\n"
+        "- store_get {key:str, offset?:int, limit?:int}  (read a stored large tool result)\n"
+        "- store_json {key:str, path:str}  (extract JSON by dot path, e.g. experiment.items[0].subject)\n"
         "- simulate {text:str}\n"
         "- simulate_verilog {text:str}\n"
         "- simulate_status_save {summary_id:str, category:str, question?:str}\n"
@@ -754,6 +768,7 @@ def _agent_tool_prompt(*, max_seconds: int) -> str:
         "- If 'Context JSON (current page)' is present, use it directly; do NOT ask the user to provide context.\n"
         "- Only use web_search when needed for external/up-to-date info.\n"
         "- Never produce political content.\n"
+        "- If a tool result is too large, it may be stored and you will receive a store key; use store_get/store_json.\n"
         "- Physics Lab search limitation: do NOT assume a true keyword search exists.\n"
         "  - Use search_plar ONLY to LOOKUP by user name/id or content id.\n"
         "  - For discovery, use list_plar (latest/hot/featured/following/followers) and then open by ID.\n"
@@ -773,6 +788,7 @@ def _agent_tool_prompt(*, max_seconds: int) -> str:
         "\n"
         "list_plar kinds (examples):\n"
         "- {\"tool\":\"list_plar\",\"args\":{\"kind\":\"latest\",\"category\":\"both\",\"take\":10}}\n"
+        "- (first work) {\"tool\":\"list_plar\",\"args\":{\"kind\":\"latest\",\"category\":\"both\",\"user_id\":\"<uid>\",\"take\":1}}\n"
         "- {\"tool\":\"list_plar\",\"args\":{\"kind\":\"hot\",\"category\":\"Experiment\",\"days\":14,\"take\":10}}\n"
         "- {\"tool\":\"list_plar\",\"args\":{\"kind\":\"featured\",\"category\":\"Discussion\",\"take\":10}}\n"
         "- {\"tool\":\"list_plar\",\"args\":{\"kind\":\"following\",\"take\":50}}\n"
@@ -788,6 +804,9 @@ def _agent_tool_prompt(*, max_seconds: int) -> str:
         "- To view a user's works by nickname: plar_get_user_by_name -> list_plar with user_id.\n"
         "  - {\"tool\":\"plar_get_user_by_name\",\"args\":{\"name\":\"紫兰斋\"}}\n"
         "  - {\"tool\":\"list_plar\",\"args\":{\"kind\":\"latest\",\"category\":\"both\",\"user_id\":\"<uid>\",\"take\":5}}\n"
+        "- If a tool result is stored (shows key), you can extract fields with store_json:\n"
+        "  - {\"tool\":\"store_json\",\"args\":{\"key\":\"<key>\",\"path\":\"experiment.items[0].subject\"}}\n"
+        "  - {\"tool\":\"store_json\",\"args\":{\"key\":\"<key>\",\"path\":\"experiment.items[0].id\"}}\n"
         "- {\"tool\":\"plar_open_content_page\",\"args\":{\"summary_id\":\"<24hex>\",\"category\":\"Experiment\",\"take\":20,\"skip\":0}}  (read an experiment/discussion + recent comments)\n"
     )
 
@@ -842,11 +861,147 @@ def _shrink_context_json_for_llm(context_json: dict[str, Any]) -> dict[str, Any]
     return shrunk if isinstance(shrunk, dict) else {"_context": shrunk}
 
 
-def _agent_tool_result_message(*, tool: str, result: str) -> dict[str, str]:
+def _llm_store_root(cache_dir: str) -> str:
+    root = os.path.join(str(cache_dir or "").strip() or ".", "llm_store")
+    os.makedirs(root, exist_ok=True)
+    return root
+
+
+def _llm_store_key_is_safe(key: str) -> bool:
+    k = str(key or "").strip()
+    if not k:
+        return False
+    # Only allow hex-ish keys (timestamp + random).
+    return bool(re.fullmatch(r"[0-9a-f]{16,64}", k))
+
+
+def _llm_store_put(*, cache_dir: str, tool: str, content: str) -> str:
+    root = _llm_store_root(cache_dir)
+    # 24-hex-ish key; keep it filesystem-friendly.
+    key = f"{int(time.time() * 1000):x}{secrets.token_hex(8)}"
+    path = os.path.join(root, f"{key}.txt")
+    meta_path = os.path.join(root, f"{key}.meta.json")
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(str(content or ""))
+    meta = {"tool": str(tool or ""), "ts_ms": int(time.time() * 1000), "bytes": len(str(content or "").encode("utf-8"))}
+    try:
+        with open(meta_path, "w", encoding="utf-8") as f:
+            json.dump(meta, f, ensure_ascii=False, indent=2)
+            f.write("\n")
+    except Exception:
+        pass
+    return key
+
+
+def _llm_store_read(*, cache_dir: str, key: str) -> str:
+    if not _llm_store_key_is_safe(key):
+        raise ValueError("invalid store key")
+    root = _llm_store_root(cache_dir)
+    path = os.path.join(root, f"{key}.txt")
+    with open(path, "r", encoding="utf-8") as f:
+        return f.read()
+
+
+def _json_path_get(obj: Any, path: str) -> Any:
+    """Very small JSON path helper: dot segments + optional [index]."""
+    p = (path or "").strip()
+    if not p:
+        return obj
+    cur: Any = obj
+    # Split by dots, but keep bracket indices.
+    for seg in p.split("."):
+        seg = seg.strip()
+        if not seg:
+            continue
+        # Handle a.b[0].c
+        m = re.fullmatch(r"([A-Za-z0-9_-]+)(\[[0-9]+\])?", seg)
+        if not m:
+            raise ValueError("invalid path segment")
+        key = m.group(1)
+        idx = m.group(2)
+        if isinstance(cur, dict):
+            cur = cur.get(key)
+        else:
+            raise KeyError(key)
+        if idx:
+            if not isinstance(cur, list):
+                raise TypeError("not a list")
+            i = int(idx.strip("[]"))
+            cur = cur[i]
+    return cur
+
+
+def _agent_tool_result_message(*, tool: str, result: str, cache_dir: str) -> dict[str, str]:
     # Keep tool output bounded to avoid blowing up prompt size.
+    #
+    # If the tool output is large, store it and return a small pointer + summary
+    # so the LLM can query it via store_get/store_json without flooding the prompt.
+    max_inline_chars = 3500
+    raw = str(result or "")
+    stored_key = None
+    if len(raw) > max_inline_chars:
+        try:
+            stored_key = _llm_store_put(cache_dir=cache_dir, tool=tool, content=raw)
+        except Exception:
+            stored_key = None
+
+    if stored_key:
+        summary_obj: Any = None
+        if tool == "list_plar":
+            try:
+                obj = json.loads(raw)
+                if isinstance(obj, dict):
+                    out: dict[str, Any] = {"kind": obj.get("kind"), "category": obj.get("category")}
+                    for section in ("experiment", "discussion"):
+                        sec = obj.get(section)
+                        if not isinstance(sec, dict):
+                            continue
+                        sec_out: dict[str, Any] = {}
+                        for k in (
+                            "user_id",
+                            "take",
+                            "skip",
+                            "from",
+                            "sort",
+                            "days",
+                            "tags",
+                            "next_skip",
+                            "next_from",
+                        ):
+                            if k in sec:
+                                sec_out[k] = sec.get(k)
+                        items = sec.get("items")
+                        if isinstance(items, list):
+                            sec_out["items_total"] = len(items)
+                            sec_out["items"] = items[:3]
+                            if items and isinstance(items[0], dict):
+                                sec_out["first"] = {
+                                    "id": items[0].get("id"),
+                                    "subject": items[0].get("subject"),
+                                }
+                        out[section] = sec_out
+                    summary_obj = out
+            except Exception:
+                summary_obj = None
+        if summary_obj is None:
+            summary_obj = {"preview": truncate(raw, max_chars=800)}
+        pointer = {
+            "stored": True,
+            "key": stored_key,
+            "tool": tool,
+            "hint": (
+                "Use store_get {key, offset, limit} or store_json {key, path}. "
+                "For list_plar first item: experiment.items[0].subject / experiment.items[0].id"
+            )
+            if tool == "list_plar"
+            else "Use store_get {key, offset, limit} or store_json {key, path}.",
+            "summary": summary_obj,
+        }
+        return {"role": "system", "content": f"Tool result ({tool}):\n" + json.dumps(pointer, ensure_ascii=False, indent=2)}
+
     return {
         "role": "system",
-        "content": f"Tool result ({tool}):\n" + truncate(str(result or ""), max_chars=8000),
+        "content": f"Tool result ({tool}):\n" + truncate(raw, max_chars=4000),
     }
 
 
@@ -1108,6 +1263,10 @@ def _agent_execute_tool(
                         tags=tags,
                     )
                     obj = _compact(items)
+                    if user_id and isinstance(obj.get("items"), list):
+                        for it in obj["items"]:
+                            if isinstance(it, dict) and not it.get("user_id"):
+                                it["user_id"] = user_id
                     obj.update({"category": cat, "take": take, "skip": skip, "from": from_id, "sort": sort, "days": days_i, "user_id": user_id, "tags": tags})
                     # plweb2 pagination typically uses skip += Take and from = last.ID
                     obj["next_skip"] = skip + min(len(obj.get("items") or []), take)
@@ -1509,6 +1668,54 @@ def _agent_execute_tool(
                 indent=2,
             )
 
+        if tool == "store_get":
+            key = str(args.get("key") or "").strip()
+            if not key:
+                return "ERROR: missing args.key"
+            offset = int(args.get("offset") or 0)
+            limit = int(args.get("limit") or 1500)
+            if offset < 0:
+                offset = 0
+            if limit <= 0:
+                limit = 1500
+            if limit > 4000:
+                limit = 4000
+            try:
+                data = _llm_store_read(cache_dir=cache_dir, key=key)
+            except Exception as e:
+                return f"ERROR: store_get failed: {_format_exception_brief(e)}"
+            chunk = data[offset : offset + limit]
+            return json.dumps(
+                {
+                    "key": key,
+                    "offset": offset,
+                    "limit": limit,
+                    "total_len": len(data),
+                    "text": chunk,
+                    "next_offset": offset + len(chunk),
+                },
+                ensure_ascii=False,
+                indent=2,
+            )
+
+        if tool == "store_json":
+            key = str(args.get("key") or "").strip()
+            path = str(args.get("path") or "").strip()
+            if not key:
+                return "ERROR: missing args.key"
+            if not path:
+                return "ERROR: missing args.path"
+            try:
+                data = _llm_store_read(cache_dir=cache_dir, key=key)
+                obj = json.loads(data)
+                val = _json_path_get(obj, path)
+            except Exception as e:
+                return f"ERROR: store_json failed: {_format_exception_brief(e)}"
+            out = json.dumps(val, ensure_ascii=False, indent=2)
+            if len(out) > 4000:
+                out = out[:3960] + f"...<truncated len={len(out)}>"
+            return out
+
         if tool == "simulate":
             text = str(args.get("text") or "").strip()
             if not text:
@@ -1656,6 +1863,9 @@ def _agent_execute_tool(
                     "open_hint": open_hint,
                     "plsav_elements": getattr(res, "plsav_elements", None),
                     "publish_block_reason": getattr(res, "publish_block_reason", None),
+                    "artifact_dir": getattr(res, "artifact_dir", None),
+                    "artifact_sav_path": getattr(res, "artifact_sav_path", None),
+                    "artifact_verilog_path": getattr(res, "artifact_verilog_path", None),
                 },
                 ensure_ascii=False,
                 indent=2,
@@ -1690,6 +1900,8 @@ def agent_mode_run(
     wants_simulation = _looks_like_simulation_request(task)
     simulation_enabled = bool(getattr(getattr(cfg, "agent", None), "simulation_enabled", True))
     wants_content_intro = _looks_like_content_intro_request(task)
+    wants_first_work = _looks_like_first_work_request(task)
+    wants_circuit, _explicit_publish_intent = _fallback_route_for_circuit(task)
 
     start_ts = time.time()
     deadline = start_ts + float(max_seconds)
@@ -1709,6 +1921,40 @@ def agent_mode_run(
                     "- Do NOT provide hand-waved 'by calculation' results unless tools are disabled or fail.\n"
                     "- If Context JSON provides summary_id/category, prefer simulate_status_save.\n"
                     "- Keep simulation tool args tiny; never paste circuit/status JSON into args."
+                ),
+            }
+        )
+    if wants_first_work:
+        messages.append(
+            {
+                "role": "system",
+                "content": (
+                    "USER WORK LOOKUP DETECTED (first work / first item).\n"
+                    "Goal: answer with the FIRST item in the user's LATEST works list.\n"
+                    "Required steps:\n"
+                    "1) Lookup user -> plar_get_user_by_name {name:\"...\"} (get uid)\n"
+                    "2) List works -> list_plar {kind:\"latest\",category:\"both\",user_id:\"<uid>\",take:1}\n"
+                    "3) End with {\"tool\":\"end\",\"final\":\"...\"} and include Category + SummaryID + Subject.\n"
+                    "Notes:\n"
+                    "- plar_get_user_board is留言板评论, NOT works. Do NOT use it for works listing.\n"
+                    "- If list_plar result is stored (shows key), use store_json to extract fields like:\n"
+                    "  experiment.items[0].subject / experiment.items[0].id (or discussion.* if experiment is empty).\n"
+                ),
+            }
+        )
+    if wants_circuit:
+        messages.append(
+            {
+                "role": "system",
+                "content": (
+                    "CIRCUIT BUILD REQUEST DETECTED.\n"
+                    "Goal: generate a Physics Lab .sav circuit via the circuit tool.\n"
+                    "Rules:\n"
+                    "- Call the circuit tool AT MOST ONCE for a given spec.\n"
+                    "- After circuit returns, immediately end with {\"tool\":\"end\",\"final\":\"...\"}.\n"
+                    "- Do NOT call circuit again with identical args; use the previous tool result.\n"
+                    "- Keep publish=false unless the user explicitly asks to publish.\n"
+                    "In your final answer, include artifact_sav_path, artifact_verilog_path, and plsav_elements."
                 ),
             }
         )
@@ -1739,9 +1985,54 @@ def agent_mode_run(
         return f"Sorry — agent timed out ({mins} minutes) and couldn't finish this task. Please @me again with a shorter request."
 
     last_raw = ""
+    last_non_tool_output = ""
     did_use_simulation_tool = False
+    did_use_circuit_tool = False
+    last_circuit_info: dict[str, Any] | None = None
     did_open_content = False
     had_auth_failed = False
+    allowed_tools = {
+        "web_search",
+        "search_plar",
+        "list_plar",
+        "plar_query_experiments",
+        "plar_get_user_by_name",
+        "plar_get_user_by_id",
+        "plar_get_user_board",
+        "plar_get_experiment_context",
+        "plar_open_content_page",
+        "plar_get_status_save",
+        "plar_get_comments",
+        "store_get",
+        "store_json",
+        "simulate",
+        "simulate_verilog",
+        "simulate_status_save",
+        "circuit",
+        "end",
+    }
+    tool_sig_counts: dict[str, int] = {}
+    tool_sig_last_result: dict[str, str] = {}
+
+    def _tool_sig(tool_name: str, tool_args: dict[str, Any]) -> str:
+        try:
+            blob = json.dumps(
+                tool_args or {},
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+        except Exception:
+            blob = str(tool_args or "")
+        return f"{tool_name}:{blob}"
+
+    def _looks_like_tool_call_text(text: str) -> bool:
+        try:
+            _agent_parse_tool_call(text)
+            return True
+        except Exception:
+            return False
+
     for step in range(1, int(max_steps) + 1):
         now = time.time()
         time_left = int(max(0.0, deadline - now))
@@ -1770,7 +2061,7 @@ def agent_mode_run(
                     time_left,
                     len(messages),
                 )
-            raw_final = ollama.chat(messages=messages)
+            raw_final = ollama.chat(messages=messages, response_format="json")
             if debug_io:
                 logger.debug(
                     "agent.llm_out: step=%d len=%d preview=%r",
@@ -1803,7 +2094,7 @@ def agent_mode_run(
                         time_left,
                         len(messages),
                     )
-                raw_final2 = ollama.chat(messages=messages)
+                raw_final2 = ollama.chat(messages=messages, response_format="json")
                 if debug_io:
                     logger.debug(
                         "agent.llm_out: step=%d (retry_end) len=%d preview=%r",
@@ -1848,7 +2139,7 @@ def agent_mode_run(
                 time_left,
                 len(messages),
             )
-        raw = ollama.chat(messages=messages)
+        raw = ollama.chat(messages=messages, response_format="json")
         last_raw = raw
         try:
             tool, args, final = _agent_parse_tool_call(raw)
@@ -1861,6 +2152,7 @@ def agent_mode_run(
                     len(raw or ""),
                     truncate(raw or "", max_chars=debug_max),
                 )
+            last_non_tool_output = raw
             messages.append(
                 {
                     "role": "system",
@@ -1873,6 +2165,42 @@ def agent_mode_run(
                 }
             )
             continue
+
+        if tool not in allowed_tools:
+            messages.append(
+                {
+                    "role": "system",
+                    "content": (
+                        f"REJECTED: unknown tool '{tool}'. "
+                        "Output ONLY a valid tool call JSON using one of the allowed tools: "
+                        + ", ".join(sorted(allowed_tools))
+                    ),
+                }
+            )
+            continue
+
+        sig = ""
+        if tool != "end":
+            sig = _tool_sig(tool, args)
+            prev_n = int(tool_sig_counts.get(sig, 0) or 0)
+            prev_res = tool_sig_last_result.get(sig, "")
+            if tool == "circuit" and prev_n >= 1 and not str(prev_res or "").startswith("ERROR"):
+                dup_msg = (
+                    "ERROR: duplicate circuit tool call suppressed (identical args). "
+                    "Use the previous circuit tool result already returned, then call end."
+                )
+                if debug_io:
+                    logger.debug("agent.tool_call: step=%d duplicate tool=%s suppressed", step, tool)
+                messages.append({"role": "assistant", "content": raw})
+                messages.append(_agent_tool_result_message(tool=tool, result=dup_msg, cache_dir=cache_dir))
+                messages.append(
+                    {
+                        "role": "system",
+                        "content": "Now call {\"tool\":\"end\",\"final\":\"...\"} using the previous circuit result.",
+                    }
+                )
+                continue
+            tool_sig_counts[sig] = prev_n + 1
 
         if tool == "end":
             if (
@@ -1909,6 +2237,46 @@ def agent_mode_run(
                     }
                 )
                 continue
+            if wants_circuit and tools_enabled and (not did_use_circuit_tool):
+                messages.append(
+                    {
+                        "role": "system",
+                        "content": (
+                            "REJECTED: circuit build requested, but you did not run the circuit tool yet.\n"
+                            "Call: {\"tool\":\"circuit\",\"args\":{\"spec\":\"...\",\"publish\":false}}\n"
+                            "Then end with {\"tool\":\"end\",\"final\":\"...\"} including artifact_sav_path, artifact_verilog_path, plsav_elements."
+                        ),
+                    }
+                )
+                continue
+            if wants_circuit and did_use_circuit_tool and isinstance(last_circuit_info, dict):
+                sav = last_circuit_info.get("artifact_sav_path")
+                vpath = last_circuit_info.get("artifact_verilog_path")
+                elems = last_circuit_info.get("plsav_elements")
+                missing: list[str] = []
+                final_text = str(final or "")
+                if isinstance(sav, str) and sav.strip() and sav.strip() not in final_text:
+                    missing.append("artifact_sav_path")
+                if isinstance(vpath, str) and vpath.strip() and vpath.strip() not in final_text:
+                    missing.append("artifact_verilog_path")
+                if isinstance(elems, int) and str(elems) not in final_text and "plsav_elements" not in final_text:
+                    missing.append("plsav_elements")
+                if missing:
+                    messages.append(
+                        {
+                            "role": "system",
+                            "content": (
+                                "REJECTED: Your end.final is missing required circuit outputs: "
+                                + ", ".join(missing)
+                                + "\nUse these values from the circuit tool result:\n"
+                                + f"- artifact_sav_path: {sav}\n"
+                                + f"- artifact_verilog_path: {vpath}\n"
+                                + f"- plsav_elements: {elems}\n"
+                                "Now call {\"tool\":\"end\",\"final\":\"...\"} again."
+                            ),
+                        }
+                    )
+                    continue
             if debug_io:
                 logger.debug("agent.tool_call: step=%d tool=end final_len=%d", step, len(final or ""))
             out = safe_reply(final or "", max_chars=cfg.agent.max_reply_chars)
@@ -1940,6 +2308,14 @@ def agent_mode_run(
             requester_nickname=requester_nickname,
             requester_user_id=requester_user_id,
         )
+        if sig:
+            tool_sig_last_result[sig] = result
+        if tool == "circuit":
+            if not str(result or "").startswith("ERROR"):
+                did_use_circuit_tool = True
+            obj = _try_parse_json_object(result or "")
+            if isinstance(obj, dict):
+                last_circuit_info = obj
         if tool in ("plar_open_content_page", "plar_get_experiment_context"):
             obj = _try_parse_json_object(result or "")
             if isinstance(obj, dict) and obj.get("error") == "auth_failed":
@@ -1957,7 +2333,24 @@ def agent_mode_run(
                 truncate(result or "", max_chars=debug_max),
             )
         messages.append({"role": "assistant", "content": raw})
-        messages.append(_agent_tool_result_message(tool=tool, result=result))
+        messages.append(_agent_tool_result_message(tool=tool, result=result, cache_dir=cache_dir))
+        if tool == "circuit":
+            sav = last_circuit_info.get("artifact_sav_path") if isinstance(last_circuit_info, dict) else None
+            vpath = last_circuit_info.get("artifact_verilog_path") if isinstance(last_circuit_info, dict) else None
+            elems = last_circuit_info.get("plsav_elements") if isinstance(last_circuit_info, dict) else None
+            messages.append(
+                {
+                    "role": "system",
+                    "content": (
+                        "Circuit tool completed. Do NOT call any more tools.\n"
+                        "Next message MUST be: {\"tool\":\"end\",\"final\":\"...\"}\n"
+                        "Include these values:\n"
+                        f"- artifact_sav_path: {sav}\n"
+                        f"- artifact_verilog_path: {vpath}\n"
+                        f"- plsav_elements: {elems}"
+                    ),
+                }
+            )
         # Always remind remaining time after each tool result.
         now2 = time.time()
         time_left2 = int(max(0.0, deadline - now2))
@@ -1996,7 +2389,7 @@ def agent_mode_run(
             (time.time() < tool_cutoff_ts),
             len(messages),
         )
-    raw2 = ollama.chat(messages=messages)
+    raw2 = ollama.chat(messages=messages, response_format="json")
     try:
         tool, _args, final = _agent_parse_tool_call(raw2)
         if tool == "end":
@@ -2004,6 +2397,7 @@ def agent_mode_run(
                 logger.debug("agent.tool_call: budget_reached tool=end final_len=%d", len(final or ""))
             out = safe_reply(final or "", max_chars=cfg.agent.max_reply_chars)
             return out if out.strip() else "Done."
+        raw2 = ""
     except Exception:
         if debug_io:
             logger.debug(
@@ -2011,9 +2405,40 @@ def agent_mode_run(
                 len(raw2 or ""),
                 truncate(raw2 or "", max_chars=debug_max),
             )
-        pass
-    out = safe_reply(raw2 or last_raw or "Done.", max_chars=cfg.agent.max_reply_chars)
-    return out if out.strip() else "Done."
+        raw2 = ""
+
+    # One last retry: force an end tool call.
+    messages.append(
+        {
+            "role": "system",
+            "content": "REJECTED: budget reached. Output ONLY {\"tool\":\"end\",\"final\":\"...\"}.",
+        }
+    )
+    raw3 = ollama.chat(messages=messages, response_format="json")
+    try:
+        tool3, _args3, final3 = _agent_parse_tool_call(raw3)
+        if tool3 == "end":
+            out = safe_reply(final3 or "", max_chars=cfg.agent.max_reply_chars)
+            return out if out.strip() else "Done."
+        raw3 = ""
+    except Exception:
+        raw3 = ""
+
+    candidate = ""
+    for x in (last_non_tool_output, last_raw, raw2, raw3):
+        if isinstance(x, str) and x.strip() and (not _looks_like_tool_call_text(x)):
+            candidate = x
+            break
+    if candidate:
+        out = safe_reply(candidate, max_chars=cfg.agent.max_reply_chars)
+        return out if out.strip() else "Done."
+
+    is_cjk = any("\u4e00" <= ch <= "\u9fff" for ch in (task or ""))
+    return (
+        "抱歉，本次生成未能按协议结束（缺少 end）。请重试或缩短需求再试一次。"
+        if is_cjk
+        else "Sorry — the model failed to produce a valid end response. Please retry with a shorter request."
+    )
 
 def _llm_decide_web_search(
     *,
@@ -2187,6 +2612,24 @@ def _looks_like_simulation_request(user_text: str) -> bool:
             "时域",
             "直流分析",
             "交流分析",
+        )
+    )
+
+
+def _looks_like_first_work_request(user_text: str) -> bool:
+    t = (user_text or "").strip()
+    if not t:
+        return False
+    low = t.casefold()
+    return any(
+        x in low
+        for x in (
+            "第一个作品",
+            "第1个作品",
+            "第一个实验",
+            "第1个实验",
+            "first work",
+            "first experiment",
         )
     )
 

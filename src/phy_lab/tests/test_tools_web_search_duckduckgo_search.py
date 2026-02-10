@@ -66,6 +66,48 @@ class TestDuckDuckGoSearchBackend(unittest.TestCase):
                 data = json.load(f)
             self.assertIsInstance(data, list)
 
+    def test_duckduckgo_search_uses_cache_without_reinitializing_ddgs(self):
+        captured = {"init_calls": 0}
+
+        class FakeDDGS:
+            def __init__(self, **kwargs):
+                captured["init_calls"] += 1
+
+            def text(self, q, max_results=None):
+                return [{"title": "One", "href": "https://example.com/1"}]
+
+        fake_mod = types.ModuleType("duckduckgo_search")
+        fake_mod.DDGS = FakeDDGS  # type: ignore[attr-defined]
+
+        with tempfile.TemporaryDirectory() as td:
+            with mock.patch.dict(sys.modules, {"duckduckgo_search": fake_mod}):
+                out1 = tools.web_search_duckduckgo(
+                    query="Physics Lab AR",
+                    cache_dir=td,
+                    ttl_sec=3600,
+                    max_results=1,
+                )
+                self.assertIn("DuckDuckGo results:", out1)
+                self.assertEqual(captured["init_calls"], 1)
+
+                class FakeDDGS2:
+                    def __init__(self, **kwargs):
+                        raise AssertionError("DDGS should not be initialized when cache is fresh")
+
+                    def text(self, *_a, **_kw):
+                        return []
+
+                fake_mod.DDGS = FakeDDGS2  # type: ignore[attr-defined]
+
+                out2 = tools.web_search_duckduckgo(
+                    query="Physics Lab AR",
+                    cache_dir=td,
+                    proxy="",  # exercise the cached path (previous bug: kwargs undefined)
+                    ttl_sec=3600,
+                    max_results=1,
+                )
+                self.assertIn("DuckDuckGo results:", out2)
+
     def test_provider_alias_routes_to_duckduckgo(self):
         fake_mod = types.ModuleType("duckduckgo_search")
 

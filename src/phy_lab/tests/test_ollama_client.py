@@ -168,6 +168,34 @@ class TestOllamaClient(unittest.TestCase):
             out = c.chat(messages=[{"role": "user", "content": "x"}])
         self.assertIn('"tool": "list_plar"', out)
 
+    def test_response_format_is_sent(self):
+        captured = {"payload": None}
+
+        class _Resp:
+            ok = True
+
+            def json(self):
+                return {"message": {"content": "OK"}}
+
+        class _Session:
+            def __init__(self):
+                self.trust_env = True
+
+            def post(self, _url, json=None, timeout=None):
+                captured["payload"] = json
+                return _Resp()
+
+        fake_requests = types.ModuleType("requests")
+        fake_requests.Session = _Session  # type: ignore[attr-defined]
+        fake_requests.RequestException = Exception  # type: ignore[attr-defined]
+
+        with mock.patch.dict(sys.modules, {"requests": fake_requests}):
+            c = OllamaClient(base_url="http://127.0.0.1:11434", model="m")
+            out = c.chat(messages=[{"role": "user", "content": "x"}], response_format="json")
+        self.assertEqual(out, "OK")
+        self.assertIsInstance(captured["payload"], dict)
+        self.assertEqual(captured["payload"].get("format"), "json")
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -31,7 +31,20 @@ class TestPlSav(unittest.TestCase):
             self.assertEqual(c.elements, 3)
             self.assertEqual(c.wires, 2)
 
+    def test_counts_status_save_string(self):
+        status = {
+            "Elements": [{}, {}, {}],
+            "Wires": [{}, {}],
+        }
+        data = {"Experiment": {"StatusSave": json.dumps(status, ensure_ascii=False)}}
+        with tempfile.TemporaryDirectory() as td:
+            p = os.path.join(td, "x.sav")
+            with open(p, "w", encoding="utf-8") as f:
+                json.dump(data, f)
+            c = load_plsav_counts(p)
+            self.assertEqual(c.elements, 3)
+            self.assertEqual(c.wires, 2)
+
 
 if __name__ == "__main__":
     unittest.main()
-

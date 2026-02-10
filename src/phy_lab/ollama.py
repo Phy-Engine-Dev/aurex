@@ -52,6 +52,10 @@ def _tool_calls_to_agent_json(tool_calls: Any) -> str | None:
     if not isinstance(name, str) or not name.strip():
         return None
     name = name.strip()
+    for pfx in ("tool.", "tools.", "tool:", "tool/"):
+        if name.startswith(pfx):
+            name = name[len(pfx) :].strip()
+            break
     if name.startswith("tool_"):
         name = name[len("tool_") :].strip()
 
@@ -130,7 +134,7 @@ class OllamaClient:
         )
         return [{"role": "system", "content": header}] + list(messages)
 
-    def chat(self, *, messages: list[dict[str, str]]) -> str:
+    def chat(self, *, messages: list[dict[str, str]], response_format: str | None = None) -> str:
         try:
             import requests
         except ImportError as e:  # pragma: no cover
@@ -146,6 +150,10 @@ class OllamaClient:
             "stream": False,
             "options": {"temperature": self.temperature, "num_predict": int(self.num_predict)},
         }
+        rf = str(response_format or "").strip().lower()
+        if rf:
+            # Ollama supports `format: "json"` to force strict JSON outputs.
+            payload["format"] = rf
 
         # Avoid accidentally proxying localhost (common when users set HTTP_PROXY for web search).
         session = requests.Session()
@@ -175,6 +183,18 @@ class OllamaClient:
 
             if not resp.ok:
                 body = resp.text
+                body_low = (body or "").casefold()
+                # Some older Ollama servers may not support the `format` field.
+                if (
+                    rf
+                    and attempt == 1
+                    and int(getattr(resp, "status_code", 0) or 0) in (400, 404)
+                    and "format" in body_low
+                    and any(x in body_low for x in ("unknown", "unsupported", "unrecognized", "invalid"))
+                ):
+                    payload.pop("format", None)
+                    rf = ""
+                    continue
                 if len(body) > 2000:
                     body = body[:2000] + "...(truncated)"
                 raise OllamaError(f"Ollama error {resp.status_code}: {body}")
@@ -265,9 +285,9 @@ class OllamaPool:
     def size(self) -> int:
         return self._size
 
-    def chat(self, *, messages: list[dict[str, str]]) -> str:
+    def chat(self, *, messages: list[dict[str, str]], response_format: str | None = None) -> str:
         client = self._q.get()
         try:
-            return client.chat(messages=messages)
+            return client.chat(messages=messages, response_format=response_format)
         finally:
             self._q.put(client)
