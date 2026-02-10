@@ -18,6 +18,8 @@ class PESample:
     voltage_ord: list[int]
     current: list[float]
     current_ord: list[int]
+    digital: list[int]
+    digital_ord: list[int]
     comp_size: int
 
 
@@ -36,6 +38,18 @@ def _run_and_sample_inner(
         properties=built.properties,
     )
     try:
+        raw_ticks = getattr(spec, "digital_clk_ticks", None)
+        if raw_ticks is None:
+            # For non-transient analyses, one digital tick helps settle digital/hybrid models
+            # (DC/AC analyze does not call digital_clk internally).
+            digital_clk_ticks = 1 if str(getattr(spec, "analysis_type", "")).lower() in ("dc", "ac") else 0
+        else:
+            digital_clk_ticks = int(raw_ticks)
+        if digital_clk_ticks < 0:
+            digital_clk_ticks = 0
+        if digital_clk_ticks > 1_000_000:
+            digital_clk_ticks = 1_000_000
+
         if spec.analysis_type == "dc":
             pe.set_analyze_type(circuit=circuit, analyze_type=AnalyzeType.DC)
         elif spec.analysis_type == "ac":
@@ -57,7 +71,10 @@ def _run_and_sample_inner(
             pe.set_tr(circuit=circuit, t_step=t_step, t_stop=t_stop)
 
         pe.analyze(circuit=circuit)
-        voltage, voltage_ord, current, current_ord, _dig, _dig_ord = pe.sample(
+        if digital_clk_ticks:
+            for _ in range(digital_clk_ticks):
+                pe.digital_clk(circuit=circuit)
+        voltage, voltage_ord, current, current_ord, digital, digital_ord = pe.sample_u8(
             circuit=circuit,
             vec_pos=vec_pos,
             chunk_pos=chunk_pos,
@@ -70,6 +87,8 @@ def _run_and_sample_inner(
             voltage_ord=voltage_ord,
             current=current,
             current_ord=current_ord,
+            digital=digital,
+            digital_ord=digital_ord,
             comp_size=comp_size,
         )
     finally:
@@ -130,6 +149,30 @@ def node_voltage(*, built: BuiltCircuit, sample: PESample, node: str) -> float |
     return float(sample.voltage[start + int(pin)])
 
 
+def node_digital(*, built: BuiltCircuit, sample: PESample, node: str) -> int | None:
+    n = (node or "").strip()
+    if not n:
+        return None
+    if n.casefold() in ("gnd", "ground", "0"):
+        return 0
+    ref = built.node_to_pin.get(n) or built.node_to_pin.get(n.casefold())
+    if not ref:
+        return None
+    ei, pin = ref
+    ci = _comp_index_for_element_index(int(ei))
+    if ci is None or ci + 1 >= len(sample.digital_ord):
+        return None
+    start = int(sample.digital_ord[ci])
+    end = int(sample.digital_ord[ci + 1])
+    if (end - start) <= int(pin):
+        return None
+    try:
+        v = int(sample.digital[start + int(pin)])
+    except Exception:
+        return None
+    return 1 if v else 0
+
+
 def component_current(*, built: BuiltCircuit, sample: PESample, cid: str) -> float | None:
     ei = built.element_index_by_id.get(cid)
     if ei is None:
@@ -172,6 +215,8 @@ def evaluate_probes(
         target = str(p.get("target") or "").strip()
         if kind == "node_voltage":
             out.append({"kind": kind, "target": target, "value": node_voltage(built=built, sample=sample, node=target)})
+        elif kind == "node_digital":
+            out.append({"kind": kind, "target": target, "value": node_digital(built=built, sample=sample, node=target)})
         elif kind == "component_current":
             out.append(
                 {

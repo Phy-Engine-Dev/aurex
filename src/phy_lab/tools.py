@@ -151,6 +151,63 @@ def llm_summarize(*, ollama: OllamaClient, system_prompt: str, text: str) -> str
     return llm_chat(ollama=ollama, system_prompt=system_prompt, user_text=prompt)
 
 
+def _pe_models_reference_for_prompt() -> str:
+    # Keep this in sync with the validator/builder (pe_builder._MODEL_SPECS).
+    try:
+        from pe_builder import _MODEL_SPECS  # type: ignore
+    except Exception:
+        return ""
+
+    lines: list[str] = []
+    for name in sorted(_MODEL_SPECS.keys()):
+        ms = _MODEL_SPECS[name]
+        pin_count = int(getattr(ms, "pin_count", 0) or 0)
+        props = []
+        for ps in getattr(ms, "props", ()) or ():
+            k = str(getattr(ps, "key", "") or "").strip()
+            if k:
+                props.append(k)
+        props_txt = ", ".join(props) if props else "none"
+        src = " (source/input)" if bool(getattr(ms, "counts_as_source", False)) else ""
+        lines.append(f"- {name}{src}: nodes={pin_count}, params={props_txt}")
+    return "\n".join(lines)
+
+
+def _pe_pin_order_notes_for_prompt() -> str:
+    # Pin order matters for many multi-pin elements; this list follows the model headers in
+    # `third-parties/Phy-Engine/include/phy_engine/model/models`.
+    return (
+        "Pin order notes (for the nodes[] list in JSON, and for ADD node order in PE-SCRIPT):\n"
+        "- vccs/vcvs/cccs/ccvs: [S, T, P, Q] (output S-T controlled by P-Q)\n"
+        "- transformer: [P, Q, S, T] (primary P-Q, secondary S-T)\n"
+        "- coupled_inductors: [P1, P2, S1, S2] (winding1 P1-P2, winding2 S1-S2)\n"
+        "- transformer_center_tap: [P, Q, S1, CT, S2]\n"
+        "- op_amp: [+, -, OUT+, OUT-]\n"
+        "- relay: [C+, C-, A, B] (coil C+/C-, contact A-B)\n"
+        "- comparator: [A, B, o]\n"
+        "- full_bridge_rectifier: [A, B, +, -]\n"
+        "- bjt_npn/bjt_pnp: [B, C, E]\n"
+        "- nmosfet/pmosfet: [D, G, S]\n"
+        "- bsim3v32_nmos/bsim3v32_pmos: [D, G, S, B]\n"
+        "- digital_input: [o]; digital_output: [i]\n"
+        "- digital_not/digital_yes/digital_schmitt_trigger: [i, o]\n"
+        "- digital_and/or/xor/xnor/nand/nor/imp/nimp: [ia, ib, o]\n"
+        "- digital_tri: [i, en, o]\n"
+        "- digital_half_adder: [ia, ib, s, c]\n"
+        "- digital_full_adder: [ia, ib, cin, s, cout]\n"
+        "- digital_half_subtractor: [ia, ib, d, b]\n"
+        "- digital_full_subtractor: [ia, ib, bin, d, bout]\n"
+        "- digital_mul2: [a0, a1, b0, b1, p0, p1, p2, p3]\n"
+        "- digital_dff: [d, clk, q]\n"
+        "- digital_tff: [t, clk, q]\n"
+        "- digital_t_bar_ff: [t_bar, clk, q]\n"
+        "- digital_jkff: [j, k, clk, q]\n"
+        "- digital_counter4: [q3, q2, q1, q0, clk, en]\n"
+        "- digital_random_generator4: [q3, q2, q1, q0, clk, reset_n]\n"
+        "- digital_eight_bit_input/digital_eight_bit_display: [b7, b6, b5, b4, b3, b2, b1, b0]\n"
+    )
+
+
 def llm_build_pe_sim_spec_json(
     *,
     ollama: OllamaClient,
@@ -167,6 +224,8 @@ def llm_build_pe_sim_spec_json(
             + json.dumps(context_json, ensure_ascii=False, indent=2)
             + "\n\n"
         )
+    model_ref = _pe_models_reference_for_prompt()
+    pin_notes = _pe_pin_order_notes_for_prompt()
     prompt = (
         "Convert the user's request into a strict JSON specification for a Phy-Engine circuit simulation.\n"
         "\n"
@@ -175,8 +234,9 @@ def llm_build_pe_sim_spec_json(
         "- `analysis` MUST be an object.\n"
         "- `components` MUST be a JSON ARRAY ([]) even if there is only 1 component.\n"
         "- `probes` MUST be a JSON ARRAY ([]). If none, use [] (not null).\n"
-        "- `nodes` MUST be an array of exactly 2 strings.\n"
-        "- `params` MUST be an object; ALL values MUST be numbers (no strings like \"1k\" / \"10u\").\n"
+        "- `nodes` MUST be a JSON array of strings; its length MUST match the required pin count for that component type.\n"
+        "- `params` MUST be an object; ALL values MUST be numbers (no strings like \"1k\" / \"10u\"). Use {} if none.\n"
+        "- `analysis.digital_clk_ticks` MUST be an integer or null.\n"
         "\n"
         "You MUST follow this JSON schema exactly (no extra keys):\n"
         "{\n"
@@ -184,40 +244,31 @@ def llm_build_pe_sim_spec_json(
         '    "type": "dc" | "ac" | "tr",\n'
         '    "ac_omega_rad_s": number | null,\n'
         '    "tr_t_step_s": number | null,\n'
-        '    "tr_t_stop_s": number | null\n'
+        '    "tr_t_stop_s": number | null,\n'
+        '    "digital_clk_ticks": int | null\n'
         "  },\n"
         '  "components": [\n'
         "    {\n"
         '      "id": "R1",\n'
-        '      "type": "resistor" | "capacitor" | "inductor" | "vdc" | "idc" | "vac" | "iac",\n'
-        '      "nodes": ["n1", "n2"],\n'
+        '      "type": "<one of the supported types>",\n'
+        '      "nodes": ["..."],\n'
         '      "params": { ...numbers... }\n'
         "    }\n"
         "  ],\n"
         '  "probes": [\n'
-        "    {\"kind\":\"node_voltage\"|\"component_current\"|\"component_vdrop\",\"target\":\"...\"}\n"
+        "    {\"kind\":\"node_voltage\"|\"node_digital\"|\"component_current\"|\"component_vdrop\",\"target\":\"...\"}\n"
         "  ]\n"
         "}\n"
         "\n"
-        "Type notes (important):\n"
-        "- `type` MUST be exactly one of: resistor, capacitor, inductor, vdc, idc, vac, iac.\n"
-        "- If the user says 学生电源/电源/电池/电压源, use type=vdc.\n"
-        "- Do NOT invent other types like \"student source\" / \"power supply\".\n"
-        "\n"
-        "Component param rules:\n"
-        "- resistor: params MUST contain {\"r_ohm\": <number>}\n"
-        "- capacitor: params MUST contain {\"c_f\": <number>}\n"
-        "- inductor: params MUST contain {\"l_h\": <number>}\n"
-        "- vdc: params MUST contain {\"v_v\": <number>}\n"
-        "- idc: params MUST contain {\"i_a\": <number>}\n"
-        "- vac: params MUST contain {\"vp_v\": <number>, \"freq_hz\": <number>, \"phase_deg\": <number>}\n"
-        "- iac: params MUST contain {\"ip_a\": <number>, \"freq_hz\": <number>, \"phase_deg\": <number>}\n"
-        "\n"
-        "Hard constraints:\n"
+        + pin_notes
+        + "\n"
+        + "Supported component types (canonical), with required nodes length and params:\n"
+        + (model_ref + "\n" if model_ref else "")
+        + "Hard constraints:\n"
         f"- 1 <= components.length <= {int(max_components)}\n"
         f"- 0 <= probes.length <= {int(max_probes)}\n"
-        "- You MUST include a ground node named exactly \"gnd\" connected to the circuit.\n"
-        "- Include at least ONE source component: vdc|idc|vac|iac.\n"
+        "- If the circuit contains ANY non-digital component (type not starting with 'digital_'), include a ground node named exactly \"gnd\" connected to the circuit.\n"
+        "- Include at least ONE source/input component (marked as source/input in the table above).\n"
         "- Use simple node names like: gnd, n1, n2, vin, vout.\n"
         "\n"
         "Analysis selection rules:\n"
@@ -225,16 +276,7 @@ def llm_build_pe_sim_spec_json(
         "- Use \"tr\" if the user asks about timing / charging / oscillation, or if capacitors/inductors are present.\n"
         "- Use \"ac\" only if the user asks about frequency response; if so, set ac_omega_rad_s.\n"
         "- For \"tr\": set BOTH tr_t_step_s and tr_t_stop_s (e.g. 1e-6 and 1e-3).\n"
-        "\n"
-        "Minimal example (format only):\n"
-        "{\n"
-        '  \"analysis\": {\"type\":\"dc\",\"ac_omega_rad_s\":null,\"tr_t_step_s\":null,\"tr_t_stop_s\":null},\n'
-        '  \"components\": [\n'
-        '    {\"id\":\"V1\",\"type\":\"vdc\",\"nodes\":[\"vin\",\"gnd\"],\"params\":{\"v_v\":5}},\n'
-        '    {\"id\":\"R1\",\"type\":\"resistor\",\"nodes\":[\"vin\",\"gnd\"],\"params\":{\"r_ohm\":1000}}\n'
-        "  ],\n"
-        '  \"probes\": [{\"kind\":\"node_voltage\",\"target\":\"vin\"}]\n'
-        "}\n"
+        "- For digital circuits in dc/ac: set digital_clk_ticks>=1 to settle logic; use larger values to advance sequential logic.\n"
         "\n"
         "Output rules:\n"
         "- Output ONLY valid JSON (no markdown/code fences, no explanations).\n"
@@ -285,6 +327,8 @@ def llm_fix_pe_sim_spec_json(
             + json.dumps(context_json, ensure_ascii=False, indent=2)
             + "\n\n"
         )
+    model_ref = _pe_models_reference_for_prompt()
+    pin_notes = _pe_pin_order_notes_for_prompt()
     prompt = (
         "You previously produced a JSON specification for a Phy-Engine circuit simulation, but it failed validation.\n"
         "Fix the JSON so it passes the validator.\n"
@@ -294,8 +338,9 @@ def llm_fix_pe_sim_spec_json(
         "- `analysis` MUST be an object.\n"
         "- `components` MUST be a JSON ARRAY ([]), not an object.\n"
         "- `probes` MUST be a JSON ARRAY ([]), not null.\n"
-        "- `nodes` MUST be an array of exactly 2 strings.\n"
-        "- `params` MUST be an object; ALL values MUST be numbers (no strings like \"1k\").\n"
+        "- `nodes` MUST be a JSON array of strings; its length MUST match the required pin count for that component type.\n"
+        "- `params` MUST be an object; ALL values MUST be numbers (no strings like \"1k\"). Use {} if none.\n"
+        "- `analysis.digital_clk_ticks` MUST be an integer or null.\n"
         "\n"
         "You MUST follow this JSON schema exactly:\n"
         "{\n"
@@ -303,31 +348,34 @@ def llm_fix_pe_sim_spec_json(
         '    "type": "dc" | "ac" | "tr",\n'
         '    "ac_omega_rad_s": number | null,\n'
         '    "tr_t_step_s": number | null,\n'
-        '    "tr_t_stop_s": number | null\n'
+        '    "tr_t_stop_s": number | null,\n'
+        '    "digital_clk_ticks": int | null\n'
         "  },\n"
         '  "components": [\n'
         "    {\n"
         '      "id": "R1",\n'
-        '      "type": "resistor" | "capacitor" | "inductor" | "vdc" | "idc" | "vac" | "iac",\n'
-        '      "nodes": ["n1", "n2"],\n'
-        '      "params": { "r_ohm"/"c_f"/"l_h"/"v_v"/"i_a"/("vp_v","freq_hz","phase_deg") : number }\n'
+        '      "type": "<one of the supported types>",\n'
+        '      "nodes": ["..."],\n'
+        '      "params": { ...numbers... }\n'
         "    }\n"
         "  ],\n"
         '  "probes": [\n'
-        "    {\"kind\":\"node_voltage\"|\"component_current\"|\"component_vdrop\",\"target\":\"...\"}\n"
+        "    {\"kind\":\"node_voltage\"|\"node_digital\"|\"component_current\"|\"component_vdrop\",\"target\":\"...\"}\n"
         "  ]\n"
         "}\n"
         "\n"
-        "Hard constraints:\n"
+        + pin_notes
+        + "\n"
+        + "Supported component types (canonical), with required nodes length and params:\n"
+        + (model_ref + "\n" if model_ref else "")
+        + "Hard constraints:\n"
         f"- components.length MUST be between 1 and {int(max_components)}.\n"
         f"- probes.length MUST be between 0 and {int(max_probes)}.\n"
-        "- Every component must be a 2-terminal element (nodes length exactly 2).\n"
-        "- You MUST include a ground node named exactly 'gnd'.\n"
+        "- If the circuit contains ANY non-digital component (type not starting with 'digital_'), include a ground node named exactly \"gnd\" connected to the circuit.\n"
+        "- Include at least ONE source/input component (marked as source/input in the table above).\n"
         "- Use simple node names like: gnd, n1, n2, vin, vout.\n"
-        "- Use SI units (Ohm, Farad, Henry, Volt, Ampere).\n"
-        "- Include at least ONE source component: vdc|idc|vac|iac.\n"
-        "- `type` MUST be exactly one of: resistor, capacitor, inductor, vdc, idc, vac, iac.\n"
-        "- If the user says 学生电源/电源/电池/电压源, that is vdc.\n"
+        "- For \"tr\": set BOTH tr_t_step_s and tr_t_stop_s.\n"
+        "- For digital circuits in dc/ac: set digital_clk_ticks>=1 to settle logic.\n"
         "\n"
         "Output rules:\n"
         "- Output ONLY valid JSON (no markdown, no comments).\n"
@@ -370,40 +418,41 @@ def llm_build_pe_sim_script(
             + json.dumps(context_json, ensure_ascii=False, indent=2)
             + "\n\n"
         )
+    model_ref = _pe_models_reference_for_prompt()
+    pin_notes = _pe_pin_order_notes_for_prompt()
     prompt = (
         "Write a PE-SCRIPT (a safe, line-based command script) to build and simulate a circuit.\n"
         "You must follow the command grammar exactly. Output ONLY the script lines.\n"
         "\n"
         "Command reference (one per line; case-insensitive):\n"
         "- ANALYSIS <dc|ac|tr>\n"
-        "- SET AC_OMEGA <omega_rad_s>           (only for ac)\n"
-        "- SET TR <t_step_s> <t_stop_s>        (only for tr)\n"
-        "- ADD <ID> <TYPE> <NODE0> <NODE1> <k=v ...>\n"
-        "    TYPE: resistor|r, capacitor|c, inductor|l, vdc, idc, vac, iac\n"
-        "    Params:\n"
-        "      - resistor: r=<ohm>\n"
-        "      - capacitor: c=<farad>\n"
-        "      - inductor: l=<henry>\n"
-        "      - vdc: v=<volt>\n"
-        "      - idc: i=<amp>\n"
-        "      - vac: vp=<volt_peak> freq=<hz> phase=<deg>\n"
-        "      - iac: ip=<amp_peak> freq=<hz> phase=<deg>\n"
-        "- WIRE <NODE> <ID.PIN> [ID.PIN ...]   (optional; PIN is 0 or 1)\n"
+        "- SET AC_OMEGA <omega_rad_s>                (only for ac)\n"
+        "- SET TR <t_step_s> <t_stop_s>             (only for tr)\n"
+        "- SET DIGITAL_CLK_TICKS <int>              (optional; for digital circuits in dc/ac)\n"
+        "- ADD <ID> <TYPE> <NODE0> ... <NODE{N-1}> [k=v ...]\n"
+        "    - N depends on TYPE (see the model table below).\n"
+        "    - Params: use k=v for each required param key for that TYPE; paramless types must have no params.\n"
+        "    - Common aliases: resistor=r, capacitor=c, inductor=l.\n"
+        "- WIRE <NODE> <ID.PIN> [ID.PIN ...]        (optional; PIN is 0..N-1)\n"
         "- PROBE NODE <NODE>\n"
+        "- PROBE DNODE <NODE>                       (digital 0/1)\n"
         "- PROBE I <ID>\n"
         "- PROBE VDROP <ID>\n"
         "- RUN                                 (optional marker)\n"
         "\n"
-        "Wiring rules:\n"
+        + pin_notes
+        + "\n"
+        + "Supported component types (canonical), with required node count and params:\n"
+        + (model_ref + "\n" if model_ref else "")
+        + "Wiring rules:\n"
         "- Pins that share the same NODE name are connected.\n"
-        "- You MUST include a ground node named exactly 'gnd' connected to the circuit.\n"
+        "- For analog circuits (any non-digital type), include a ground node named exactly 'gnd'.\n"
         "\n"
         "Hard constraints:\n"
         f"- At most {int(max_components)} ADD commands.\n"
         f"- At most {int(max_probes)} PROBE commands.\n"
-        "- Every component must be a 2-terminal element.\n"
-        "- Use simple node names like: gnd, n1, n2, vin, vout.\n"
-        "- Use SI units (Ohm, Farad, Henry, Volt, Ampere).\n"
+        "- Use simple node names like: gnd, n1, n2, vin, vout, clk.\n"
+        "- Use SI units (Ohm, Farad, Henry, Volt, Ampere, seconds).\n"
         "- If the user mentions 学生电源/电源/电池, model it as VDC (type=vdc with v=<volt>).\n"
         "\n"
         "Output rules:\n"
@@ -532,6 +581,8 @@ def simulate_ai_circuit_with_phyengine(
     voltage_ord = list(sample.voltage_ord)
     current = list(sample.current)
     current_ord = list(sample.current_ord)
+    digital = list(sample.digital)
+    digital_ord = list(sample.digital_ord)
 
     # Helpers for extracting values.
     def comp_index_for_element_index(element_index: int) -> int | None:
@@ -558,6 +609,29 @@ def simulate_ai_circuit_with_phyengine(
         if (end - start) <= pin:
             return None
         return float(voltage[start + pin])
+
+    def node_digital(node: str) -> int | None:
+        n = (node or "").strip()
+        if not n:
+            return None
+        if n.casefold() in ("gnd", "ground", "0"):
+            return 0
+        ref = built.node_to_pin.get(n) or built.node_to_pin.get(n.casefold())  # best effort
+        if not ref:
+            return None
+        ei, pin = ref
+        ci = comp_index_for_element_index(ei)
+        if ci is None or ci + 1 >= len(digital_ord):
+            return None
+        start = digital_ord[ci]
+        end = digital_ord[ci + 1]
+        if (end - start) <= pin:
+            return None
+        try:
+            v = int(digital[start + pin])
+        except Exception:
+            return None
+        return 1 if v else 0
 
     def component_current(cid: str) -> float | None:
         ei = built.element_index_by_id.get(cid)
@@ -590,9 +664,11 @@ def simulate_ai_circuit_with_phyengine(
     probes = list(spec.probes)
     if not probes:
         # Default probes: show node voltages (excluding gnd) and per-component current/vdrop (limited).
+        has_digital = any(str(getattr(c, "type", "")).startswith("digital_") for c in spec.components)
+        node_kind = "node_digital" if has_digital else "node_voltage"
         node_names = [n for n in built.node_to_pin.keys() if n != "gnd"]
         for n in node_names[: max(0, max_probes // 2)]:
-            probes.append(PEProbe(kind="node_voltage", target=n))
+            probes.append(PEProbe(kind=node_kind, target=n))
         for comp in spec.components[: max(0, max_probes // 2)]:
             probes.append(PEProbe(kind="component_current", target=comp.id))
 
@@ -611,6 +687,12 @@ def simulate_ai_circuit_with_phyengine(
                 lines.append(f"- V({p.target}) = <unavailable>")
             else:
                 lines.append(f"- V({p.target}) = {v:.6g} V")
+        elif p.kind == "node_digital":
+            d = node_digital(p.target)
+            if d is None:
+                lines.append(f"- D({p.target}) = <unavailable>")
+            else:
+                lines.append(f"- D({p.target}) = {int(d)}")
         elif p.kind == "component_current":
             i = component_current(p.target)
             if i is None:
@@ -683,9 +765,11 @@ def simulate_ai_script_circuit_with_phyengine(
 
     probes = list(spec.probes)
     if not probes:
+        has_digital = any(str(getattr(c, "type", "")).startswith("digital_") for c in spec.components)
+        node_kind = "node_digital" if has_digital else "node_voltage"
         node_names = [n for n in built.node_to_pin.keys() if n != "gnd"]
         for n in node_names[: max(0, max_probes // 2)]:
-            probes.append(PEProbe(kind="node_voltage", target=n))
+            probes.append(PEProbe(kind=node_kind, target=n))
         for comp in spec.components[: max(0, max_probes // 2)]:
             probes.append(PEProbe(kind="component_current", target=comp.id))
 
@@ -711,6 +795,7 @@ def simulate_ai_script_circuit_with_phyengine(
             "ac_omega_rad_s": spec.ac_omega_rad_s,
             "tr_t_step_s": spec.tr_t_step_s,
             "tr_t_stop_s": spec.tr_t_stop_s,
+            "digital_clk_ticks": spec.digital_clk_ticks,
         },
         "components": [
             {"id": c.id, "type": c.type, "nodes": list(c.nodes), "params": dict(c.params)}

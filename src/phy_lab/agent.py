@@ -1882,7 +1882,7 @@ def agent_mode_run(
     history: list[dict[str, str]],
     requester_nickname: str | None = None,
     requester_user_id: str | None = None,
-    max_seconds: int = 900,
+    max_seconds: int = 600,
     max_steps: int = 100,
 ) -> str:
     task = (task or "").strip()

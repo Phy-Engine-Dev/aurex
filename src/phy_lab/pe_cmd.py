@@ -4,6 +4,7 @@ import re
 from dataclasses import dataclass
 from typing import Any
 
+from pe_builder import _MODEL_SPECS, _canonical_component_type  # type: ignore
 
 class PEScriptError(RuntimeError):
     pass
@@ -11,7 +12,7 @@ class PEScriptError(RuntimeError):
 
 _ID_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_]{0,31}$")
 _NODE_RE = re.compile(r"^[A-Za-z0-9_:+.-]{1,32}$")
-_PIN_REF_RE = re.compile(r"^(?P<id>[A-Za-z][A-Za-z0-9_]{0,31})\.(?P<pin>[01])$")
+_PIN_REF_RE = re.compile(r"^(?P<id>[A-Za-z][A-Za-z0-9_]{0,31})\.(?P<pin>[0-9]{1,3})$")
 _PARAM_KEY_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_]{0,31}$")
 _ENG_NUM_RE = re.compile(
     r"^\s*(?P<num>[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?)"
@@ -83,94 +84,32 @@ def _parse_float(token: str, *, where: str) -> float:
 
 
 def _canonical_type(t: str) -> str:
-    x = (t or "").strip().lower()
-    if x in ("r", "resistor"):
-        return "resistor"
-    if x in ("c", "cap", "capacitor"):
-        return "capacitor"
-    if x in ("l", "ind", "inductor"):
-        return "inductor"
-    if x in ("vdc",):
-        return "vdc"
-    if x in ("idc",):
-        return "idc"
-    if x in ("vac",):
-        return "vac"
-    if x in ("iac",):
-        return "iac"
-    # Common aliases / UI terms.
-    x2 = re.sub(r"\\s+", " ", x.replace("_", " ")).strip()
-    if x2 in ("dc", "dc source", "voltage source", "battery", "cell", "student source", "student power"):
-        return "vdc"
-    if x2 in ("current source", "dc current"):
-        return "idc"
-    if x2 in ("ac", "ac source"):
-        return "vac"
-    if x2 in ("ac current",):
-        return "iac"
-    if x2 in ("电源", "直流电源", "学生电源", "电压源", "电池"):
-        return "vdc"
-    if x2 in ("电流源", "直流电流源"):
-        return "idc"
-    if x2 in ("交流电源", "交流电压源"):
-        return "vac"
-    if x2 in ("交流电流源",):
-        return "iac"
-    if x2 in ("电阻", "电阻器"):
-        return "resistor"
-    if x2 in ("电容", "电容器"):
-        return "capacitor"
-    if x2 in ("电感", "电感器"):
-        return "inductor"
-    return x
+    return _canonical_component_type(t)
 
 
 def _param_key_map(ctype: str) -> dict[str, str]:
-    # Maps DSL keys to pe_builder expected keys.
-    if ctype == "resistor":
-        return {
-            "r": "r_ohm",
-            "r_ohm": "r_ohm",
-            "ohm": "r_ohm",
-            "resistance": "r_ohm",
-            "resistance_ohm": "r_ohm",
-            "电阻": "r_ohm",
-        }
-    if ctype == "capacitor":
-        return {"c": "c_f", "c_f": "c_f", "f": "c_f", "capacitance": "c_f", "电容": "c_f"}
-    if ctype == "inductor":
-        return {"l": "l_h", "l_h": "l_h", "h": "l_h", "inductance": "l_h", "电感": "l_h"}
-    if ctype == "vdc":
-        return {"v": "v_v", "v_v": "v_v", "volt": "v_v", "voltage": "v_v", "电压": "v_v"}
-    if ctype == "idc":
-        return {"i": "i_a", "i_a": "i_a", "amp": "i_a", "current": "i_a", "电流": "i_a"}
-    if ctype == "vac":
-        return {
-            "vp": "vp_v",
-            "vp_v": "vp_v",
-            "freq": "freq_hz",
-            "freq_hz": "freq_hz",
-            "phase": "phase_deg",
-            "phase_deg": "phase_deg",
-        }
-    if ctype == "iac":
-        return {
-            "ip": "ip_a",
-            "ip_a": "ip_a",
-            "freq": "freq_hz",
-            "freq_hz": "freq_hz",
-            "phase": "phase_deg",
-            "phase_deg": "phase_deg",
-        }
-    return {}
+    ms = _MODEL_SPECS.get(ctype)
+    if ms is None:
+        return {}
+    out: dict[str, str] = {}
+    for ps in getattr(ms, "props", ()) or ():
+        key = str(getattr(ps, "key", "") or "").strip()
+        if not key:
+            continue
+        synonyms = getattr(ps, "synonyms", ()) or ()
+        for syn in synonyms:
+            s = str(syn or "").strip().lower()
+            if not s:
+                continue
+            out.setdefault(s, key)
+    return out
 
 
 @dataclass
 class _Comp:
     cid: str
     ctype: str
-    n0: str
-    n1: str
+    nodes: list[str]
     params: dict[str, float]
 
 
@@ -186,9 +125,11 @@ def parse_pe_script_to_spec_obj(
       - ANALYSIS <dc|ac|tr>
       - SET AC_OMEGA <omega_rad_s>
       - SET TR <t_step_s> <t_stop_s>
-      - ADD <ID> <TYPE> <NODE0> <NODE1> <k=v ...>
-      - WIRE <NODE> <ID.PIN> [ID.PIN ...]     (PIN is 0 or 1)
+      - SET DIGITAL_CLK_TICKS <int>           (optional; for digital circuits in dc/ac)
+      - ADD <ID> <TYPE> <NODE0> ... <NODE{N-1}> [k=v ...]
+      - WIRE <NODE> <ID.PIN> [ID.PIN ...]     (PIN is 0..N-1)
       - PROBE NODE <NODE>
+      - PROBE DNODE <NODE>
       - PROBE I <ID>
       - PROBE VDROP <ID>
       - RUN                                  (optional; parser ignores but allows it)
@@ -204,6 +145,7 @@ def parse_pe_script_to_spec_obj(
     ac_omega: float | None = None
     tr_step: float | None = None
     tr_stop: float | None = None
+    digital_clk_ticks: int | None = None
 
     comps: dict[str, _Comp] = {}
     probes: list[dict[str, str]] = []
@@ -249,6 +191,19 @@ def parse_pe_script_to_spec_obj(
                 tr_step = _parse_float(rest[0], where=f"Line {lineno}: t_step")
                 tr_stop = _parse_float(rest[1], where=f"Line {lineno}: t_stop")
                 continue
+            if sub in ("DIGITAL_CLK_TICKS", "DIGITAL_TICKS", "CLK_TICKS", "CLK"):
+                if len(rest) != 1:
+                    raise PEScriptError(f"Line {lineno}: SET {sub} expects 1 arg")
+                try:
+                    n = int(str(rest[0]).strip(), 10)
+                except Exception as e:
+                    raise PEScriptError(f"Line {lineno}: {sub} must be an integer") from e
+                if n < 0:
+                    n = 0
+                if n > 1_000_000:
+                    n = 1_000_000
+                digital_clk_ticks = int(n)
+                continue
             if sub in ("ANALYSIS",):
                 if len(rest) != 1:
                     raise PEScriptError(f"Line {lineno}: SET ANALYSIS expects 1 arg")
@@ -260,33 +215,56 @@ def parse_pe_script_to_spec_obj(
             raise PEScriptError(f"Line {lineno}: Unknown SET subcommand {sub!r}")
 
         if cmd in ("ADD",):
-            if len(args) < 5:
-                raise PEScriptError(f"Line {lineno}: ADD expects at least 5 args")
+            if len(args) < 3:
+                raise PEScriptError(f"Line {lineno}: ADD expects at least 3 args")
             cid = _require_id(args[0], where=f"Line {lineno}: component id")
             if cid in comps:
                 raise PEScriptError(f"Line {lineno}: Duplicate component id {cid!r}")
             ctype = _canonical_type(args[1])
-            n0 = _require_node(args[2], where=f"Line {lineno}: node0")
-            n1 = _require_node(args[3], where=f"Line {lineno}: node1")
+            ms = _MODEL_SPECS.get(ctype)
+            if ms is None:
+                raise PEScriptError(f"Line {lineno}: Unsupported component type {args[1]!r}")
+            pin_count = int(getattr(ms, "pin_count", 0) or 0)
+            if pin_count <= 0:
+                raise PEScriptError(f"Line {lineno}: Invalid pin_count for type {ctype!r}")
+            if len(args) < 2 + pin_count:
+                raise PEScriptError(
+                    f"Line {lineno}: ADD {ctype} expects {2 + pin_count} args before params (id type + {pin_count} nodes)"
+                )
+
+            nodes: list[str] = []
+            for j in range(pin_count):
+                nodes.append(_require_node(args[2 + j], where=f"Line {lineno}: node{j}"))
 
             key_map = _param_key_map(ctype)
-            if not key_map:
-                raise PEScriptError(f"Line {lineno}: Unsupported component type {args[1]!r}")
-
             params: dict[str, float] = {}
-            for tok in args[4:]:
+            for tok in args[2 + pin_count :]:
                 if "=" not in tok:
                     raise PEScriptError(f"Line {lineno}: Param must be k=v (got {tok!r})")
                 k, v = tok.split("=", 1)
                 kk = (k or "").strip().lower()
                 if not _PARAM_KEY_RE.match(kk):
                     raise PEScriptError(f"Line {lineno}: Invalid param key {k!r}")
+                if not key_map:
+                    raise PEScriptError(f"Line {lineno}: {ctype} takes no params (got {k!r})")
                 if kk not in key_map:
                     raise PEScriptError(f"Line {lineno}: Unsupported param {k!r} for type {ctype}")
+                canon_k = key_map[kk]
+                if canon_k in params:
+                    raise PEScriptError(f"Line {lineno}: Duplicate param {canon_k!r} for {cid}")
                 vv = _parse_float(v.strip(), where=f"Line {lineno}: {k}")
-                params[key_map[kk]] = vv
+                params[canon_k] = vv
 
-            comps[cid] = _Comp(cid=cid, ctype=ctype, n0=n0, n1=n1, params=params)
+            for ps in getattr(ms, "props", ()) or ():
+                key = str(getattr(ps, "key", "") or "")
+                if not key:
+                    continue
+                if not bool(getattr(ps, "required", True)):
+                    continue
+                if key not in params:
+                    raise PEScriptError(f"Line {lineno}: Missing required param {key!r} for {ctype}")
+
+            comps[cid] = _Comp(cid=cid, ctype=ctype, nodes=nodes, params=params)
             if max_components > 0 and len(comps) > max_components:
                 raise PEScriptError(f"Too many components (limit={max_components})")
             continue
@@ -298,16 +276,17 @@ def parse_pe_script_to_spec_obj(
             for ref in args[1:]:
                 m = _PIN_REF_RE.match(ref.strip())
                 if not m:
-                    raise PEScriptError(f"Line {lineno}: Invalid pin ref {ref!r} (expected ID.0 or ID.1)")
+                    raise PEScriptError(f"Line {lineno}: Invalid pin ref {ref!r} (expected ID.<pin>)")
                 cid = m.group("id")
                 pin = int(m.group("pin"))
                 comp = comps.get(cid)
                 if comp is None:
                     raise PEScriptError(f"Line {lineno}: Unknown component {cid!r} in WIRE")
-                if pin == 0:
-                    comp.n0 = node
-                else:
-                    comp.n1 = node
+                if pin < 0 or pin >= len(comp.nodes):
+                    raise PEScriptError(
+                        f"Line {lineno}: Pin out of range for {cid} (pin={pin}, pin_count={len(comp.nodes)})"
+                    )
+                comp.nodes[int(pin)] = node
             continue
 
         if cmd in ("PROBE",):
@@ -318,6 +297,10 @@ def parse_pe_script_to_spec_obj(
             if kind in ("NODE", "VNODE", "VN"):
                 n = _require_node(target, where=f"Line {lineno}: node")
                 add_probe("node_voltage", n)
+                continue
+            if kind in ("DNODE", "D", "DIGITAL", "NODE_DIGITAL"):
+                n = _require_node(target, where=f"Line {lineno}: node")
+                add_probe("node_digital", n)
                 continue
             if kind in ("I", "CURRENT"):
                 cid = _require_id(target, where=f"Line {lineno}: component id")
@@ -345,7 +328,7 @@ def parse_pe_script_to_spec_obj(
             {
                 "id": c.cid,
                 "type": c.ctype,
-                "nodes": [c.n0, c.n1],
+                "nodes": list(c.nodes),
                 "params": dict(c.params),
             }
         )
@@ -356,6 +339,7 @@ def parse_pe_script_to_spec_obj(
             "ac_omega_rad_s": ac_omega,
             "tr_t_step_s": tr_step,
             "tr_t_stop_s": tr_stop,
+            "digital_clk_ticks": digital_clk_ticks,
         },
         "components": components,
         "probes": probes,

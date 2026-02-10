@@ -66,3 +66,39 @@ class TestPEScript(unittest.TestCase):
         comps = {c["id"]: c for c in obj["components"]}
         self.assertAlmostEqual(comps["R1"]["params"]["r_ohm"], 1000.0)
         self.assertAlmostEqual(comps["C1"]["params"]["c_f"], 100e-9)
+
+    def test_parse_digital_clk_ticks_and_digital_probe(self):
+        script = "\n".join(
+            [
+                "ANALYSIS dc",
+                "SET DIGITAL_CLK_TICKS 3",
+                "ADD IN1 digital_input a state=1",
+                "ADD N1 digital_not a y",
+                "ADD OUT1 digital_output y",
+                "PROBE DNODE y",
+            ]
+        )
+        obj = parse_pe_script_to_spec_obj(script, max_components=10, max_probes=10)
+        self.assertEqual(obj["analysis"]["digital_clk_ticks"], 3)
+        comps = {c["id"]: c for c in obj["components"]}
+        self.assertEqual(comps["IN1"]["nodes"], ["a"])
+        self.assertEqual(comps["IN1"]["params"]["state"], 1.0)
+        self.assertEqual(comps["N1"]["nodes"], ["a", "y"])
+        self.assertEqual(comps["OUT1"]["nodes"], ["y"])
+        self.assertEqual(obj["probes"][0]["kind"], "node_digital")
+        self.assertEqual(obj["probes"][0]["target"], "y")
+
+    def test_parse_multi_pin_and_wire_override(self):
+        script = "\n".join(
+            [
+                "ADD V1 vdc n1 gnd v=5",
+                "ADD G1 vccs x0 x1 x2 x3 g=0.001",
+                "WIRE n2 G1.0",
+                "WIRE gnd G1.1 G1.3",
+                "WIRE n1 G1.2",
+            ]
+        )
+        obj = parse_pe_script_to_spec_obj(script, max_components=10, max_probes=10)
+        comps = {c["id"]: c for c in obj["components"]}
+        self.assertEqual(comps["G1"]["nodes"], ["n2", "gnd", "n1", "gnd"])
+        self.assertAlmostEqual(comps["G1"]["params"]["g"], 0.001)
