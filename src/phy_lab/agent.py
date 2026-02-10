@@ -308,10 +308,32 @@ def _looks_political_sensitive(text: str) -> bool:
     return any(k in t for k in cjk)
 
 
+def _dominant_lang_is_zh(text: str) -> bool:
+    """Best-effort dominant-language detector for zh vs non-zh.
+
+    We keep this intentionally simple and local (no external deps). It is used only to
+    strengthen the agent's tendency to reply in Chinese when the user asks in Chinese.
+    """
+    t = text or ""
+    cjk = 0
+    latin = 0
+    for ch in t:
+        if "\u4e00" <= ch <= "\u9fff":
+            cjk += 1
+        elif ("A" <= ch <= "Z") or ("a" <= ch <= "z"):
+            latin += 1
+    if cjk == 0 and latin == 0:
+        return False
+    if cjk == 0:
+        return False
+    if latin == 0:
+        return True
+    # "Dominant" script heuristic.
+    return cjk >= latin
+
+
 def _political_refusal_message(user_text: str) -> str:
-    t = user_text or ""
-    is_cjk = any("\u4e00" <= ch <= "\u9fff" for ch in t)
-    if is_cjk:
+    if _dominant_lang_is_zh(user_text or ""):
         return "抱歉，我不能处理或搜索任何政治相关内容。我可以帮助你解决物理实验室社区相关问题。"
     return "Sorry, I can't help with political content or political web searches. I can help with Physics Lab AR community questions."
 
@@ -439,10 +461,14 @@ def _format_exception_brief(e: BaseException) -> str:
 def _effective_system_prompt(*, cfg: Any, user_text: str) -> str:
     base = str(getattr(getattr(cfg, "agent", None), "system_prompt", "") or "").rstrip()
     # Always reinforce reply scope; optionally enforce one-shot reply semantics.
-    is_cjk = any("\u4e00" <= ch <= "\u9fff" for ch in (user_text or ""))
+    is_cjk = _dominant_lang_is_zh(user_text or "")
     one_shot = bool(getattr(getattr(cfg, "agent", None), "reply_once", True))
     if is_cjk:
         extra = (
+            "语言（务必遵守）\n"
+            "- 你的输出必须使用中文。\n"
+            "- 除非用户明确要求/引用英文原文/必须保留的专有名词或代码，否则不要输出英文句子。\n"
+            "\n"
             "关键约束（务必遵守）\n"
             "- 只回复当前提问者（当前这条评论的作者），不要面向其他人说话。\n"
             "- 不要 @ 提及任何其他用户（如需引用他人昵称/用户名，用普通文字即可，但不要 @）。\n"
@@ -454,6 +480,10 @@ def _effective_system_prompt(*, cfg: Any, user_text: str) -> str:
             extra += "- 本次为一次性回复；回复后会直接关闭对话，你将不会再继续跟进。\n"
     else:
         extra = (
+            "Language (must follow)\n"
+            "- Reply in the same language as the incoming comment (default: English).\n"
+            "- Do not switch languages unless the user asks.\n"
+            "\n"
             "Critical constraints (must follow)\n"
             "- Reply ONLY to the author of the current comment.\n"
             "- Do NOT @mention any other users (you may refer to a user by plain text name if needed, but no @mentions).\n"
@@ -735,11 +765,17 @@ def _agent_parse_tool_call(raw: str) -> tuple[str, dict[str, Any], str]:
     return tool, args, final
 
 
-def _agent_tool_prompt(*, max_seconds: int) -> str:
+def _agent_tool_prompt(*, max_seconds: int, lang_zh: bool) -> str:
     tool_cutoff_seconds = max(0, int(max_seconds) - 60)
+    lang_line = (
+        "语言：最终结束时（tool=end）的 final 字段必须使用中文；除非用户明确要求，不要输出英文句子。"
+        if lang_zh
+        else "Language: for tool=end, the final text MUST match the user's language."
+    )
     return (
         "You are running in AGENT MODE (multi-step tool use).\n"
         f"Time budget: {int(max_seconds)}s. Tool-call cutoff: after {tool_cutoff_seconds}s, only end is allowed.\n"
+        f"{lang_line}\n"
         "\n"
         "Output format (STRICT JSON only, no prose):\n"
         "- Tool call: {\"tool\":\"<name>\",\"args\":{...}}\n"
@@ -1011,6 +1047,17 @@ def _agent_execute_tool(
 
         if tool == "search_plar":
             query_v: Any = args.get("query")
+            if query_v is None:
+                # Heuristic: some models emit search_plar with {name:"..."} or {user_id:"..."}.
+                name_v = args.get("name")
+                uid_v = args.get("user_id") or args.get("uid")
+                sid_v = args.get("summary_id") or args.get("id")
+                if isinstance(name_v, str) and name_v.strip():
+                    query_v = name_v.strip()
+                elif isinstance(uid_v, str) and uid_v.strip():
+                    query_v = f"uid:{uid_v.strip()}"
+                elif isinstance(sid_v, str) and sid_v.strip():
+                    query_v = sid_v.strip()
             if isinstance(query_v, dict):
                 for k in ("query", "q", "text", "value", "name", "id"):
                     vv = query_v.get(k)
@@ -1899,9 +1946,14 @@ def agent_mode_run(
     wants_content_intro = _looks_like_content_intro_request(task)
     wants_first_work = _looks_like_first_work_request(task)
     first_work_target_name = _extract_first_work_target_name(task) if wants_first_work else None
+    wants_user_work_list = _looks_like_user_work_list_request(task)
+    work_list_target_name = (
+        _extract_user_work_list_target_name(task) if wants_user_work_list else None
+    )
     wants_user_work_pick = _looks_like_user_work_pick_request(task)
     work_pick_target_name = _extract_work_pick_target_name(task) if wants_user_work_pick else None
     wants_circuit, _explicit_publish_intent = _fallback_route_for_circuit(task)
+    lang_zh = _dominant_lang_is_zh(task)
 
     start_ts = time.time()
     deadline = start_ts + float(max_seconds)
@@ -1909,7 +1961,7 @@ def agent_mode_run(
     system_prompt = _effective_system_prompt(cfg=cfg, user_text=task)
     messages: list[dict[str, str]] = [
         {"role": "system", "content": system_prompt},
-        {"role": "system", "content": _agent_tool_prompt(max_seconds=max_seconds)},
+        {"role": "system", "content": _agent_tool_prompt(max_seconds=max_seconds, lang_zh=lang_zh)},
     ]
     if first_work_target_name:
         messages.append(
@@ -1919,6 +1971,33 @@ def agent_mode_run(
                     "FIRST WORK TARGET USER (use EXACTLY; do not substitute based on prior context):\n"
                     f"- name: {first_work_target_name}\n"
                     "Use this exact string in plar_get_user_by_name.name (or in search_plar @handle)."
+                ),
+            }
+        )
+    if work_list_target_name:
+        messages.append(
+            {
+                "role": "system",
+                "content": (
+                    "检测到“列出某用户发布的实验/作品”请求。\n"
+                    "目标用户（必须严格使用；不要根据上下文/历史替换）：\n"
+                    f"- name: {work_list_target_name}\n"
+                    "必走流程：\n"
+                    "1) plar_get_user_by_name {name:\"<name>\"}  (得到 uid)\n"
+                    "2) list_plar {kind:\"latest\",category:\"Experiment\",user_id:\"<uid>\",take:12}\n"
+                    "3) end.final 里列出若干条，并包含 Category + SummaryID + Subject。\n"
+                    "不要用 web_search；不要返回其他用户的作品。"
+                    if lang_zh
+                    else (
+                        "USER WORK LIST REQUEST DETECTED (list a user's published experiments/works).\n"
+                        "Target user (use EXACTLY; do not substitute based on page context/history):\n"
+                        f"- name: {work_list_target_name}\n"
+                        "Required flow:\n"
+                        "1) plar_get_user_by_name {name:\"<name>\"}  (get uid)\n"
+                        "2) list_plar {kind:\"latest\",category:\"Experiment\",user_id:\"<uid>\",take:12}\n"
+                        "3) In end.final list items with Category + SummaryID + Subject.\n"
+                        "Do NOT use web_search; do NOT return works from other users."
+                    )
                 ),
             }
         )
@@ -2098,7 +2177,7 @@ def agent_mode_run(
         return out
 
     def _timeout_reply() -> str:
-        is_cjk = any("\u4e00" <= ch <= "\u9fff" for ch in (task or ""))
+        is_cjk = _dominant_lang_is_zh(task or "")
         mins = int(max(0, int(max_seconds)) // 60) or 10
         if is_cjk:
             return f"抱歉，Agent 已超时（{mins} 分钟），本次任务未能完成。你可以重新 @我 并简化需求再试一次。"
@@ -2109,12 +2188,86 @@ def agent_mode_run(
             return ollama.chat(messages=messages, response_format="json")
         except (OllamaError, Exception) as e:
             logger.warning("agent.llm_error: phase=%s err=%s", phase, e)
-            is_cjk = any("\u4e00" <= ch <= "\u9fff" for ch in (task or ""))
+            is_cjk = _dominant_lang_is_zh(task or "")
             if is_cjk:
                 final = "抱歉，本次模型没有返回可用输出（空响应/格式异常），请稍后重试或更换模型。"
             else:
                 final = "Sorry — the model returned an unusable empty/invalid response. Please retry or switch models."
             return json.dumps({"tool": "end", "final": final}, ensure_ascii=False)
+
+    def _reply_needs_zh_rewrite(text: str) -> bool:
+        if not lang_zh:
+            return False
+        s = text or ""
+        # Ignore hex IDs and code blocks when estimating language dominance.
+        try:
+            s = re.sub(r"\b[0-9a-fA-F]{24}\b", "", s)
+            s = re.sub(r"```.*?```", "", s, flags=re.DOTALL)
+        except Exception:
+            pass
+        cjk = 0
+        latin = 0
+        for ch in s:
+            if "\u4e00" <= ch <= "\u9fff":
+                cjk += 1
+            elif ("A" <= ch <= "Z") or ("a" <= ch <= "z"):
+                latin += 1
+        if latin == 0:
+            return False
+        # If the reply is mostly Latin letters (common drift: English labels/sentences), rewrite to Chinese.
+        if cjk == 0 and latin >= 10:
+            return True
+        if latin >= 30 and latin > (cjk * 2):
+            return True
+        if latin >= 20 and latin > cjk:
+            return True
+        return False
+
+    def _rewrite_reply_to_zh(text: str) -> str:
+        src = (text or "").strip()
+        if not src:
+            return src
+        prompt = (
+            "请把下面这段回复改写成中文，要求：\n"
+            "- 不要添加新信息，不要遗漏任何关键信息。\n"
+            "- 保留所有 24 位十六进制 ID、数字、专有名词、代码/命令/路径不变。\n"
+            "- 不要加入任何 @mention。\n"
+            "- 只输出改写后的正文，不要输出解释。\n\n"
+            f"原文：\n{src}"
+        )
+        try:
+            out = ollama.chat(
+                messages=[
+                    {"role": "system", "content": "你是一个严谨的编辑，只做语言改写，不做内容改动。"},
+                    {"role": "user", "content": prompt},
+                ]
+            )
+        except Exception:
+            return src
+        return (out or "").strip() or src
+
+    def _strip_model_artifacts(text: str) -> str:
+        s = (text or "").strip()
+        if not s:
+            return s
+        # Some models may leak training stop tokens and then continue with unrelated text.
+        for marker in ("<|endoftext|>", "<|eot_id|>", "<|end|>", "</s>"):
+            if marker in s:
+                s = s.split(marker, 1)[0].rstrip()
+        return s.strip()
+
+    def _finalize_reply_text(text: str) -> str:
+        out = safe_reply(text or "", max_chars=cfg.agent.max_reply_chars).strip()
+        out = _strip_model_artifacts(out)
+        if not out:
+            return "完成。" if lang_zh else "Done."
+        if _reply_needs_zh_rewrite(out):
+            out2 = _rewrite_reply_to_zh(out)
+            out2 = safe_reply(out2 or "", max_chars=cfg.agent.max_reply_chars).strip()
+            out2 = _strip_model_artifacts(out2)
+            if out2:
+                return out2
+        return out
 
     last_raw = ""
     last_non_tool_output = ""
@@ -2125,6 +2278,9 @@ def agent_mode_run(
     had_auth_failed = False
     allowed_open_ids: set[str] = set()
     did_list_plar_for_work_pick = False
+    did_list_plar_for_user_work_list = False
+    allowed_user_list_ids: set[str] = set()
+    work_list_target_user_id: str | None = None
     allowed_tools = {
         "web_search",
         "search_plar",
@@ -2261,7 +2417,7 @@ def agent_mode_run(
         # In the last 60s, tools are disabled: force final output and refuse tool calls.
         if not tools_enabled:
             def _tools_disabled_fallback(raw_text: str | None = None) -> str:
-                is_cjk = any("\u4e00" <= ch <= "\u9fff" for ch in (task or ""))
+                is_cjk = lang_zh
                 t = (raw_text or "").strip()
                 # If the model produced plain text (not a tool call), accept it.
                 obj = _try_parse_json_object(t) if t else None
@@ -2311,8 +2467,7 @@ def agent_mode_run(
                 if tool == "end":
                     if debug_io:
                         logger.debug("agent.tool_call: step=%d tool=end final_len=%d", step, len(final or ""))
-                    out = safe_reply(final or "", max_chars=cfg.agent.max_reply_chars)
-                    return out if out.strip() else "Done."
+                    return _finalize_reply_text(final or "")
                 # Reject any other tool call and force one last retry for end.
                 messages.append(
                     {
@@ -2349,13 +2504,12 @@ def agent_mode_run(
                                 step,
                                 len(final2 or ""),
                             )
-                        out = safe_reply(final2 or "", max_chars=cfg.agent.max_reply_chars)
-                        return out if out.strip() else "Done."
-                    return _tools_disabled_fallback(raw_text=final2 or raw_final2)
+                        return _finalize_reply_text(final2 or "")
+                    return _finalize_reply_text(_tools_disabled_fallback(raw_text=final2 or raw_final2))
                 except Exception:
-                    return _tools_disabled_fallback(raw_text=raw_final2)
+                    return _finalize_reply_text(_tools_disabled_fallback(raw_text=raw_final2))
             except Exception:
-                return _tools_disabled_fallback(raw_text=raw_final)
+                return _finalize_reply_text(_tools_disabled_fallback(raw_text=raw_final))
 
         # Normal tool-enabled phase.
         messages.append(
@@ -2473,6 +2627,119 @@ def agent_mode_run(
                     )
                     continue
 
+        if wants_user_work_list and work_list_target_name:
+            def _norm_name3(x: str) -> str:
+                s = (x or "").strip()
+                s = s.lstrip("@＠")
+                s = re.sub(r"\s+", "", s)
+                return s
+
+            target_norm3 = _norm_name3(work_list_target_name)
+
+            if tool == "web_search":
+                messages.append(
+                    {
+                        "role": "system",
+                        "content": (
+                            "REJECTED: do not use web_search to list a user's published experiments/works. "
+                            "Use in-app lookup + list_plar for the target user."
+                        ),
+                    }
+                )
+                continue
+
+            if tool == "plar_get_user_board":
+                messages.append(
+                    {
+                        "role": "system",
+                        "content": (
+                            "REJECTED: user board is not a list of published experiments.\n"
+                            "Required flow:\n"
+                            "1) plar_get_user_by_name {name:\"...\"}\n"
+                            "2) list_plar {kind:\"latest\",category:\"Experiment\",user_id:\"<uid>\",take:12}\n"
+                            "Then answer from that list."
+                        ),
+                    }
+                )
+                continue
+
+            if tool == "plar_get_user_by_name":
+                got = _norm_name3(str(args.get("name") or ""))
+                if got and got != target_norm3:
+                    messages.append(
+                        {
+                            "role": "system",
+                            "content": (
+                                "REJECTED: wrong user name for user-work-list request.\n"
+                                f"- required name: {work_list_target_name}\n"
+                                f"- got: {str(args.get('name') or '').strip()}\n"
+                                "Call plar_get_user_by_name again with the required name."
+                            ),
+                        }
+                    )
+                    continue
+
+            if tool == "search_plar":
+                q = str(args.get("query") or args.get("name") or "").strip()
+                try:
+                    spec = _parse_plar_lookup_query(q)
+                except Exception:
+                    spec = {"kind": "", "value": ""}
+                if spec.get("kind") == "user_name":
+                    got = _norm_name3(str(spec.get("value") or ""))
+                    if got and got != target_norm3:
+                        messages.append(
+                            {
+                                "role": "system",
+                                "content": (
+                                    "REJECTED: wrong user in search_plar for user-work-list request.\n"
+                                    f"- required: @{work_list_target_name}\n"
+                                    f"- got: {q}\n"
+                                    "Redo the lookup using the required user name."
+                                ),
+                            }
+                        )
+                        continue
+
+            if tool == "list_plar":
+                uid = str(args.get("user_id") or "").strip()
+                if not work_list_target_user_id:
+                    messages.append(
+                        {
+                            "role": "system",
+                            "content": (
+                                "REJECTED: you must first lookup the target user to get the correct user_id.\n"
+                                f"Call plar_get_user_by_name {{\"name\":\"{work_list_target_name}\"}} first, then list_plar with that user_id."
+                            ),
+                        }
+                    )
+                    continue
+                if not uid:
+                    messages.append(
+                        {
+                            "role": "system",
+                            "content": (
+                                "REJECTED: list_plar for user-work-list must include a specific user_id.\n"
+                                f"First lookup the user '{work_list_target_name}' using plar_get_user_by_name, then call list_plar with user_id."
+                            ),
+                        }
+                    )
+                    continue
+                if work_list_target_user_id and uid != str(work_list_target_user_id):
+                    messages.append(
+                        {
+                            "role": "system",
+                            "content": (
+                                "REJECTED: list_plar.user_id does not match the looked-up target user.\n"
+                                f"- target user: {work_list_target_name}\n"
+                                f"- required user_id: {work_list_target_user_id}\n"
+                                f"- got user_id: {uid}\n"
+                                "Call list_plar again with the required user_id."
+                            ),
+                        }
+                    )
+                    continue
+
         if wants_user_work_pick and work_pick_target_name:
             def _norm_name2(x: str) -> str:
                 s = (x or "").strip()
@@ -2571,6 +2838,20 @@ def agent_mode_run(
                     }
                 )
                 continue
+            if wants_user_work_list and work_list_target_name and tools_enabled and (not did_list_plar_for_user_work_list) and (not had_auth_failed):
+                messages.append(
+                    {
+                        "role": "system",
+                        "content": (
+                            "REJECTED: user asked for a list of a specific user's published experiments/works, but you did not list that user's works yet.\n"
+                            "Required flow:\n"
+                            "1) plar_get_user_by_name {name:\"...\"}\n"
+                            "2) list_plar {kind:\"latest\",category:\"Experiment\",user_id:\"<uid>\",take:12}\n"
+                            "Then answer from that list and include Category + SummaryID + Subject."
+                        ),
+                    }
+                )
+                continue
             if wants_user_work_pick and tools_enabled and (not did_list_plar_for_work_pick) and (not had_auth_failed):
                 messages.append(
                     {
@@ -2615,7 +2896,7 @@ def agent_mode_run(
                     continue
             if wants_user_work_pick and tools_enabled:
                 final_text = str(final or "")
-                if _HEX24_RE.search(final_text or "") is None:
+                if re.search(r"\b[0-9a-fA-F]{24}\b", final_text or "") is None:
                     messages.append(
                         {
                             "role": "system",
@@ -2626,6 +2907,34 @@ def agent_mode_run(
                         }
                     )
                     continue
+            if wants_user_work_list and work_list_target_name and tools_enabled:
+                final_text = str(final or "")
+                ids_in_final = set(re.findall(r"\b[0-9a-fA-F]{24}\b", final_text or ""))
+                if not ids_in_final:
+                    messages.append(
+                        {
+                            "role": "system",
+                            "content": (
+                                "REJECTED: your end.final is missing SummaryID(s) (24-hex id).\n"
+                                "List items from list_plar and include Category + SummaryID + Subject."
+                            ),
+                        }
+                    )
+                    continue
+                if allowed_user_list_ids:
+                    bad = sorted([sid for sid in ids_in_final if sid not in allowed_user_list_ids])
+                    if bad:
+                        messages.append(
+                            {
+                                "role": "system",
+                                "content": (
+                                    "REJECTED: end.final includes SummaryID(s) that are not in the target user's list_plar results.\n"
+                                    f"- bad ids: {', '.join(bad[:8])}\n"
+                                    "Only use IDs returned by list_plar for the target user."
+                                ),
+                            }
+                        )
+                        continue
             if wants_circuit and tools_enabled and (not did_use_circuit_tool):
                 messages.append(
                     {
@@ -2668,8 +2977,18 @@ def agent_mode_run(
                     continue
             if debug_io:
                 logger.debug("agent.tool_call: step=%d tool=end final_len=%d", step, len(final or ""))
-            out = safe_reply(final or "", max_chars=cfg.agent.max_reply_chars)
-            return out if out.strip() else "Done."
+            if lang_zh and not any("\u4e00" <= ch <= "\u9fff" for ch in str(final or "")):
+                messages.append(
+                    {
+                        "role": "system",
+                        "content": (
+                            "REJECTED: 你的 end.final 看起来不是中文。\n"
+                            "请用中文重写 final（保留所有 ID/数字/专有名词/代码不变），不要输出英文句子。"
+                        ),
+                    }
+                )
+                continue
+            return _finalize_reply_text(final or "")
 
         if tool in ("simulate", "simulate_verilog", "simulate_status_save"):
             did_use_simulation_tool = True
@@ -2713,6 +3032,35 @@ def agent_mode_run(
                 pass
             elif isinstance(obj, dict):
                 did_open_content = True
+        if wants_user_work_list and tool in ("plar_get_user_by_name", "plar_get_user_by_id", "search_plar") and not str(result or "").startswith("ERROR"):
+            obj = _try_parse_json_object(result or "")
+            if isinstance(obj, dict):
+                uid = best_effort_extract_text(obj.get("id")) or best_effort_extract_text(obj.get("user_id")) or best_effort_extract_text(obj.get("ID"))
+                if isinstance(uid, str) and uid.strip():
+                    work_list_target_user_id = uid.strip()
+        if wants_user_work_list and tool == "list_plar" and not str(result or "").startswith("ERROR"):
+            obj = _try_parse_json_object(result or "")
+            ids: list[str] = []
+            if isinstance(obj, dict):
+                items = obj.get("items")
+                if isinstance(items, list):
+                    for it in items:
+                        if isinstance(it, dict):
+                            sid = best_effort_extract_text(it.get("id")) or best_effort_extract_text(it.get("ID"))
+                            if isinstance(sid, str) and sid.strip():
+                                ids.append(sid.strip())
+                for sec_key in ("experiment", "discussion"):
+                    sec = obj.get(sec_key)
+                    if isinstance(sec, dict) and isinstance(sec.get("items"), list):
+                        for it in sec.get("items") or []:
+                            if isinstance(it, dict):
+                                sid = best_effort_extract_text(it.get("id")) or best_effort_extract_text(it.get("ID"))
+                                if isinstance(sid, str) and sid.strip():
+                                    ids.append(sid.strip())
+            for sid in ids:
+                allowed_user_list_ids.add(sid)
+            if ids:
+                did_list_plar_for_user_work_list = True
         if wants_user_work_pick and tool == "list_plar" and not str(result or "").startswith("ERROR"):
             obj = _try_parse_json_object(result or "")
             ids: list[str] = []
@@ -2808,8 +3156,7 @@ def agent_mode_run(
         if tool == "end":
             if debug_io:
                 logger.debug("agent.tool_call: budget_reached tool=end final_len=%d", len(final or ""))
-            out = safe_reply(final or "", max_chars=cfg.agent.max_reply_chars)
-            return out if out.strip() else "Done."
+            return _finalize_reply_text(final or "")
         raw2 = ""
     except Exception:
         if debug_io:
@@ -2832,8 +3179,7 @@ def agent_mode_run(
     try:
         tool3, _args3, final3 = _agent_parse_tool_call(raw3)
         if tool3 == "end":
-            out = safe_reply(final3 or "", max_chars=cfg.agent.max_reply_chars)
-            return out if out.strip() else "Done."
+            return _finalize_reply_text(final3 or "")
         raw3 = ""
     except Exception:
         raw3 = ""
@@ -2844,10 +3190,9 @@ def agent_mode_run(
             candidate = x
             break
     if candidate:
-        out = safe_reply(candidate, max_chars=cfg.agent.max_reply_chars)
-        return out if out.strip() else "Done."
+        return _finalize_reply_text(candidate)
 
-    is_cjk = any("\u4e00" <= ch <= "\u9fff" for ch in (task or ""))
+    is_cjk = _dominant_lang_is_zh(task or "")
     return (
         "抱歉，本次生成未能按协议结束（缺少 end）。请重试或缩短需求再试一次。"
         if is_cjk
@@ -3164,6 +3509,108 @@ def _extract_work_pick_target_name(user_text: str) -> str | None:
         if name:
             return name
     return None
+
+
+def _extract_user_work_list_target_name(user_text: str) -> str | None:
+    """Extract a target user name for 'list a user's published works/experiments' queries."""
+    t = (user_text or "").strip()
+    if not t:
+        return None
+
+    low = t.casefold()
+    # If the user already provided an explicit id prefix, let the agent follow it.
+    if any(p in low for p in ("uid:", "user_id:", "userid:", "experiment:", "discussion:", "user:", "nickname:")):
+        return None
+    if _HEX24_RE.search(t):
+        return None
+
+    # Prefer explicit @handle when present.
+    m_at = _AT_HANDLE_RE.search(t)
+    if m_at:
+        cand = (m_at.group(1) or "").strip()
+        return cand or None
+
+    def _cleanup_name(name: str) -> str:
+        s = (name or "").strip()
+        for p in (
+            "请你",
+            "麻烦你",
+            "帮我",
+            "请",
+            "告诉我",
+            "给我",
+            "列出",
+            "列一下",
+            "看看",
+            "查一下",
+            "查下",
+        ):
+            if s.startswith(p):
+                s = s[len(p) :].strip()
+                break
+        # English possessive.
+        if s.endswith("'s") and len(s) > 2:
+            s = s[:-2].strip()
+        # Strip common trailing verbs.
+        for suf in ("发布", "发表", "上传", "发了", "做了", "制作"):
+            if s.endswith(suf) and len(s) > len(suf):
+                s = s[: -len(suf)].strip()
+                break
+        return s
+
+    patterns = [
+        # “MapMaths发布的实验结果有哪些…”
+        r"(?P<name>[^\s，,。？！?]{1,32}?)\s*(?:发布|发表|上传|发了|做了|制作)\s*(?:的)?\s*(?:实验|作品)\s*(?:结果)?",
+        # “列出MapMaths的实验…”
+        r"(?:列出|列一下|给我看看|查一下|查下)\s*(?P<name>[^\s，,。？！?]{1,32}?)\s*(?:的)?\s*(?:实验|作品)\s*(?:结果)?",
+        # “MapMaths的实验有哪些…”
+        r"(?P<name>[^\s，,。？！?]{1,32}?)\s*的\s*(?:实验|作品)\s*(?:结果)?",
+        # English: "MapMaths's experiments"
+        r"(?P<name>[A-Za-z0-9_\\-]{1,32})\\s*'s\\s*(?:experiments|works)\\b",
+    ]
+    for pat in patterns:
+        m = re.search(pat, t)
+        if not m:
+            continue
+        name = _cleanup_name((m.group("name") or "").strip())
+        if not name:
+            continue
+        if name in ("我", "你", "他", "她", "它", "我们", "他们", "她们", "自己"):
+            continue
+        return name
+
+    return None
+
+
+def _looks_like_user_work_list_request(user_text: str) -> bool:
+    t = (user_text or "").strip()
+    if not t:
+        return False
+    # Avoid conflicting special handlers.
+    if _looks_like_first_work_request(t) or _looks_like_user_work_pick_request(t) or _looks_like_content_intro_request(t):
+        return False
+    name = _extract_user_work_list_target_name(t)
+    if not name:
+        return False
+    low = t.casefold()
+    mentions_work = any(x in low for x in ("实验", "作品", "experiment", "experiments", "work", "works"))
+    asks_list = any(
+        x in t
+        for x in (
+            "有哪些",
+            "有什么",
+            "都有哪些",
+            "全部",
+            "所有",
+            "列表",
+            "列出",
+            "发了什么",
+            "发布了什么",
+            "给我看看",
+        )
+    ) or any(x in low for x in ("list", "show", "what ", "which ", "all ", "latest "))
+    mentions_published = any(x in t for x in ("发布", "发表", "上传", "发了", "做了", "制作")) or ("published" in low)
+    return bool(mentions_work and (asks_list or mentions_published))
 
 
 def _setup_logging(
