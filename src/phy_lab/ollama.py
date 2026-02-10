@@ -125,11 +125,12 @@ class OllamaClient:
                     return messages
         header = (
             "Harmony\n"
-            "reasoning: high\n"
+            "reasoning: medium\n"
             "\n"
             "Guidance:\n"
-            "- Do thorough internal reasoning.\n"
+            "- Keep internal reasoning brief.\n"
             "- Do NOT reveal chain-of-thought.\n"
+            "- Always produce a non-empty final answer in message.content.\n"
             "- Follow all formatting/output instructions in later system messages.\n"
         )
         return [{"role": "system", "content": header}] + list(messages)
@@ -169,12 +170,55 @@ class OllamaClient:
             "- If you intend to call a tool, also include the tool-call JSON in message.content.\n"
         )
 
-        # Some Ollama builds/models can occasionally return an empty message.content.
-        # Treat it as a transient server-side failure and retry once.
-        max_attempts = 2
+        # Some Ollama builds/models can occasionally return an empty message.content,
+        # especially when the prompt is near the context window limit or the model
+        # spends the whole budget in a hidden "thinking" channel.
+        max_attempts = 3
         last_data: Any = None
         last_details: dict[str, Any] = {}
         base_options: dict[str, Any] = dict(payload.get("options") or {})
+
+        def _prune_messages_for_retry(msgs: list[dict[str, str]]) -> list[dict[str, str]]:
+            # Keep a small, high-signal subset to reduce prompt size and improve the
+            # chance of producing a non-empty message.content.
+            if not isinstance(msgs, list) or not msgs:
+                return []
+            out: list[dict[str, str]] = []
+            # Preserve the first system message (often contains format constraints).
+            m0 = msgs[0] if isinstance(msgs[0], dict) else None
+            if isinstance(m0, dict) and isinstance(m0.get("role"), str) and isinstance(m0.get("content"), str):
+                out.append({"role": m0["role"], "content": m0["content"]})
+            # Preserve the second system message if it exists (common: tool list).
+            if len(msgs) > 1:
+                m1 = msgs[1] if isinstance(msgs[1], dict) else None
+                if (
+                    isinstance(m1, dict)
+                    and m1.get("role") == "system"
+                    and isinstance(m1.get("content"), str)
+                    and (m1 not in out)
+                ):
+                    out.append({"role": "system", "content": m1["content"]})
+            # Keep the most recent tail.
+            tail = [m for m in msgs[-12:] if isinstance(m, dict)]
+            for m in tail:
+                role = m.get("role")
+                content = m.get("content")
+                if not isinstance(role, str) or not isinstance(content, str):
+                    continue
+                if any((x.get("role") == role and x.get("content") == content) for x in out):
+                    continue
+                if len(content) > 2200:
+                    content = content[:2000] + f"...<truncated len={len(content)}>"
+                out.append({"role": role, "content": content})
+            return out
+
+        retry_guard2 = (
+            "IMPORTANT (empty output fix):\n"
+            "- Your previous responses had empty message.content. This is NOT allowed.\n"
+            "- You MUST put the final answer/tool-call JSON in message.content.\n"
+            "- Keep the response short and direct.\n"
+        )
+
         for attempt in range(1, max_attempts + 1):
             try:
                 resp = session.post(url, json=payload, timeout=self.timeout_sec)
@@ -237,17 +281,62 @@ class OllamaClient:
                 "num_predict": int(base_options.get("num_predict") or self.num_predict),
             }
             if attempt < max_attempts:
-                # Retry with an extra guard message to encourage a non-empty final output.
-                # If the model is burning the whole budget on the thinking channel, force a
-                # shorter retry to give it a chance to produce message.content.
+                # Retry with additional guards + a smaller generation budget.
                 retry_num_predict = int(base_options.get("num_predict") or self.num_predict)
                 if retry_num_predict <= 0:
                     retry_num_predict = int(self.num_predict) if int(self.num_predict) > 0 else 512
                 retry_num_predict = min(retry_num_predict, 512)
                 payload["options"] = dict(base_options)
                 payload["options"]["num_predict"] = retry_num_predict
-                payload["messages"] = list(base_messages) + [{"role": "system", "content": retry_guard}]
+
+                if attempt == 1:
+                    payload["messages"] = list(base_messages) + [{"role": "system", "content": retry_guard}]
+                else:
+                    # Final retry: aggressively prune the prompt and re-guard.
+                    payload["messages"] = _prune_messages_for_retry(list(base_messages)) + [
+                        {"role": "system", "content": retry_guard2},
+                        {"role": "system", "content": retry_guard},
+                    ]
                 continue
+
+        # Last-chance fallback when strict format=json yields empty content.
+        # Some thinking-heavy models occasionally return only a hidden "thinking" field
+        # (content="") even after retries. Try once without `format`, while still
+        # requiring JSON in message.content.
+        if rf:
+            try:
+                payload2: dict[str, Any] = dict(payload)
+                payload2.pop("format", None)
+                payload2["options"] = dict(base_options)
+                retry_num_predict = int(base_options.get("num_predict") or self.num_predict)
+                if retry_num_predict <= 0:
+                    retry_num_predict = int(self.num_predict) if int(self.num_predict) > 0 else 512
+                payload2["options"]["num_predict"] = min(retry_num_predict, 512)
+                payload2["messages"] = _prune_messages_for_retry(list(base_messages)) + [
+                    {
+                        "role": "system",
+                        "content": (
+                            "FINAL RETRY (format fallback):\n"
+                            "- You MUST return a non-empty JSON object in message.content.\n"
+                            "- Do NOT output only hidden thinking.\n"
+                            "- If you intend a tool call, output the tool-call JSON object.\n"
+                        ),
+                    }
+                ]
+                resp2 = session.post(url, json=payload2, timeout=self.timeout_sec)
+                if resp2.ok:
+                    data2 = resp2.json()
+                    last_data = data2
+                    message2 = data2.get("message")
+                    if isinstance(message2, dict):
+                        content2 = message2.get("content")
+                        if isinstance(content2, str) and content2.strip():
+                            return content2.strip()
+                        tool_json2 = _tool_calls_to_agent_json(message2.get("tool_calls"))
+                        if isinstance(tool_json2, str) and tool_json2.strip():
+                            return tool_json2
+            except Exception:
+                pass
 
         # If we get here, every attempt returned empty content.
         preview = _safe_response_preview(last_data, max_chars=500)

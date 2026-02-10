@@ -22,6 +22,35 @@ class TestGetUser(unittest.TestCase):
         got = get_user_by_name(_User(), name="abc")
         self.assertEqual(got["User"]["ID"], "u1")
 
+    def test_wrapper_get_user_by_name_strips_at_prefix(self):
+        captured = {"name": None}
+
+        class _User:
+            def get_user_by_name(self, name):
+                captured["name"] = name
+                return {"Status": 200, "Message": "", "Data": {"User": {"ID": "u1", "Nickname": name}}}
+
+        got = get_user_by_name(_User(), name="@abc")
+        self.assertEqual(got["User"]["Nickname"], "abc")
+        self.assertEqual(captured["name"], "abc")
+
+    def test_wrapper_get_user_by_name_retries_common_mium_to_nium_typo(self):
+        calls = {"names": []}
+
+        class _User:
+            def get_user_by_name(self, name):
+                calls["names"].append(name)
+                if name == "Neptumium":
+                    return {"Status": 404, "Message": "NotFound", "Data": None}
+                if name == "Neptunium":
+                    return {"Status": 200, "Message": "", "Data": {"User": {"ID": "u9", "Nickname": name}}}
+                return {"Status": 404, "Message": "NotFound", "Data": None}
+
+        got = get_user_by_name(_User(), name="Neptumium")
+        self.assertEqual(got["User"]["ID"], "u9")
+        self.assertEqual(got["User"]["Nickname"], "Neptunium")
+        self.assertEqual(calls["names"][:2], ["Neptumium", "Neptunium"])
+
     def test_direct_http_get_user_by_name(self):
         class _User:
             token = "tok"
@@ -63,4 +92,3 @@ class TestGetUser(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-

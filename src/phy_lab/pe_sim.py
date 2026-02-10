@@ -523,15 +523,17 @@ class PhyEngineLib:
                 raise PESimError("Unexpected VDC pin count (expected >= 2)")
             if int(voltage_ord[2] - voltage_ord[1]) < 2:
                 raise PESimError("Unexpected R1 pin count (expected >= 2)")
-            if int(current_ord[2] - current_ord[1]) < 1:
-                raise PESimError("Unexpected R1 branch count (expected >= 1)")
 
             # Component order matches non-ground elements in input order: VDC, R1, R2.
             vdc_pin0 = float(voltage[voltage_ord[0] + 0])
             vdc_pin1 = float(voltage[voltage_ord[0] + 1])
             r1_pin1 = float(voltage[voltage_ord[1] + 1])
 
-            i_r1 = float(current[current_ord[1] + 0])
+            # Some adapter backends may omit current branch sampling for resistors.
+            # Fall back to Ohm's law in that case.
+            i_r1 = 0.0
+            if int(current_ord[2] - current_ord[1]) >= 1:
+                i_r1 = float(current[current_ord[1] + 0])
             i = abs(i_r1) if i_r1 != 0.0 else abs(v / (r1 + r2))
 
             return SeriesVdcResistorsResult(

@@ -142,6 +142,9 @@ class AgentConfig:
     web_search_fallback_to_ddg: bool = True
     web_search_searxng_base_url: str = ""
     auto_tool_routing: bool = True
+    # Run a short planning pass before tool execution in agent mode.
+    planner_enabled: bool = True
+    planner_max_items: int = 6
     auto_publish: bool = False
     publish_by_default: bool = False
     circuit_max_attempts: int = 3
@@ -481,6 +484,14 @@ def parse_config(data: dict[str, Any], *, source: str) -> Config:
     auto_tool_routing = _optional_bool(
         agent_obj.get("auto_tool_routing"), where="agent.auto_tool_routing"
     )
+    planner_enabled = _optional_bool(
+        agent_obj.get("planner_enabled"), where="agent.planner_enabled"
+    )
+    planner_max_items = _optional_int(
+        agent_obj.get("planner_max_items"), where="agent.planner_max_items"
+    )
+    if planner_max_items is not None and planner_max_items <= 0:
+        raise ConfigError("agent.planner_max_items must be > 0")
     auto_publish = _optional_bool(
         agent_obj.get("auto_publish"), where="agent.auto_publish"
     )
@@ -682,6 +693,12 @@ def parse_config(data: dict[str, Any], *, source: str) -> Config:
         auto_tool_routing=auto_tool_routing
         if auto_tool_routing is not None
         else AgentConfig.auto_tool_routing,
+        planner_enabled=planner_enabled
+        if planner_enabled is not None
+        else AgentConfig.planner_enabled,
+        planner_max_items=planner_max_items
+        if planner_max_items is not None
+        else AgentConfig.planner_max_items,
         auto_publish=auto_publish if auto_publish is not None else AgentConfig.auto_publish,
         publish_by_default=publish_by_default
         if publish_by_default is not None
@@ -839,6 +856,8 @@ def write_config(path: str, config: Config) -> None:
             "web_search_fallback_to_ddg": config.agent.web_search_fallback_to_ddg,
             "web_search_searxng_base_url": config.agent.web_search_searxng_base_url,
             "auto_tool_routing": config.agent.auto_tool_routing,
+            "planner_enabled": bool(getattr(config.agent, "planner_enabled", True)),
+            "planner_max_items": int(getattr(config.agent, "planner_max_items", 6) or 6),
             "auto_publish": config.agent.auto_publish,
             "publish_by_default": config.agent.publish_by_default,
             "circuit_max_attempts": config.agent.circuit_max_attempts,

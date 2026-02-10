@@ -446,7 +446,9 @@ def _effective_system_prompt(*, cfg: Any, user_text: str) -> str:
             "关键约束（务必遵守）\n"
             "- 只回复当前提问者（当前这条评论的作者），不要面向其他人说话。\n"
             "- 不要 @ 提及任何其他用户（如需引用他人昵称/用户名，用普通文字即可，但不要 @）。\n"
-            "- 请在这一条回复里给出完整结论；不要要求对方补充信息或进行追问。\n"
+            "- 请优先根据“当前这一条用户消息”作答；不要假设存在更早的对话或更早的问题。\n"
+            "- 如果关键信息缺失/人名目标不明确：在这一条回复里最多问 1 个澄清问题；不要瞎猜。\n"
+            "- 系统提示词中出现的开发者/项目名（例如 MacroModel）不是用户问题的默认对象；只有用户明确提到时才作为查询/回答对象。\n"
         )
         if one_shot:
             extra += "- 本次为一次性回复；回复后会直接关闭对话，你将不会再继续跟进。\n"
@@ -455,7 +457,9 @@ def _effective_system_prompt(*, cfg: Any, user_text: str) -> str:
             "Critical constraints (must follow)\n"
             "- Reply ONLY to the author of the current comment.\n"
             "- Do NOT @mention any other users (you may refer to a user by plain text name if needed, but no @mentions).\n"
-            "- Provide a complete answer in this single reply; do not ask follow-up questions or request more context.\n"
+            "- Prioritize answering the CURRENT user message; do not assume earlier unseen conversation.\n"
+            "- If essential info is missing or the target person/work is ambiguous, ask at most ONE short clarifying question; do not guess.\n"
+            "- Developer/project names in the system prompt (e.g., MacroModel) are NOT the default subject unless the user explicitly asks about them.\n"
         )
         if one_shot:
             extra += "- This is a one-shot reply; after replying the conversation is closed and you will not follow up.\n"
@@ -735,79 +739,39 @@ def _agent_tool_prompt(*, max_seconds: int) -> str:
     tool_cutoff_seconds = max(0, int(max_seconds) - 60)
     return (
         "You are running in AGENT MODE (multi-step tool use).\n"
-        f"Time budget: {int(max_seconds)} seconds.\n"
-        f"Tool-call cutoff: after {tool_cutoff_seconds} seconds, tool calls are DISABLED; the last 60 seconds are reserved for final reasoning.\n"
+        f"Time budget: {int(max_seconds)}s. Tool-call cutoff: after {tool_cutoff_seconds}s, only end is allowed.\n"
         "\n"
-        "How to use tools:\n"
-        "- To call a tool, output STRICT JSON only, no prose. Schema:\n"
-        "  {\"tool\":\"<name>\",\"args\":{...}}\n"
-        "- When you are ready to reply to the user, end by calling:\n"
-        "  {\"tool\":\"end\",\"final\":\"...\"}\n"
+        "Output format (STRICT JSON only, no prose):\n"
+        "- Tool call: {\"tool\":\"<name>\",\"args\":{...}}\n"
+        "- Finish:    {\"tool\":\"end\",\"final\":\"...\"}\n"
         "\n"
-        "Available tools:\n"
-        "- web_search {query:str}\n"
-        "- search_plar {query:str}  (LOOKUP ONLY: user name/id, or experiment/discussion id; NOT keyword search)\n"
-        "- list_plar {kind:str, ...}  (LIST WORKS: supports user_id filter; use take=1 for 'first item')\n"
-        "- plar_query_experiments {category:str, take?:int, skip?:int, days?:int, sort?:str}\n"
-        "- plar_get_user_by_name {name:str}\n"
-        "- plar_get_user_by_id {user_id:str}\n"
-        "- plar_get_user_board {user_id:str, take?:int, skip?:int}  (留言板评论/board; NOT the user's works list)\n"
-        "- plar_get_experiment_context {summary_id:str, category:str}\n"
-        "- plar_open_content_page {summary_id:str, category:\"Experiment\"|\"Discussion\", take?:int, skip?:int}\n"
-        "- plar_get_status_save {summary_id:str, category:str}\n"
-        "- plar_get_comments {target_type:str, target_id:str, take?:int, skip?:int}\n"
-        "- store_get {key:str, offset?:int, limit?:int}  (read a stored large tool result)\n"
-        "- store_json {key:str, path:str}  (extract JSON by dot path, e.g. experiment.items[0].subject)\n"
-        "- simulate {text:str}\n"
-        "- simulate_verilog {text:str}\n"
-        "- simulate_status_save {summary_id:str, category:str, question?:str}\n"
-        "- circuit {spec:str, publish?:bool}\n"
-        "- end {final:str}\n"
+        "Tools:\n"
+        "- web_search {query}\n"
+        "- search_plar {query}  (LOOKUP ONLY: @name / uid:... / experiment:<id> / discussion:<id>; NOT keyword search)\n"
+        "- list_plar {kind, category?, user_id?, take?, skip?, from?, days?, tags?}\n"
+        "- plar_get_user_by_name {name}\n"
+        "- plar_get_user_by_id {user_id}\n"
+        "- plar_open_content_page {summary_id, category:\"Experiment\"|\"Discussion\", take?, skip?}\n"
+        "- plar_get_experiment_context {summary_id, category}\n"
+        "- plar_get_status_save {summary_id, category}\n"
+        "- plar_get_comments {target_type, target_id, take?, skip?}\n"
+        "- plar_get_user_board {user_id, take?, skip?}\n"
+        "- store_get {key, offset?, limit?} | store_json {key, path}\n"
+        "- simulate {text} | simulate_verilog {text} | simulate_status_save {summary_id, category, question?}\n"
+        "- circuit {spec, publish?}\n"
         "\n"
-        "Tool policies:\n"
-        "- If 'Context JSON (current page)' is present, use it directly; do NOT ask the user to provide context.\n"
-        "- Only use web_search when needed for external/up-to-date info.\n"
-        "- Never produce political content.\n"
-        "- If a tool result is too large, it may be stored and you will receive a store key; use store_get/store_json.\n"
-        "- Physics Lab search limitation: do NOT assume a true keyword search exists.\n"
-        "  - Use search_plar ONLY to LOOKUP by user name/id or content id.\n"
-        "  - For discovery, use list_plar (latest/hot/featured/following/followers) and then open by ID.\n"
-        "- Never guess content IDs. Only open IDs that the user provided or that you obtained from list_plar/search_plar.\n"
-        "- When describing a specific work, you MUST open it first (plar_open_content_page or plar_get_experiment_context) and only use fields from that Context JSON.\n"
-        "- In your FINAL answer about a work, include Category + SummaryID + Subject so the user can verify.\n"
-        "- Publishing is only allowed when the user explicitly asks AND config enables it; otherwise keep publish=false.\n"
-        "- If you publish via circuit tool and it returns published=true, your FINAL answer MUST include:\n"
-        "  - Category (always Discussion)\n"
-        "  - SummaryID (the 24-hex id)\n"
-        "- Do NOT invent tool names or argument fields. Only use the schemas listed above.\n"
-        "- Never paste large blobs (Context JSON, excerpts, status-save JSON, circuit JSON, etc.) into tool args.\n"
-        "  - Keep tool-call JSON small; as a rule, keep args under ~500 characters.\n"
-        "  - If you need the current page data, it is already available via Context JSON; reference it implicitly.\n"
-        "  - For simulation, prefer simulate_status_save when Context JSON provides summary_id/category.\n"
-        "- Prefer concise outputs; keep tool args minimal.\n"
+        "Rules:\n"
+        "- Treat the CURRENT user message as the only task (no earlier unseen context).\n"
+        "- Names in the system prompt (e.g., MacroModel) are NOT default targets unless the user explicitly asks.\n"
+        "- For lists/discovery use list_plar; use search_plar only for lookup by name/id.\n"
+        "- To describe a specific work, you MUST open it first and use ONLY opened Context JSON.\n"
+        "- Final answers about a work MUST include Category + SummaryID + Subject.\n"
+        "- If tool output is stored, use store_get/store_json.\n"
+        "- Keep args small (<~500 chars). Never paste large blobs into args. Never produce political content.\n"
         "\n"
-        "list_plar kinds (examples):\n"
-        "- {\"tool\":\"list_plar\",\"args\":{\"kind\":\"latest\",\"category\":\"both\",\"take\":10}}\n"
+        "Examples:\n"
         "- (first work) {\"tool\":\"list_plar\",\"args\":{\"kind\":\"latest\",\"category\":\"both\",\"user_id\":\"<uid>\",\"take\":1}}\n"
-        "- {\"tool\":\"list_plar\",\"args\":{\"kind\":\"hot\",\"category\":\"Experiment\",\"days\":14,\"take\":10}}\n"
-        "- {\"tool\":\"list_plar\",\"args\":{\"kind\":\"featured\",\"category\":\"Discussion\",\"take\":10}}\n"
-        "- {\"tool\":\"list_plar\",\"args\":{\"kind\":\"following\",\"take\":50}}\n"
-        "- {\"tool\":\"list_plar\",\"args\":{\"kind\":\"followers\",\"take\":50}}\n"
-        "- {\"tool\":\"list_plar\",\"args\":{\"kind\":\"banned\",\"take\":50}}  (your ban list)\n"
-        "- {\"tool\":\"list_plar\",\"args\":{\"kind\":\"volunteers\",\"take\":50}}\n"
-        "- {\"tool\":\"list_plar\",\"args\":{\"kind\":\"editors\",\"take\":50}}  (editors + admins)\n"
-        "- {\"tool\":\"list_plar\",\"args\":{\"kind\":\"retired\",\"take\":50}}\n"
-        "- {\"tool\":\"list_plar\",\"args\":{\"kind\":\"staff\"}}  (best-effort: filters your following list by Verification)\n"
-        "\n"
-        "Open/read flows (examples):\n"
-        "- {\"tool\":\"plar_get_user_board\",\"args\":{\"user_id\":\"<uid>\",\"take\":20,\"skip\":0}}  (read someone's board)\n"
-        "- To view a user's works by nickname: plar_get_user_by_name -> list_plar with user_id.\n"
-        "  - {\"tool\":\"plar_get_user_by_name\",\"args\":{\"name\":\"紫兰斋\"}}\n"
-        "  - {\"tool\":\"list_plar\",\"args\":{\"kind\":\"latest\",\"category\":\"both\",\"user_id\":\"<uid>\",\"take\":5}}\n"
-        "- If a tool result is stored (shows key), you can extract fields with store_json:\n"
-        "  - {\"tool\":\"store_json\",\"args\":{\"key\":\"<key>\",\"path\":\"experiment.items[0].subject\"}}\n"
-        "  - {\"tool\":\"store_json\",\"args\":{\"key\":\"<key>\",\"path\":\"experiment.items[0].id\"}}\n"
-        "- {\"tool\":\"plar_open_content_page\",\"args\":{\"summary_id\":\"<24hex>\",\"category\":\"Experiment\",\"take\":20,\"skip\":0}}  (read an experiment/discussion + recent comments)\n"
+        "- (open) {\"tool\":\"plar_open_content_page\",\"args\":{\"summary_id\":\"<24hex>\",\"category\":\"Experiment\",\"take\":20,\"skip\":0}}\n"
     )
 
 
@@ -1046,7 +1010,16 @@ def _agent_execute_tool(
             )
 
         if tool == "search_plar":
-            query = str(args.get("query") or "").strip()
+            query_v: Any = args.get("query")
+            if isinstance(query_v, dict):
+                for k in ("query", "q", "text", "value", "name", "id"):
+                    vv = query_v.get(k)
+                    if isinstance(vv, str) and vv.strip():
+                        query_v = vv
+                        break
+            if not isinstance(query_v, str):
+                return "ERROR: args.query must be a string"
+            query = query_v.strip()
             if not query:
                 return "ERROR: missing args.query"
             if _looks_political_sensitive(query):
@@ -1538,7 +1511,17 @@ def _agent_execute_tool(
             return json.dumps(compact, ensure_ascii=False, indent=2)
 
         if tool == "plar_get_user_by_name":
-            name = str(args.get("name") or "").strip()
+            name_v: Any = args.get("name")
+            if isinstance(name_v, dict):
+                # Some models may emit {"name": {"value": "..."} } in JSON mode.
+                for k in ("name", "value", "text", "query"):
+                    vv = name_v.get(k)
+                    if isinstance(vv, str) and vv.strip():
+                        name_v = vv
+                        break
+            if not isinstance(name_v, str):
+                return "ERROR: args.name must be a string"
+            name = name_v.strip()
             if not name:
                 return "ERROR: missing args.name"
             data = get_user_by_name(user, name=name)
@@ -1559,7 +1542,16 @@ def _agent_execute_tool(
             return json.dumps(out, ensure_ascii=False, indent=2)
 
         if tool == "plar_get_user_by_id":
-            user_id = str(args.get("user_id") or "").strip()
+            user_id_v: Any = args.get("user_id")
+            if isinstance(user_id_v, dict):
+                for k in ("user_id", "id", "value", "text"):
+                    vv = user_id_v.get(k)
+                    if isinstance(vv, str) and vv.strip():
+                        user_id_v = vv
+                        break
+            if not isinstance(user_id_v, str):
+                return "ERROR: args.user_id must be a string"
+            user_id = user_id_v.strip()
             if not user_id:
                 return "ERROR: missing args.user_id"
             data = get_user_by_id(user, user_id=user_id)
@@ -1890,17 +1882,25 @@ def agent_mode_run(
     history: list[dict[str, str]],
     requester_nickname: str | None = None,
     requester_user_id: str | None = None,
-    max_seconds: int = 600,
-    max_steps: int = 18,
+    max_seconds: int = 900,
+    max_steps: int = 100,
 ) -> str:
     task = (task or "").strip()
     if not task:
         return render_help(command_prefix=getattr(cfg.agent, "command_prefix", "!"), mode="agent")
 
+    # In one-shot mode, prior conversation context is more likely to harm than help.
+    # Keep the agent anchored to the current user message to reduce entity drift.
+    if bool(getattr(getattr(cfg, "agent", None), "reply_once", True)):
+        history = []
+
     wants_simulation = _looks_like_simulation_request(task)
     simulation_enabled = bool(getattr(getattr(cfg, "agent", None), "simulation_enabled", True))
     wants_content_intro = _looks_like_content_intro_request(task)
     wants_first_work = _looks_like_first_work_request(task)
+    first_work_target_name = _extract_first_work_target_name(task) if wants_first_work else None
+    wants_user_work_pick = _looks_like_user_work_pick_request(task)
+    work_pick_target_name = _extract_work_pick_target_name(task) if wants_user_work_pick else None
     wants_circuit, _explicit_publish_intent = _fallback_route_for_circuit(task)
 
     start_ts = time.time()
@@ -1911,6 +1911,33 @@ def agent_mode_run(
         {"role": "system", "content": system_prompt},
         {"role": "system", "content": _agent_tool_prompt(max_seconds=max_seconds)},
     ]
+    if first_work_target_name:
+        messages.append(
+            {
+                "role": "system",
+                "content": (
+                    "FIRST WORK TARGET USER (use EXACTLY; do not substitute based on prior context):\n"
+                    f"- name: {first_work_target_name}\n"
+                    "Use this exact string in plar_get_user_by_name.name (or in search_plar @handle)."
+                ),
+            }
+        )
+    if work_pick_target_name:
+        messages.append(
+            {
+                "role": "system",
+                "content": (
+                    "USER WORK PICK REQUEST DETECTED (best/most interesting work).\n"
+                    "Target user (use EXACTLY; do not substitute based on page context/history):\n"
+                    f"- name: {work_pick_target_name}\n"
+                    "Required flow:\n"
+                    "1) plar_get_user_by_name {name:\"<name>\"}\n"
+                    "2) list_plar {kind:\"latest\",category:\"Experiment\",user_id:\"<uid>\",take:12}\n"
+                    "3) Pick ONE item and answer with Category + SummaryID + Subject.\n"
+                    "Do NOT open or reference any unrelated page/content IDs."
+                ),
+            }
+        )
     if wants_simulation and simulation_enabled:
         messages.append(
             {
@@ -1921,6 +1948,22 @@ def agent_mode_run(
                     "- Do NOT provide hand-waved 'by calculation' results unless tools are disabled or fail.\n"
                     "- If Context JSON provides summary_id/category, prefer simulate_status_save.\n"
                     "- Keep simulation tool args tiny; never paste circuit/status JSON into args."
+                ),
+            }
+        )
+    if wants_content_intro:
+        messages.append(
+            {
+                "role": "system",
+                "content": (
+                    "CONTENT INTRO REQUEST DETECTED (介绍/简介/讲讲内容).\n"
+                    "Goal: describe the requested work using ONLY opened Context JSON fields.\n"
+                    "Required:\n"
+                    "- If the user refers to a specific ID: plar_open_content_page(summary_id,...)\n"
+                    "- If the user refers to a user's first work: plar_get_user_by_name -> list_plar(take=1) -> plar_open_content_page\n"
+                    "Final answer must include:\n"
+                    "- Category + SummaryID + Subject\n"
+                    "- 1–3 sentences of introduction/summary from Context JSON (e.g., title/body_text/summary_text).\n"
                 ),
             }
         )
@@ -1936,6 +1979,7 @@ def agent_mode_run(
                     "2) List works -> list_plar {kind:\"latest\",category:\"both\",user_id:\"<uid>\",take:1}\n"
                     "3) End with {\"tool\":\"end\",\"final\":\"...\"} and include Category + SummaryID + Subject.\n"
                     "Notes:\n"
+                    "- The target user is the one named in the CURRENT user request (not the system prompt / developer name).\n"
                     "- plar_get_user_board is留言板评论, NOT works. Do NOT use it for works listing.\n"
                     "- If list_plar result is stored (shows key), use store_json to extract fields like:\n"
                     "  experiment.items[0].subject / experiment.items[0].id (or discussion.* if experiment is empty).\n"
@@ -1958,24 +2002,100 @@ def agent_mode_run(
                 ),
             }
         )
-    if context_json is not None:
+
+    def _looks_like_page_context_reference(text: str) -> bool:
+        t = (text or "").strip()
+        if not t:
+            return True
+        low = t.casefold()
+        if any(x in low for x in ("summarize", "summary", "总结", "概括")):
+            return True
+        # Avoid matching overly-generic tokens like "当前" alone; use longer anchors.
+        anchors = (
+            "当前页面",
+            "当前实验",
+            "当前讨论",
+            "本页面",
+            "本实验",
+            "本讨论",
+            "这个页面",
+            "这个实验",
+            "这个讨论",
+            "此页面",
+            "此实验",
+            "此讨论",
+            "this page",
+            "current page",
+            "this experiment",
+            "current experiment",
+            "this discussion",
+            "current discussion",
+        )
+        return any(a in low for a in anchors)
+
+    include_context = (
+        context_json is not None
+        and (wants_simulation or wants_content_intro or _looks_like_page_context_reference(task))
+    )
+    if include_context and context_json is not None:
         context_for_llm = _shrink_context_json_for_llm(context_json)
+        ctx_text = json.dumps(context_for_llm, ensure_ascii=False, indent=2)
+        # Keep the embedded context bounded; the full context still exists in `context_json` for tools.
+        ctx_text = truncate(ctx_text, max_chars=8000)
         messages.append(
             {
                 "role": "system",
-                "content": "Context JSON (current page):\n"
-                + json.dumps(context_for_llm, ensure_ascii=False, indent=2),
+                "content": "Context JSON (current page, truncated):\n" + ctx_text,
             }
         )
     if history:
         # Keep it short; agent mode can re-query if needed.
         messages.extend(history[-8:])
     messages.append({"role": "user", "content": task})
+    sticky_prefix_len = len(messages)
 
     debug_io = bool(getattr(getattr(cfg, "agent", None), "debug_log_llm_io", False)) and logger.isEnabledFor(
         logging.DEBUG
     )
     debug_max = int(getattr(getattr(cfg, "agent", None), "debug_llm_max_chars", 800) or 800)
+
+    def _trim_messages_for_budget(msgs: list[dict[str, str]]) -> list[dict[str, str]]:
+        # gpt-oss commonly runs with a 4k-ish context window; keep prompts tight.
+        max_prompt_chars = int(getattr(getattr(cfg, "agent", None), "llm_prompt_max_chars", 14000) or 14000)
+
+        def _chars(ms: list[dict[str, str]]) -> int:
+            return sum(len(str(m.get("content") or "")) for m in ms if isinstance(m, dict))
+
+        total = _chars(msgs)
+        if total <= max_prompt_chars:
+            return msgs
+
+        prefix = list(msgs[:sticky_prefix_len])
+        tail = list(msgs[sticky_prefix_len:])
+        # Prefer keeping the most recent tool calls/results.
+        keep_n = 24
+        kept = tail[-keep_n:] if keep_n > 0 else []
+        out = prefix + kept
+
+        # If still too large, shrink the tail further.
+        while _chars(out) > max_prompt_chars and keep_n > 8:
+            keep_n = max(8, keep_n - 4)
+            kept = tail[-keep_n:]
+            out = prefix + kept
+
+        # As a last resort, truncate any embedded Context JSON system message.
+        if _chars(out) > max_prompt_chars:
+            out2: list[dict[str, str]] = []
+            for m in out:
+                if not isinstance(m, dict):
+                    continue
+                c = str(m.get("content") or "")
+                if (m.get("role") == "system") and ("Context JSON (current page" in c) and (len(c) > 2500):
+                    c = truncate(c, max_chars=2500)
+                out2.append({"role": str(m.get("role") or "system"), "content": c})
+            out = out2
+
+        return out
 
     def _timeout_reply() -> str:
         is_cjk = any("\u4e00" <= ch <= "\u9fff" for ch in (task or ""))
@@ -1984,6 +2104,18 @@ def agent_mode_run(
             return f"抱歉，Agent 已超时（{mins} 分钟），本次任务未能完成。你可以重新 @我 并简化需求再试一次。"
         return f"Sorry — agent timed out ({mins} minutes) and couldn't finish this task. Please @me again with a shorter request."
 
+    def _llm_chat_json(*, messages: list[dict[str, str]], phase: str) -> str:
+        try:
+            return ollama.chat(messages=messages, response_format="json")
+        except (OllamaError, Exception) as e:
+            logger.warning("agent.llm_error: phase=%s err=%s", phase, e)
+            is_cjk = any("\u4e00" <= ch <= "\u9fff" for ch in (task or ""))
+            if is_cjk:
+                final = "抱歉，本次模型没有返回可用输出（空响应/格式异常），请稍后重试或更换模型。"
+            else:
+                final = "Sorry — the model returned an unusable empty/invalid response. Please retry or switch models."
+            return json.dumps({"tool": "end", "final": final}, ensure_ascii=False)
+
     last_raw = ""
     last_non_tool_output = ""
     did_use_simulation_tool = False
@@ -1991,6 +2123,8 @@ def agent_mode_run(
     last_circuit_info: dict[str, Any] | None = None
     did_open_content = False
     had_auth_failed = False
+    allowed_open_ids: set[str] = set()
+    did_list_plar_for_work_pick = False
     allowed_tools = {
         "web_search",
         "search_plar",
@@ -2014,6 +2148,88 @@ def agent_mode_run(
     tool_sig_counts: dict[str, int] = {}
     tool_sig_last_result: dict[str, str] = {}
 
+    def _maybe_add_planner_hint() -> None:
+        planner_enabled = bool(getattr(getattr(cfg, "agent", None), "planner_enabled", False))
+        if not planner_enabled:
+            return
+        # Avoid spending budget on planning when caller explicitly sets a tiny time budget.
+        if int(max_seconds) < 90:
+            return
+
+        max_items = int(getattr(getattr(cfg, "agent", None), "planner_max_items", 6) or 6)
+        if max_items <= 0:
+            max_items = 6
+
+        ctx_obj: dict[str, Any] | None = None
+        if isinstance(context_json, dict) and context_json:
+            try:
+                ctx_obj = _shrink_context_json_for_llm(context_json)
+            except Exception:
+                ctx_obj = None
+
+        planner_messages: list[dict[str, str]] = [
+            {
+                "role": "system",
+                "content": (
+                    "PLANNER MODE (internal).\n"
+                    "- Do NOT call tools.\n"
+                    "- Do NOT include chain-of-thought.\n"
+                    "- Output STRICT JSON only.\n"
+                    "Schema:\n"
+                    "{\"plan\":[\"...\"]}\n"
+                    "Rules:\n"
+                    f"- plan must be a list of <= {max_items} short steps.\n"
+                    "- steps must be actionable and reference tools by name when needed.\n"
+                ),
+            },
+        ]
+        if ctx_obj is not None:
+            planner_messages.append(
+                {
+                    "role": "system",
+                    "content": "Context JSON (current page):\n" + json.dumps(ctx_obj, ensure_ascii=False, indent=2),
+                }
+            )
+        planner_messages.append(
+            {
+                "role": "system",
+                "content": "Allowed tools: " + ", ".join(sorted(allowed_tools - {"end"})),
+            }
+        )
+        planner_messages.append({"role": "user", "content": task})
+
+        try:
+            raw_plan = ollama.chat(messages=planner_messages, response_format="json")
+        except Exception:
+            return
+        obj = _try_parse_json_object(raw_plan or "")
+        if not obj:
+            return
+        steps = obj.get("plan")
+        if not isinstance(steps, list):
+            return
+        cleaned: list[str] = []
+        for s in steps:
+            if not isinstance(s, str):
+                continue
+            s2 = (s or "").strip()
+            if not s2:
+                continue
+            if len(s2) > 180:
+                s2 = truncate(s2, max_chars=180)
+            cleaned.append(s2)
+            if len(cleaned) >= max_items:
+                break
+        if not cleaned:
+            return
+        plan_text = "\n".join([f"{i+1}. {x}" for i, x in enumerate(cleaned)])
+        messages.append(
+            {
+                "role": "system",
+                "content": "INTERNAL PLAN (do not reveal to user; follow it):\n" + plan_text,
+            }
+        )
+
     def _tool_sig(tool_name: str, tool_args: dict[str, Any]) -> str:
         try:
             blob = json.dumps(
@@ -2033,6 +2249,8 @@ def agent_mode_run(
         except Exception:
             return False
 
+    _maybe_add_planner_hint()
+
     for step in range(1, int(max_steps) + 1):
         now = time.time()
         time_left = int(max(0.0, deadline - now))
@@ -2040,8 +2258,26 @@ def agent_mode_run(
         if now > deadline:
             return _timeout_reply()
 
-        # After 9 minutes (last 60s), tools are disabled: force final output and refuse tool calls.
+        # In the last 60s, tools are disabled: force final output and refuse tool calls.
         if not tools_enabled:
+            def _tools_disabled_fallback(raw_text: str | None = None) -> str:
+                is_cjk = any("\u4e00" <= ch <= "\u9fff" for ch in (task or ""))
+                t = (raw_text or "").strip()
+                # If the model produced plain text (not a tool call), accept it.
+                obj = _try_parse_json_object(t) if t else None
+                if t and not (isinstance(obj, dict) and isinstance(obj.get("tool"), str)):
+                    out2 = safe_reply(t, max_chars=cfg.agent.max_reply_chars)
+                    return out2 if out2.strip() else ("Done." if not is_cjk else "完成。")
+                if is_cjk:
+                    return (
+                        "抱歉，当前时间预算过小/已进入最后 60 秒，工具调用已禁用，无法继续完成需要工具的步骤。"
+                        "请提高 max_seconds 后重试。"
+                    )
+                return (
+                    "Sorry — tools are disabled in the last 60 seconds (or the time budget is too small), "
+                    "so I can't complete tool-required steps. Please retry with a larger max_seconds."
+                )
+
             messages.append(
                 {
                     "role": "system",
@@ -2061,7 +2297,8 @@ def agent_mode_run(
                     time_left,
                     len(messages),
                 )
-            raw_final = ollama.chat(messages=messages, response_format="json")
+            messages = _trim_messages_for_budget(messages)
+            raw_final = _llm_chat_json(messages=messages, phase="tools_disabled_end")
             if debug_io:
                 logger.debug(
                     "agent.llm_out: step=%d len=%d preview=%r",
@@ -2092,9 +2329,10 @@ def agent_mode_run(
                         step,
                         int(max_steps),
                         time_left,
-                        len(messages),
-                    )
-                raw_final2 = ollama.chat(messages=messages, response_format="json")
+                    len(messages),
+                )
+                messages = _trim_messages_for_budget(messages)
+                raw_final2 = _llm_chat_json(messages=messages, phase="tools_disabled_retry_end")
                 if debug_io:
                     logger.debug(
                         "agent.llm_out: step=%d (retry_end) len=%d preview=%r",
@@ -2113,14 +2351,11 @@ def agent_mode_run(
                             )
                         out = safe_reply(final2 or "", max_chars=cfg.agent.max_reply_chars)
                         return out if out.strip() else "Done."
+                    return _tools_disabled_fallback(raw_text=final2 or raw_final2)
                 except Exception:
-                    out = safe_reply(raw_final2, max_chars=cfg.agent.max_reply_chars)
-                    return out if out.strip() else "Done."
-                out = safe_reply(raw_final2, max_chars=cfg.agent.max_reply_chars)
-                return out if out.strip() else "Done."
+                    return _tools_disabled_fallback(raw_text=raw_final2)
             except Exception:
-                out = safe_reply(raw_final, max_chars=cfg.agent.max_reply_chars)
-                return out if out.strip() else "Done."
+                return _tools_disabled_fallback(raw_text=raw_final)
 
         # Normal tool-enabled phase.
         messages.append(
@@ -2139,7 +2374,8 @@ def agent_mode_run(
                 time_left,
                 len(messages),
             )
-        raw = ollama.chat(messages=messages, response_format="json")
+        messages = _trim_messages_for_budget(messages)
+        raw = _llm_chat_json(messages=messages, phase="tool_loop")
         last_raw = raw
         try:
             tool, args, final = _agent_parse_tool_call(raw)
@@ -2178,6 +2414,117 @@ def agent_mode_run(
                 }
             )
             continue
+
+        if wants_first_work and first_work_target_name:
+            def _norm_name(x: str) -> str:
+                s = (x or "").strip()
+                s = s.lstrip("@＠")
+                s = re.sub(r"\s+", "", s)
+                return s
+
+            target_norm = _norm_name(first_work_target_name)
+            if tool == "plar_get_user_by_name":
+                got = _norm_name(str(args.get("name") or ""))
+                if got and got != target_norm:
+                    messages.append(
+                        {
+                            "role": "system",
+                            "content": (
+                                "REJECTED: wrong user name for first-work lookup.\n"
+                                f"- required name: {first_work_target_name}\n"
+                                f"- got: {str(args.get('name') or '').strip()}\n"
+                                "Call plar_get_user_by_name again with the required name."
+                            ),
+                        }
+                    )
+                    continue
+            if tool == "search_plar":
+                q = str(args.get("query") or "").strip()
+                try:
+                    spec = _parse_plar_lookup_query(q)
+                except Exception:
+                    spec = {"kind": "", "value": ""}
+                if spec.get("kind") == "user_name":
+                    got = _norm_name(str(spec.get("value") or ""))
+                    if got and got != target_norm:
+                        messages.append(
+                            {
+                                "role": "system",
+                                "content": (
+                                    "REJECTED: wrong user in search_plar for first-work lookup.\n"
+                                    f"- required: @{first_work_target_name}\n"
+                                    f"- got: {q}\n"
+                                    "Redo the lookup using the required user name."
+                                ),
+                            }
+                        )
+                        continue
+            if tool == "list_plar":
+                uid = str(args.get("user_id") or "").strip()
+                if not uid:
+                    messages.append(
+                        {
+                            "role": "system",
+                            "content": (
+                                "REJECTED: list_plar for 'first work' must include a specific user_id.\n"
+                                f"First lookup the user '{first_work_target_name}' using plar_get_user_by_name, then call list_plar with user_id."
+                            ),
+                        }
+                    )
+                    continue
+
+        if wants_user_work_pick and work_pick_target_name:
+            def _norm_name2(x: str) -> str:
+                s = (x or "").strip()
+                s = s.lstrip("@＠")
+                s = re.sub(r"\s+", "", s)
+                return s
+
+            target_norm2 = _norm_name2(work_pick_target_name)
+            if tool == "plar_get_user_by_name":
+                got = _norm_name2(str(args.get("name") or ""))
+                if got and got != target_norm2:
+                    messages.append(
+                        {
+                            "role": "system",
+                            "content": (
+                                "REJECTED: wrong user name for work-pick lookup.\n"
+                                f"- required name: {work_pick_target_name}\n"
+                                f"- got: {str(args.get('name') or '').strip()}\n"
+                                "Call plar_get_user_by_name again with the required name."
+                            ),
+                        }
+                    )
+                    continue
+            if tool == "list_plar":
+                uid = str(args.get("user_id") or "").strip()
+                if not uid:
+                    messages.append(
+                        {
+                            "role": "system",
+                            "content": (
+                                "REJECTED: list_plar for work-pick must include a specific user_id.\n"
+                                f"First lookup the user '{work_pick_target_name}' using plar_get_user_by_name, then call list_plar with user_id."
+                            ),
+                        }
+                    )
+                    continue
+            if tool in ("plar_open_content_page", "plar_get_experiment_context") and allowed_open_ids:
+                sid = str(args.get("summary_id") or args.get("id") or "").strip()
+                if sid and sid not in allowed_open_ids:
+                    messages.append(
+                        {
+                            "role": "system",
+                            "content": (
+                                "REJECTED: do not open unrelated content for this request.\n"
+                                f"- requested user: {work_pick_target_name}\n"
+                                f"- allowed ids (from list_plar): {', '.join(sorted(list(allowed_open_ids))[:12])}\n"
+                                f"- got: {sid}\n"
+                                "Open ONLY an id returned by list_plar for the target user, or answer directly from list_plar without opening."
+                            ),
+                        }
+                    )
+                    continue
 
         sig = ""
         if tool != "end":
@@ -2224,6 +2571,20 @@ def agent_mode_run(
                     }
                 )
                 continue
+            if wants_user_work_pick and tools_enabled and (not did_list_plar_for_work_pick) and (not had_auth_failed):
+                messages.append(
+                    {
+                        "role": "system",
+                        "content": (
+                            "REJECTED: user asked you to pick an interesting experiment, but you did not list the user's works yet.\n"
+                            "Required flow:\n"
+                            "1) plar_get_user_by_name {name:\"...\"}\n"
+                            "2) list_plar {kind:\"latest\",category:\"Experiment\",user_id:\"<uid>\",take:12}\n"
+                            "Then pick ONE item and end with Category + SummaryID + Subject."
+                        ),
+                    }
+                )
+                continue
             if wants_content_intro and tools_enabled and (not did_open_content) and (not had_auth_failed):
                 messages.append(
                     {
@@ -2237,6 +2598,34 @@ def agent_mode_run(
                     }
                 )
                 continue
+            if wants_content_intro and tools_enabled and did_open_content:
+                final_text = str(final or "").strip()
+                has_intro_hint = any(x in final_text for x in ("介绍", "简介", "内容", "summary", "Summary", "intro", "Intro"))
+                if (len(final_text) < 120) and (not has_intro_hint):
+                    messages.append(
+                        {
+                            "role": "system",
+                            "content": (
+                                "REJECTED: user asked for an introduction/summary, but your end.final does not include it.\n"
+                                "Include Category + SummaryID + Subject, plus 1–3 sentences summarizing the work from the opened Context JSON.\n"
+                                "Now call {\"tool\":\"end\",\"final\":\"...\"} again."
+                            ),
+                        }
+                    )
+                    continue
+            if wants_user_work_pick and tools_enabled:
+                final_text = str(final or "")
+                if _HEX24_RE.search(final_text or "") is None:
+                    messages.append(
+                        {
+                            "role": "system",
+                            "content": (
+                                "REJECTED: your end.final is missing a SummaryID (24-hex id).\n"
+                                "Pick one experiment from list_plar and include Category + SummaryID + Subject."
+                            ),
+                        }
+                    )
+                    continue
             if wants_circuit and tools_enabled and (not did_use_circuit_tool):
                 messages.append(
                     {
@@ -2324,6 +2713,29 @@ def agent_mode_run(
                 pass
             elif isinstance(obj, dict):
                 did_open_content = True
+        if wants_user_work_pick and tool == "list_plar" and not str(result or "").startswith("ERROR"):
+            obj = _try_parse_json_object(result or "")
+            ids: list[str] = []
+            if isinstance(obj, dict):
+                items = obj.get("items")
+                if isinstance(items, list):
+                    for it in items:
+                        if isinstance(it, dict):
+                            sid = best_effort_extract_text(it.get("id")) or best_effort_extract_text(it.get("ID"))
+                            if isinstance(sid, str) and sid.strip():
+                                ids.append(sid.strip())
+                for sec_key in ("experiment", "discussion"):
+                    sec = obj.get(sec_key)
+                    if isinstance(sec, dict) and isinstance(sec.get("items"), list):
+                        for it in sec.get("items") or []:
+                            if isinstance(it, dict):
+                                sid = best_effort_extract_text(it.get("id")) or best_effort_extract_text(it.get("ID"))
+                                if isinstance(sid, str) and sid.strip():
+                                    ids.append(sid.strip())
+            for sid in ids:
+                allowed_open_ids.add(sid)
+            if ids:
+                did_list_plar_for_work_pick = True
         if debug_io:
             logger.debug(
                 "agent.tool_result: step=%d tool=%s len=%d preview=%r",
@@ -2389,7 +2801,8 @@ def agent_mode_run(
             (time.time() < tool_cutoff_ts),
             len(messages),
         )
-    raw2 = ollama.chat(messages=messages, response_format="json")
+    messages = _trim_messages_for_budget(messages)
+    raw2 = _llm_chat_json(messages=messages, phase="budget_reached")
     try:
         tool, _args, final = _agent_parse_tool_call(raw2)
         if tool == "end":
@@ -2414,7 +2827,8 @@ def agent_mode_run(
             "content": "REJECTED: budget reached. Output ONLY {\"tool\":\"end\",\"final\":\"...\"}.",
         }
     )
-    raw3 = ollama.chat(messages=messages, response_format="json")
+    messages = _trim_messages_for_budget(messages)
+    raw3 = _llm_chat_json(messages=messages, phase="budget_reached_retry_end")
     try:
         tool3, _args3, final3 = _agent_parse_tool_call(raw3)
         if tool3 == "end":
@@ -2632,6 +3046,124 @@ def _looks_like_first_work_request(user_text: str) -> bool:
             "first experiment",
         )
     )
+
+def _extract_first_work_target_name(user_text: str) -> str | None:
+    """Best-effort extract target nickname for 'first work/experiment' requests.
+
+    We keep this conservative: return None if we cannot confidently identify a single name.
+    The goal is to prevent entity drift when prior context mentions other names.
+    """
+    t = (user_text or "").strip()
+    if not t:
+        return None
+
+    low = t.casefold()
+    # If the user already provided an explicit handle/id prefix, let the agent follow it.
+    if any(p in low for p in ("uid:", "user_id:", "userid:", "experiment:", "discussion:", "user:", "nickname:")):
+        return None
+    if _HEX24_RE.search(t):
+        return None
+
+    # Prefer explicit @handle when present.
+    m_at = _AT_HANDLE_RE.search(t)
+    if m_at:
+        cand = (m_at.group(1) or "").strip()
+        if cand:
+            return cand
+
+    def _cleanup_name(name: str) -> str:
+        s = (name or "").strip()
+        # Strip common leading instruction phrases that can be accidentally captured.
+        for p in (
+            "请你告诉我",
+            "麻烦你告诉我",
+            "告诉我",
+            "请问",
+            "你认识",
+            "你知道",
+            "你了解",
+        ):
+            if s.startswith(p):
+                s = s[len(p) :].strip()
+                break
+        # Strip common trailing verbs accidentally attached to the name.
+        for suf in ("发布", "发表", "制作", "做"):
+            if s.endswith(suf) and len(s) > len(suf):
+                s = s[: -len(suf)].strip()
+                break
+        return s
+
+    patterns = [
+        # “告诉我紫兰斋的第一个作品…”
+        r"(?:告诉我|请你告诉我|请问|麻烦你告诉我)(?P<name>[^\s，,。？！?]{1,32}?)的第(?:一|1)个(?:作品|实验)",
+        # “紫兰斋发布的第一个实验…”
+        r"(?P<name>[^\s，,。？！?]{1,32}?)(?:发布|发表|做|制作)的第(?:一|1)个(?:作品|实验)",
+        # “紫兰斋的第一个作品/实验…”
+        r"(?P<name>[^\s，,。？！?]{1,32}?)的第(?:一|1)个(?:作品|实验)",
+        # “你认识紫兰斋吗？…第一个作品…”
+        r"(?:你认识|你知道|你了解)(?P<name>[^\s，,。？！?吗]{1,32}?)(?:吗|？|\\?)?.{0,24}第(?:一|1)个(?:作品|实验)",
+    ]
+    for pat in patterns:
+        m = re.search(pat, t)
+        if not m:
+            continue
+        name = _cleanup_name((m.group("name") or "").strip())
+        if not name:
+            continue
+        # Avoid capturing leading pronouns.
+        if name in ("我", "你", "他", "她", "它", "我们", "他们", "她们", "自己"):
+            continue
+        return name
+
+    return None
+
+def _looks_like_user_work_pick_request(user_text: str) -> bool:
+    t = (user_text or "").strip()
+    if not t:
+        return False
+    low = t.casefold()
+    wants_pick = any(x in low for x in ("最有趣", "最好", "最值得", "推荐", "best", "most interesting", "recommend"))
+    mentions_work = any(x in low for x in ("作品", "实验", "experiment", "work"))
+    mentions_published = any(x in low for x in ("发布", "发表", "发布的", "published"))
+    has_target_hint = ("@" in t) or ("＠" in t) or ("的" in t) or ("user:" in low) or ("uid:" in low)
+    return bool(wants_pick and mentions_work and (mentions_published or has_target_hint))
+
+def _extract_work_pick_target_name(user_text: str) -> str | None:
+    """Extract a target user name for 'pick best/most interesting work' queries."""
+    t = (user_text or "").strip()
+    if not t:
+        return None
+    # Prefer explicit @handle.
+    m_at = _AT_HANDLE_RE.search(t)
+    if m_at:
+        cand = (m_at.group(1) or "").strip()
+        return cand or None
+
+    def _cleanup(name: str) -> str:
+        s = (name or "").strip()
+        for p in ("请你告诉我", "麻烦你告诉我", "告诉我", "请问"):
+            if s.startswith(p):
+                s = s[len(p) :].strip()
+                break
+        for suf in ("发布", "发表"):
+            if s.endswith(suf) and len(s) > len(suf):
+                s = s[: -len(suf)].strip()
+                break
+        return s
+
+    # “MacroModel发布的最有趣的实验…”
+    m = re.search(r"(?P<name>[^\s，,。？！?]{1,32}?)发布的", t)
+    if m:
+        name = _cleanup(m.group("name") or "")
+        if name:
+            return name
+    # “MacroModel 的最有趣的实验…”
+    m2 = re.search(r"(?P<name>[^\s，,。？！?]{1,32}?)的最", t)
+    if m2:
+        name = _cleanup(m2.group("name") or "")
+        if name:
+            return name
+    return None
 
 
 def _setup_logging(
@@ -6393,8 +6925,8 @@ def _cmd_oneshot(args: argparse.Namespace) -> int:
             history=[],
             requester_nickname=getattr(user, "nickname", None),
             requester_user_id=getattr(user, "user_id", None),
-            max_seconds=int(getattr(args, "max_seconds", 180) or 180),
-            max_steps=int(getattr(args, "max_steps", 12) or 12),
+            max_seconds=int(getattr(args, "max_seconds", 900) or 900),
+            max_steps=int(getattr(args, "max_steps", 30) or 30),
         )
         print(reply)
         return 0
@@ -6530,8 +7062,8 @@ def main(argv: list[str] | None = None) -> int:
         default=None,
         help="Optional context to load: experiment:<id> | discussion:<id> | <id> (defaults to Experiment)",
     )
-    p_one.add_argument("--max-seconds", default=180, type=int, help="Agent-mode time budget seconds (default: 180)")
-    p_one.add_argument("--max-steps", default=12, type=int, help="Agent-mode max tool steps (default: 12)")
+    p_one.add_argument("--max-seconds", default=900, type=int, help="Agent-mode time budget seconds (default: 900)")
+    p_one.add_argument("--max-steps", default=30, type=int, help="Agent-mode max tool steps (default: 30)")
     p_one.add_argument("--debug-io", action="store_true", help="Force debug logs for LLM I/O")
     p_one.add_argument("--log-level", default=None, help="Console log level (default: config or DEBUG if --debug-io)")
     p_one.set_defaults(func=_cmd_oneshot)

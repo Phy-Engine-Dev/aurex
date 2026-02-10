@@ -454,9 +454,34 @@ def get_user_by_name(
     *,
     name: str,
 ) -> dict[str, Any]:
-    name = (name or "").strip()
-    if not name:
+    name0 = (name or "").strip()
+    if not name0:
         raise PLARError("name is empty")
+    # Allow callers to pass @handles.
+    name0 = name0.lstrip("@＠").strip()
+    if not name0:
+        raise PLARError("name is empty")
+
+    def _is_probable_not_found(e: BaseException) -> bool:
+        msg = (str(e) or "").casefold()
+        return ("status=404" in msg) or ("standard.404" in msg) or ("notfound" in msg) or ("not found" in msg)
+
+    def _candidate_names(n: str) -> list[str]:
+        out: list[str] = [n]
+        low = n.casefold()
+        # Common latin typo: "...mium" vs "...nium" (e.g., Neptumium -> Neptunium).
+        if low.endswith("mium") and not low.endswith("nium") and len(n) >= 6:
+            out.append(n[:-4] + "nium")
+        # Common fullwidth @ already stripped above; keep only unique non-empty.
+        seen: set[str] = set()
+        out2: list[str] = []
+        for x in out:
+            s = (x or "").strip()
+            if not s or s in seen:
+                continue
+            seen.add(s)
+            out2.append(s)
+        return out2
 
     def _extract_data(result: Any) -> dict[str, Any]:
         if not isinstance(result, dict):
@@ -476,28 +501,63 @@ def get_user_by_name(
         return data
 
     fn = getattr(user, "get_user_by_name", None)
-    if callable(fn):
-        return _extract_data(fn(name))
 
     token = getattr(user, "token", None)
     auth_code = getattr(user, "auth_code", None)
-    if not isinstance(token, str) or not token.strip() or not isinstance(auth_code, str) or not auth_code.strip():
-        raise PLARError("get_user_by_name is not callable and token/auth_code are missing")
-    status_code, data = _requests_post_json_no_env_proxy(
-        url="https://physics-api-cn.turtlesim.com/Users/GetUser",
-        payload={"Name": name},
-        headers={
-            "Content-Type": "application/json",
-            "x-API-Token": token,
-            "x-API-AuthCode": auth_code,
-        },
-        timeout_sec=_requests_default_timeout_sec,
+    have_direct_http = (
+        isinstance(token, str)
+        and token.strip()
+        and isinstance(auth_code, str)
+        and auth_code.strip()
     )
-    if status_code == 403:
-        raise PermissionError("login failed")
-    if status_code and status_code >= 400:
-        raise PLARError(f"GetUser failed (http={status_code}): {data}")
-    return _extract_data(data)
+
+    last_err: BaseException | None = None
+    for cand in _candidate_names(name0):
+        # 1) Prefer the upstream wrapper when available.
+        if callable(fn):
+            try:
+                return _extract_data(fn(cand))
+            except TypeError:
+                # Some upstream physicsLab builds/environments can occasionally mis-wire
+                # internal request/session objects and raise TypeError (e.g. "'dict' object is not callable").
+                # Fall back to a direct HTTP call using token/auth_code.
+                last_err = TypeError("'dict' object is not callable")
+            except PLARError as e:
+                last_err = e
+                if _is_probable_not_found(e):
+                    continue
+                raise
+
+        # 2) Direct HTTP fallback.
+        if not have_direct_http:
+            continue
+        try:
+            status_code, data = _requests_post_json_no_env_proxy(
+                url="https://physics-api-cn.turtlesim.com/Users/GetUser",
+                payload={"Name": cand},
+                headers={
+                    "Content-Type": "application/json",
+                    "x-API-Token": token,
+                    "x-API-AuthCode": auth_code,
+                },
+                timeout_sec=_requests_default_timeout_sec,
+            )
+            if status_code == 403:
+                raise PermissionError("login failed")
+            if status_code and status_code >= 400:
+                raise PLARError(f"GetUser failed (http={status_code}): {data}")
+            return _extract_data(data)
+        except PLARError as e:
+            last_err = e
+            if _is_probable_not_found(e):
+                continue
+            raise
+
+    if last_err is None:
+        raise PLARError("get_user_by_name is not callable and token/auth_code are missing")
+    if isinstance(last_err, PLARError):
+        raise last_err
+    raise PLARError(str(last_err) or "GetUser failed")
 
 
 def get_user_by_id(
@@ -528,7 +588,11 @@ def get_user_by_id(
 
     fn = getattr(user, "get_user_by_id", None)
     if callable(fn):
-        return _extract_data(fn(user_id))
+        try:
+            return _extract_data(fn(user_id))
+        except TypeError:
+            # See get_user_by_name: fall back to direct HTTP on flaky wrapper behavior.
+            pass
 
     token = getattr(user, "token", None)
     auth_code = getattr(user, "auth_code", None)

@@ -73,6 +73,22 @@ class TestAgentMode(unittest.TestCase):
         self.assertEqual(agent_mod._json_path_get(obj, "experiment.items[0].subject"), "y")
         self.assertEqual(agent_mod._json_path_get(obj, "experiment.items[0].id"), "x")
 
+    def test_extract_first_work_target_name(self):
+        self.assertEqual(
+            agent_mod._extract_first_work_target_name("你认识紫兰斋吗？告诉我紫兰斋的第一个作品是什么"),
+            "紫兰斋",
+        )
+        self.assertEqual(
+            agent_mod._extract_first_work_target_name("请你告诉我紫兰斋发布的第一个实验介绍是什么？"),
+            "紫兰斋",
+        )
+        self.assertEqual(
+            agent_mod._extract_first_work_target_name("@紫兰斋 的第一个实验是什么？"),
+            "紫兰斋",
+        )
+        self.assertIsNone(agent_mod._extract_first_work_target_name("uid:559bb4f1f57067d3795b81a3 的第一个作品是什么？"))
+        self.assertIsNone(agent_mod._extract_first_work_target_name("experiment:5ce144ec8de57b5d588aada5 的第一个作品是什么？"))
+
     def test_parse_context_ref(self):
         self.assertEqual(agent_mod._parse_context_ref("experiment:abc"), ("Experiment", "abc"))
         self.assertEqual(agent_mod._parse_context_ref("exp:abc"), ("Experiment", "abc"))

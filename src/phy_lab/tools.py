@@ -2138,7 +2138,10 @@ def web_search_duckduckgo(
                 break
 
         if not pairs:
-            return f"No results parsed from DuckDuckGo (duckduckgo-search).\nQuery: {q}"
+            # Treat as a soft failure and fall back to the HTML endpoint, which is often
+            # more robust in locked-down/proxied environments.
+            lib_error_note = "duckduckgo-search returned no parsable results"
+            return None
 
         lines = ["DuckDuckGo results:"]
         for i, (t, u) in enumerate(pairs, start=1):

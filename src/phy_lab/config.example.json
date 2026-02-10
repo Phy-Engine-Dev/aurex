@@ -65,6 +65,8 @@
     "web_search_fallback_to_ddg": true,
     "web_search_searxng_base_url": "http://127.0.0.1:8080",
     "auto_tool_routing": true,
+    "planner_enabled": true,
+    "planner_max_items": 10,
     "auto_publish": false,
     "publish_by_default": false,
     "circuit_max_attempts": 3,
