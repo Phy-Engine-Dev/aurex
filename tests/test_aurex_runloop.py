@@ -77,6 +77,11 @@ class TestRunLoopHelpers(unittest.TestCase):
         self.assertTrue(runloop._has_explicit_mention(text="你好 ＠aurex", mention_tag="@aurex"))
         self.assertTrue(runloop._has_explicit_mention(text="Hello @AUREX", mention_tag="@aurex"))
 
+    def test_normalize_post_text_preserves_newlines(self):
+        s = "@abc  hello  \n\n-  a  \n-  b  \n\n\n"
+        out = runloop._normalize_post_text(s)
+        self.assertEqual(out, "@abc hello\n\n- a\n- b")
+
 
 class TestNotificationsScan(unittest.TestCase):
     def _cfg(self) -> AurexConfig:

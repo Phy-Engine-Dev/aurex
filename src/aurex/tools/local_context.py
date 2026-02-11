@@ -111,6 +111,58 @@ def local_get_target_context(runtime: ToolRuntime, args: dict[str, Any]) -> dict
             )
             out = db.get_target_context(target_key=target_key, take=take)
 
+    # Best-effort: enrich target metadata for Experiment/Discussion so the writer can reference title/author safely.
+    if runtime.user is not None:
+        try:
+            ttype0, tid0 = target_key.split(":", 1)
+        except ValueError:
+            ttype0, tid0 = "", ""
+        ttype0 = _canonical_target_type(ttype0)
+        tid0 = tid0.strip()
+        if ttype0 in ("Experiment", "Discussion") and tid0:
+            try:
+                ctx = plar.get_experiment_context(
+                    runtime.user,
+                    summary_id=tid0,
+                    category_value=ttype0,
+                    cache_dir=runtime.cache_dir,
+                    ttl_sec=600,
+                    max_json_chars=2000,
+                )
+            except Exception:
+                ctx = None
+            if isinstance(ctx, dict):
+                meta: dict[str, Any] = {"type": ttype0, "id": tid0}
+                title = ctx.get("title")
+                author = ctx.get("author")
+                plsav_summary = ctx.get("plsav_summary")
+                summary_text = ctx.get("summary_text") or ctx.get("body_text")
+                experiment_text = ctx.get("experiment_text") or ctx.get("content_text")
+                if isinstance(title, str) and title.strip():
+                    meta["title"] = title.strip()
+                if isinstance(author, dict):
+                    meta["author"] = author
+                if isinstance(plsav_summary, dict):
+                    meta["plsav_summary"] = plsav_summary
+                if isinstance(summary_text, str) and summary_text.strip():
+                    st = summary_text.strip()
+                    meta["summary_text_excerpt"] = st if len(st) <= 1200 else (st[:1199] + "…")
+                if isinstance(experiment_text, str) and experiment_text.strip():
+                    et = experiment_text.strip()
+                    meta["experiment_text_excerpt"] = et if len(et) <= 1200 else (et[:1199] + "…")
+                if len(meta) > 2:
+                    try:
+                        db.upsert_target_meta(target_key=target_key, target=meta)
+                    except Exception:
+                        pass
+                    tgt = out.get("target")
+                    if isinstance(tgt, dict):
+                        merged = dict(tgt)
+                        merged.update(meta)
+                        out["target"] = merged
+                    else:
+                        out["target"] = meta
+
     comments = out.get("comments")
     if isinstance(comments, list):
         out["comments_count"] = len(comments)

@@ -55,7 +55,13 @@ class ContextDB:
             entry = {}
             targets[target_key] = entry
 
-        entry["target"] = dict(target or {})
+        existing_target = entry.get("target")
+        if isinstance(existing_target, dict):
+            merged_target = dict(existing_target)
+            merged_target.update(dict(target or {}))
+            entry["target"] = merged_target
+        else:
+            entry["target"] = dict(target or {})
         entry["updated_at_ms"] = int(time.time() * 1000)
 
         existing = entry.get("comments")
@@ -92,6 +98,31 @@ class ContextDB:
 
         self.save(data)
 
+    def upsert_target_meta(self, *, target_key: str, target: dict[str, Any]) -> None:
+        if not target_key:
+            return
+        data = self.load()
+        targets = data.get("targets")
+        if not isinstance(targets, dict):
+            targets = {}
+            data["targets"] = targets
+
+        entry = targets.get(target_key)
+        if not isinstance(entry, dict):
+            entry = {}
+            targets[target_key] = entry
+
+        existing_target = entry.get("target")
+        if isinstance(existing_target, dict):
+            merged_target = dict(existing_target)
+            merged_target.update(dict(target or {}))
+            entry["target"] = merged_target
+        else:
+            entry["target"] = dict(target or {})
+
+        entry["target_meta_updated_at_ms"] = int(time.time() * 1000)
+        self.save(data)
+
     def get_target_context(self, *, target_key: str, take: int = 20) -> dict[str, Any]:
         take_i = int(take or 20)
         if take_i <= 0:
@@ -115,6 +146,6 @@ class ContextDB:
             "found": True,
             "target": entry.get("target"),
             "updated_at_ms": entry.get("updated_at_ms"),
+            "target_meta_updated_at_ms": entry.get("target_meta_updated_at_ms"),
             "comments": out,
         }
-

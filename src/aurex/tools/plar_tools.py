@@ -1,10 +1,107 @@
 from __future__ import annotations
 
+import re
 from typing import Any
 
 import plar
 
 from .registry import ToolError, ToolRuntime
+
+
+_HEX24_RE = re.compile(r"[0-9a-fA-F]{24}")
+_TAG_SPLIT_RE = re.compile(r"[,\n;，；]+")
+
+_TAG_NAME_TO_VALUE: dict[str, str] | None = None
+
+
+def _extract_hex24(value: Any) -> str:
+    s = str(value or "").strip()
+    if not s:
+        return ""
+    m = _HEX24_RE.search(s)
+    return m.group(0) if m else ""
+
+
+def _require_hex24(value: Any, *, where: str) -> str:
+    s = str(value or "").strip()
+    out = _extract_hex24(s)
+    if out:
+        return out
+    if s and re.fullmatch(r"[0-9a-fA-F]+", s) and len(s) != 24:
+        raise ToolError(f"{where} looks truncated (expected 24-hex), got {s!r}")
+    raise ToolError(f"{where} must include a 24-hex id, got {s!r}")
+
+
+def _load_tag_name_to_value() -> dict[str, str]:
+    """Load physicsLab.Tag enum mapping: name(casefold) -> value.
+
+    This covers common built-in tags like Featured(精选), Circuit(Type-0), NoRemixes(禁止改编), etc.
+    If physicsLab is unavailable, return an empty mapping.
+    """
+    global _TAG_NAME_TO_VALUE
+    if _TAG_NAME_TO_VALUE is not None:
+        return _TAG_NAME_TO_VALUE
+    mapping: dict[str, str] = {}
+    try:
+        from physicsLab import Tag as PLTag  # type: ignore
+
+        for t in PLTag:
+            name = getattr(t, "name", None)
+            val = getattr(t, "value", None)
+            if isinstance(name, str) and name.strip() and isinstance(val, str) and val.strip():
+                mapping[name.strip().casefold()] = val.strip()
+    except Exception:
+        mapping = {}
+    _TAG_NAME_TO_VALUE = mapping
+    return mapping
+
+
+def _normalize_tag_list(value: Any) -> list[str] | None:
+    """Normalize tag filters from LLM/user args.
+
+    Accepts: null | string | list. Converts Tag.<Name> / <Name> to the Tag enum value when available.
+    Unknown/custom tags are preserved as-is.
+    """
+    if value is None:
+        return None
+
+    raw_items: list[str] = []
+    if isinstance(value, str):
+        s = value.strip()
+        if not s:
+            return None
+        raw_items = [x.strip() for x in _TAG_SPLIT_RE.split(s) if x.strip()] or [s]
+    elif isinstance(value, list):
+        for x in value:
+            if x is None:
+                continue
+            if isinstance(x, str) and x.strip():
+                raw_items.append(x.strip())
+            else:
+                sx = str(x).strip()
+                if sx:
+                    raw_items.append(sx)
+    else:
+        s = str(value).strip()
+        if not s:
+            return None
+        raw_items = [s]
+
+    name_to_value = _load_tag_name_to_value()
+    out: list[str] = []
+    seen: set[str] = set()
+    for it in raw_items:
+        s = (it or "").strip()
+        if not s:
+            continue
+        if s.startswith("Tag.") and len(s) > 4:
+            s = s[4:].strip()
+        mapped = name_to_value.get(s.casefold())
+        tag = mapped or s
+        if tag and tag not in seen:
+            seen.add(tag)
+            out.append(tag)
+    return out or None
 
 
 def _require_user(runtime: ToolRuntime) -> Any:
@@ -16,7 +113,13 @@ def _require_user(runtime: ToolRuntime) -> Any:
 def plar_query_experiments(runtime: ToolRuntime, args: dict[str, Any]) -> list[dict[str, Any]]:
     user = _require_user(runtime)
     category = args.get("category") or "Experiment"
-    return plar.query_experiments(
+    user_id_raw = args.get("user_id")
+    user_id_s: str | None = None
+    if isinstance(user_id_raw, str) and user_id_raw.strip():
+        user_id_s = _require_hex24(user_id_raw, where="plar_query_experiments.user_id")
+    tags = _normalize_tag_list(args.get("tags"))
+    exclude_tags = _normalize_tag_list(args.get("exclude_tags"))
+    items = plar.query_experiments(
         user,
         category=category,
         take=int(args.get("take") or 20),
@@ -24,12 +127,18 @@ def plar_query_experiments(runtime: ToolRuntime, args: dict[str, Any]) -> list[d
         from_skip=args.get("from_skip"),
         days=args.get("days"),
         sort=args.get("sort"),
-        user_id=args.get("user_id"),
-        tags=args.get("tags"),
-        exclude_tags=args.get("exclude_tags"),
+        user_id=user_id_s,
+        tags=tags,
+        exclude_tags=exclude_tags,
         languages=args.get("languages"),
         exclude_languages=args.get("exclude_languages"),
     )
+    cat_hint = category if category in ("Experiment", "Discussion") else None
+    out: list[dict[str, Any]] = []
+    for it in items:
+        if isinstance(it, dict):
+            out.append(_compact_qe_item(it, category_hint=cat_hint))
+    return out
 
 
 def plar_get_user(runtime: ToolRuntime, args: dict[str, Any]) -> dict[str, Any]:
@@ -37,9 +146,12 @@ def plar_get_user(runtime: ToolRuntime, args: dict[str, Any]) -> dict[str, Any]:
     name = args.get("name")
     user_id = args.get("user_id")
     if isinstance(name, str) and name.strip():
-        return plar.get_user_by_name(user, name=name)
+        pkg = plar.get_user_by_name(user, name=name)
+        return _compact_user_pkg(pkg)
     if isinstance(user_id, str) and user_id.strip():
-        return plar.get_user_by_id(user, user_id=user_id)
+        uid = _require_hex24(user_id, where="plar_get_user.user_id")
+        pkg = plar.get_user_by_id(user, user_id=uid)
+        return _compact_user_pkg(pkg)
     raise ToolError("plar_get_user requires either name or user_id")
 
 
@@ -50,9 +162,7 @@ def plar_get_comments(runtime: ToolRuntime, args: dict[str, Any]) -> list[dict[s
         target_type = target_type[:1].upper() + target_type[1:].casefold()
     if target_type not in ("User", "Experiment", "Discussion"):
         raise ToolError("plar_get_comments: target_type must be User|Experiment|Discussion")
-    target_id = str(args.get("target_id") or "").strip()
-    if not target_id:
-        raise ToolError("plar_get_comments: target_id is required")
+    target_id = _require_hex24(args.get("target_id"), where="plar_get_comments.target_id")
     take = int(args.get("take") or 20)
     if take <= 0:
         take = 20
@@ -61,7 +171,262 @@ def plar_get_comments(runtime: ToolRuntime, args: dict[str, Any]) -> list[dict[s
     skip = int(args.get("skip") or 0)
     if skip < 0:
         skip = 0
-    return plar.get_comments(user, target_id=target_id, target_type=target_type, take=take, skip=skip)
+    raw = plar.get_comments(user, target_id=target_id, target_type=target_type, take=take, skip=skip)
+    out: list[dict[str, Any]] = []
+    for c in raw:
+        if not isinstance(c, dict):
+            continue
+        rec = _compact_comment(c)
+        if rec is not None:
+            out.append(rec)
+    return out
+
+
+def _compact_qe_item(item: dict[str, Any], *, category_hint: str | None = None) -> dict[str, Any]:
+    def _get_str(*keys: str) -> str:
+        for k in keys:
+            v = item.get(k)
+            s = plar.best_effort_extract_text(v).strip()
+            if s:
+                return s
+        return ""
+
+    def _get_int(key: str) -> int | None:
+        v = item.get(key)
+        if isinstance(v, bool):
+            return None
+        if isinstance(v, int):
+            return v
+        if isinstance(v, float):
+            return int(v)
+        if isinstance(v, str) and v.strip().isdigit():
+            try:
+                return int(v.strip(), 10)
+            except Exception:
+                return None
+        return None
+
+    subject = _get_str("Subject", "Title", "Name")
+    desc = plar.best_effort_extract_text(item.get("Description")).strip()
+    if isinstance(item.get("Description"), list):
+        desc = "\n".join([x for x in item.get("Description") if isinstance(x, str)]).strip()
+    if len(desc) > 240:
+        desc = desc[:239] + "…"
+
+    user_obj = item.get("User")
+    user_id = ""
+    user_nick = ""
+    if isinstance(user_obj, dict):
+        user_id = plar.best_effort_extract_text(user_obj.get("ID") or user_obj.get("UserID")).strip()
+        user_nick = plar.best_effort_extract_text(user_obj.get("Nickname") or user_obj.get("Name")).strip()
+    if not user_id:
+        user_id = _get_str("UserID")
+    cat = _get_str("Category") or (category_hint or "")
+
+    tags = item.get("Tags")
+    tags_list = [str(x) for x in tags if isinstance(x, (str, int, float))] if isinstance(tags, list) else []
+
+    return {
+        "id": _get_str("ID", "Id"),
+        "category": cat,
+        "subject": subject,
+        "description": desc,
+        "user_id": user_id or None,
+        "user_nickname": user_nick or None,
+        "creation_date": _get_int("CreationDate"),
+        "update_date": _get_int("UpdateDate"),
+        "sorting_date": _get_int("SortingDate"),
+        "popularity": _get_int("Popularity"),
+        "stars": _get_int("Stars"),
+        "supports": _get_int("Supports"),
+        "visits": _get_int("Visits"),
+        "tags": tags_list,
+    }
+
+
+def _compact_comment(c: dict[str, Any]) -> dict[str, Any] | None:
+    cid = plar.best_effort_extract_text(c.get("ID") or c.get("Id")).strip()
+    if not cid:
+        return None
+    ts_ms = c.get("Timestamp") or c.get("Time") or c.get("CreateTime") or c.get("CreatedAt") or c.get("Created") or 0
+    try:
+        ts_i = int(ts_ms) if isinstance(ts_ms, (int, float, str)) and str(ts_ms).strip() else 0
+    except Exception:
+        ts_i = 0
+    author_id = plar.best_effort_extract_text(c.get("UserID") or c.get("AuthorID")).strip() or None
+    author_nickname = plar.best_effort_extract_text(c.get("Nickname") or c.get("Author")).strip() or None
+    text = plar.best_effort_extract_text(c.get("Content") or c.get("Text")).strip()
+    if not text:
+        return None
+    if len(text) > 500:
+        text = text[:499] + "…"
+    return {
+        "id": cid,
+        "ts_ms": ts_i,
+        "author_id": author_id,
+        "author_nickname": author_nickname,
+        "text": text,
+    }
+
+
+def _compact_user_pkg(pkg: dict[str, Any]) -> dict[str, Any]:
+    if not isinstance(pkg, dict):
+        return {"id": None, "nickname": None}
+    u = pkg.get("User") if isinstance(pkg.get("User"), dict) else {}
+    s = pkg.get("Statistic") if isinstance(pkg.get("Statistic"), dict) else {}
+
+    def _int(v: Any) -> int | None:
+        if isinstance(v, bool):
+            return None
+        if isinstance(v, int):
+            return v
+        if isinstance(v, float):
+            return int(v)
+        if isinstance(v, str) and v.strip().isdigit():
+            try:
+                return int(v.strip(), 10)
+            except Exception:
+                return None
+        return None
+
+    user_id = plar.best_effort_extract_text(u.get("ID") or u.get("Id") or u.get("UserID")).strip() or None
+    nickname = plar.best_effort_extract_text(u.get("Nickname") or u.get("Name")).strip() or None
+    signature = plar.best_effort_extract_text(u.get("Signature")).strip() or None
+
+    return {
+        "id": user_id,
+        "nickname": nickname,
+        "signature": signature,
+        "level": _int(u.get("Level")),
+        "experience": _int(u.get("Experience")),
+        "stats": {
+            "comment_count": _int(s.get("CommentCount")),
+            "experiment_count": _int(s.get("ExperimentCount")),
+            "following_count": _int(s.get("FollowingCount")),
+            "follower_count": _int(s.get("FollowerCount")),
+            "star_count": _int(s.get("StarCount")),
+            "support_count": _int(s.get("SupportCount")),
+        },
+        "raw_type": str(pkg.get("$type") or "").strip() or None,
+    }
+
+
+def plar_oldest_by_user(runtime: ToolRuntime, args: dict[str, Any]) -> dict[str, Any]:
+    """Find a user's oldest work by scanning QueryExperiments pages (best-effort)."""
+    user = _require_user(runtime)
+    user_id = _require_hex24(args.get("user_id"), where="plar_oldest_by_user.user_id")
+    if not user_id:
+        raise ToolError("plar_oldest_by_user: user_id is required")
+    category = str(args.get("category") or "Experiment").strip() or "Experiment"
+    if category not in ("Experiment", "Discussion", "both"):
+        raise ToolError("plar_oldest_by_user: category must be Experiment|Discussion|both")
+
+    take = int(args.get("take") or 24)
+    if take <= 0:
+        take = 24
+    if take > 24:
+        take = 24
+
+    max_pages = int(args.get("max_pages") or 200)
+    if max_pages < 1:
+        max_pages = 1
+    if max_pages > 800:
+        max_pages = 800
+
+    tags = args.get("tags")
+    if tags is not None and not isinstance(tags, (list, str)):
+        raise ToolError("plar_oldest_by_user: tags must be an array of strings or null")
+    tags_list = _normalize_tag_list(tags)
+
+    def _scan(cat: str) -> dict[str, Any]:
+        skip = 0
+        from_id: str | None = None
+        pages = 0
+        oldest: dict[str, Any] | None = None
+        oldest_cd: int | None = None
+        hit_limit = False
+
+        while pages < max_pages:
+            items = plar.query_experiments(
+                user,
+                category=cat,
+                take=take,
+                skip=skip,
+                from_skip=from_id,
+                days=None,
+                sort="Default",
+                user_id=user_id,
+                tags=tags_list,
+            )
+            pages += 1
+            if not items:
+                break
+            for it in items:
+                if not isinstance(it, dict):
+                    continue
+                cd = it.get("CreationDate")
+                try:
+                    cd_i = int(cd) if isinstance(cd, (int, float, str)) and str(cd).strip() else None
+                except Exception:
+                    cd_i = None
+                if cd_i is None:
+                    continue
+                if oldest_cd is None or cd_i < oldest_cd:
+                    oldest_cd = cd_i
+                    oldest = it
+
+            last = items[-1] if isinstance(items[-1], dict) else None
+            if last is not None:
+                last_id = plar.best_effort_extract_text(last.get("ID") or last.get("Id")).strip()
+                if last_id:
+                    from_id = last_id
+            skip += min(len(items), take)
+            if len(items) < take:
+                break
+            if pages >= max_pages:
+                hit_limit = True
+                break
+
+        return {
+            "category": cat,
+            "user_id": user_id,
+            "tags": tags_list or [],
+            "take": take,
+            "pages_scanned": pages,
+            "incomplete": bool(hit_limit),
+            "item": _compact_qe_item(oldest or {}, category_hint=cat) if isinstance(oldest, dict) else None,
+        }
+
+    if category == "both":
+        exp = _scan("Experiment")
+        disc = _scan("Discussion")
+
+        def _cd(d: dict[str, Any]) -> int | None:
+            it = d.get("item")
+            if not isinstance(it, dict):
+                return None
+            v = it.get("creation_date")
+            try:
+                return int(v) if v is not None else None
+            except Exception:
+                return None
+
+        exp_cd = _cd(exp)
+        disc_cd = _cd(disc)
+        pick: dict[str, Any] | None = None
+        if isinstance(exp.get("item"), dict) and isinstance(disc.get("item"), dict):
+            if exp_cd is not None and disc_cd is not None:
+                pick = exp["item"] if exp_cd <= disc_cd else disc["item"]
+            else:
+                pick = exp["item"]
+        elif isinstance(exp.get("item"), dict):
+            pick = exp["item"]
+        elif isinstance(disc.get("item"), dict):
+            pick = disc["item"]
+
+        return {"category": "both", "experiment": exp, "discussion": disc, "pick": pick}
+
+    return _scan(category)
 
 
 def plar_get_relations(runtime: ToolRuntime, args: dict[str, Any]) -> list[dict[str, Any]]:
@@ -81,7 +446,7 @@ def plar_get_relations(runtime: ToolRuntime, args: dict[str, Any]) -> list[dict[
 
 def plar_get_experiment_context(runtime: ToolRuntime, args: dict[str, Any]) -> dict[str, Any]:
     user = _require_user(runtime)
-    summary_id = str(args.get("summary_id") or "").strip()
+    summary_id = _require_hex24(args.get("summary_id"), where="plar_get_experiment_context.summary_id")
     category = str(args.get("category") or "Experiment").strip() or "Experiment"
     if not summary_id:
         raise ToolError("plar_get_experiment_context: summary_id is required")
@@ -99,7 +464,7 @@ def plar_get_experiment_context(runtime: ToolRuntime, args: dict[str, Any]) -> d
 
 def plar_get_status_save(runtime: ToolRuntime, args: dict[str, Any]) -> dict[str, Any]:
     user = _require_user(runtime)
-    summary_id = str(args.get("summary_id") or "").strip()
+    summary_id = _require_hex24(args.get("summary_id"), where="plar_get_status_save.summary_id")
     category = str(args.get("category") or "Experiment").strip() or "Experiment"
     if not summary_id:
         raise ToolError("plar_get_status_save: summary_id is required")
@@ -136,6 +501,22 @@ def plar_upload_sav(runtime: ToolRuntime, args: dict[str, Any]) -> dict[str, Any
     )
 
 
+def plar_list_builtin_tags(_runtime: ToolRuntime, _args: dict[str, Any]) -> dict[str, Any]:
+    """List physicsLab built-in Tag enum name/value pairs (best-effort)."""
+    try:
+        from physicsLab import Tag as PLTag  # type: ignore
+    except Exception as e:
+        raise ToolError(f"plar_list_builtin_tags: failed to import physicsLab.Tag: {type(e).__name__}: {e}") from e
+
+    tags: list[dict[str, Any]] = []
+    for t in PLTag:
+        name = getattr(t, "name", None)
+        val = getattr(t, "value", None)
+        if isinstance(name, str) and name.strip() and isinstance(val, str) and val.strip():
+            tags.append({"name": name.strip(), "value": val.strip()})
+    return {"count": len(tags), "tags": tags}
+
+
 PLAR_QUERY_TOOL = {
     "name": "plar_query_experiments",
     "description": "List experiments/discussions from PhysicsLab community (QueryExperiments).",
@@ -149,8 +530,16 @@ PLAR_QUERY_TOOL = {
             "days": {"type": ["integer", "string", "null"]},
             "sort": {"type": ["integer", "string", "null"]},
             "user_id": {"type": ["string", "null"]},
-            "tags": {"type": ["array", "null"], "items": {"type": "string"}},
-            "exclude_tags": {"type": ["array", "null"], "items": {"type": "string"}},
+            "tags": {
+                "type": ["array", "null"],
+                "items": {"type": "string"},
+                "description": "Include tags (e.g. 精选 / Featured / Tag.Featured). Unknown/custom tags are allowed.",
+            },
+            "exclude_tags": {
+                "type": ["array", "null"],
+                "items": {"type": "string"},
+                "description": "Exclude tags (same format as tags).",
+            },
             "languages": {"type": ["array", "null"], "items": {"type": "string"}},
             "exclude_languages": {"type": ["array", "null"], "items": {"type": "string"}},
         },
@@ -182,6 +571,26 @@ PLAR_GET_COMMENTS_TOOL = {
             "skip": {"type": "integer", "minimum": 0, "default": 0},
         },
         "required": ["target_type", "target_id"],
+    },
+}
+
+PLAR_OLDEST_BY_USER_TOOL = {
+    "name": "plar_oldest_by_user",
+    "description": "Find a user's oldest (earliest published) Experiment/Discussion by scanning QueryExperiments pages (best-effort). Useful for queries like “<nickname>发布的第一个实验”.",
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "user_id": {"type": "string", "description": "Target user ID."},
+            "category": {"type": "string", "enum": ["Experiment", "Discussion", "both"], "default": "Experiment"},
+            "take": {"type": "integer", "minimum": 1, "maximum": 24, "default": 24},
+            "max_pages": {"type": "integer", "minimum": 1, "maximum": 800, "default": 200},
+            "tags": {
+                "type": ["array", "string", "null"],
+                "items": {"type": "string"},
+                "description": "Optional tag filter (e.g. 精选 / Featured / Tag.Featured). Unknown/custom tags are allowed.",
+            },
+        },
+        "required": ["user_id"],
     },
 }
 
@@ -244,4 +653,10 @@ PLAR_UPLOAD_SAV_TOOL = {
         },
         "required": ["sav_path", "title", "introduction"],
     },
+}
+
+PLAR_LIST_TAGS_TOOL = {
+    "name": "plar_list_builtin_tags",
+    "description": "List built-in PhysicsLab Tag enum names/values (e.g. Featured=精选). Useful when user asks what tags exist or how to filter by tags.",
+    "parameters": {"type": "object", "properties": {}, "required": []},
 }

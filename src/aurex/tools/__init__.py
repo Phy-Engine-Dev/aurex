@@ -21,15 +21,19 @@ from .plar_tools import (
     PLAR_CONTEXT_TOOL,
     PLAR_GET_COMMENTS_TOOL,
     PLAR_GET_USER_TOOL,
+    PLAR_LIST_TAGS_TOOL,
+    PLAR_OLDEST_BY_USER_TOOL,
     PLAR_QUERY_TOOL,
     PLAR_RELATIONS_TOOL,
     PLAR_STATUS_SAVE_TOOL,
     PLAR_UPLOAD_SAV_TOOL,
+    plar_list_builtin_tags,
     plar_get_comments,
     plar_get_experiment_context,
     plar_get_relations,
     plar_get_status_save,
     plar_get_user,
+    plar_oldest_by_user,
     plar_query_experiments,
     plar_upload_sav,
 )
@@ -64,6 +68,8 @@ def create_registry() -> ToolRegistry:
     add(PLAR_QUERY_TOOL, plar_query_experiments)
     add(PLAR_GET_USER_TOOL, plar_get_user)
     add(PLAR_GET_COMMENTS_TOOL, plar_get_comments)
+    add(PLAR_LIST_TAGS_TOOL, plar_list_builtin_tags)
+    add(PLAR_OLDEST_BY_USER_TOOL, plar_oldest_by_user)
     add(PLAR_RELATIONS_TOOL, plar_get_relations)
     add(PLAR_CONTEXT_TOOL, plar_get_experiment_context)
     add(PLAR_STATUS_SAVE_TOOL, plar_get_status_save)

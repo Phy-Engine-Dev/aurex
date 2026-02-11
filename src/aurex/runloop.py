@@ -137,6 +137,33 @@ def _comment_timestamp_ms(c: dict[str, Any]) -> int | None:
     return None
 
 
+def _normalize_post_text(text: str) -> str:
+    """Normalize reply text for Physics Lab AR posting.
+
+    - Preserve newlines (platform is plain-text; no Markdown rendering)
+    - Collapse excessive spaces/tabs within each line
+    - Collapse multiple blank lines
+    """
+    s = (text or "").replace("\r\n", "\n").replace("\r", "\n")
+    lines = s.split("\n")
+    out: list[str] = []
+    blank_run = 0
+    for ln in lines:
+        norm = " ".join(str(ln).split()).strip()
+        if not norm:
+            blank_run += 1
+            if blank_run <= 1:
+                out.append("")
+            continue
+        blank_run = 0
+        out.append(norm)
+    while out and not out[0]:
+        out.pop(0)
+    while out and not out[-1]:
+        out.pop()
+    return "\n".join(out).strip()
+
+
 _TRIGGER_CONTEXT_SPLIT_RE = re.compile(r"\n\s*\n", re.MULTILINE)
 
 
@@ -916,7 +943,9 @@ def run_forever(
                             # replace "@aurex"/"＠aurex" with "aurex" instead of removing it.
                             replacement = mt[1:] if mt.startswith("@") and len(mt) > 1 else "aurex"
                             reply = reply.replace(mt, replacement).replace(mt.replace("@", "＠"), replacement)
-                            reply = " ".join(reply.split()).strip()
+
+                    # Keep newlines for readability (Physics Lab AR comments are plain text).
+                    reply = _normalize_post_text(reply)
 
                     if dry_run:
                         logger.info(

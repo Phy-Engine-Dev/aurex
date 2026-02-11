@@ -121,7 +121,12 @@ class TestAurexAgent(unittest.TestCase):
 
         agent = _mk_agent(
             planner_resps=[OllamaChatResponse(content="", tool_calls=[], raw={}), OllamaChatResponse(content="", tool_calls=[], raw={})],
-            executor_resps=[OllamaChatResponse(content="fallback ok", tool_calls=[], raw={})],
+            executor_resps=[
+                # executor(json-plan) attempt (invalid -> fallback)
+                OllamaChatResponse(content="not json", tool_calls=[], raw={}),
+                # final fallback answer
+                OllamaChatResponse(content="fallback ok", tool_calls=[], raw={}),
+            ],
             registry=reg,
         )
         out = agent.handle(user_text="please help")
@@ -302,6 +307,113 @@ class TestAurexAgent(unittest.TestCase):
         self.assertEqual(out["tool_results"][0].data["target_type"], "User")
         self.assertEqual(out["tool_results"][0].data["target_id"], "u1")
 
+    def test_execute_retries_same_step_on_tool_error(self):
+        reg = ToolRegistry()
+
+        def needs_id(_rt: ToolRuntime, args: dict) -> dict:
+            vid = str(args.get("id") or "")
+            if len(vid) != 24:
+                raise Exception("invalid id")  # will be wrapped as error
+            return {"ok": True, "id": vid}
+
+        reg.register(
+            ToolSpec(
+                name="needs_id",
+                description="",
+                parameters={"type": "object", "properties": {"id": {"type": "string"}}, "required": ["id"]},
+                handler=needs_id,
+            )
+        )
+        reg.register(
+            ToolSpec(
+                name="end",
+                description="",
+                parameters={"type": "object", "properties": {"final": {"type": "string"}}, "required": ["final"]},
+                handler=lambda _rt, args: {"final": args.get("final", "")},
+            )
+        )
+
+        agent = _mk_agent(
+            planner_resps=[
+                OllamaChatResponse(
+                    content='{"task_id":"TR","user_lang":"zh","goal":"g","steps":[{"id":"s1","tool":"needs_id","hint":"use id from results"}]}',
+                    tool_calls=[],
+                    raw={},
+                ),
+                OllamaChatResponse(content="ok", tool_calls=[], raw={}),
+            ],
+            executor_resps=[
+                OllamaChatResponse(
+                    content="",
+                    tool_calls=[{"function": {"name": "needs_id", "arguments": {"id": "0123456789abcdef"}}}],
+                    raw={},
+                ),
+                OllamaChatResponse(
+                    content="",
+                    tool_calls=[{"function": {"name": "needs_id", "arguments": {"id": "0123456789abcdef01234567"}}}],
+                    raw={},
+                ),
+            ],
+            registry=reg,
+        )
+        out = agent.handle(user_text="run")
+        self.assertEqual(out["answer"], "ok")
+        self.assertTrue(out["tool_results"][-1].ok)
+
+    def test_execute_injects_featured_tag_for_query_experiments(self):
+        reg = ToolRegistry()
+
+        def _qe(_rt: ToolRuntime, args: dict) -> dict:
+            return {"args": dict(args)}
+
+        reg.register(
+            ToolSpec(
+                name="plar_query_experiments",
+                description="",
+                parameters={
+                    "type": "object",
+                    "properties": {"category": {"type": "string"}, "take": {"type": "integer"}, "tags": {"type": ["array", "null"]}},
+                    "required": ["category"],
+                },
+                handler=_qe,
+            )
+        )
+        reg.register(
+            ToolSpec(
+                name="end",
+                description="",
+                parameters={"type": "object", "properties": {"final": {"type": "string"}}, "required": ["final"]},
+                handler=lambda _rt, args: {"final": args.get("final", "")},
+            )
+        )
+
+        agent = _mk_agent(
+            planner_resps=[
+                OllamaChatResponse(
+                    content='{"task_id":"TQF","user_lang":"zh","goal":"g","steps":[{"id":"s1","tool":"plar_query_experiments","hint":"latest featured"}]}',
+                    tool_calls=[],
+                    raw={},
+                ),
+                OllamaChatResponse(content="ok", tool_calls=[], raw={}),
+            ],
+            executor_resps=[
+                OllamaChatResponse(
+                    content="",
+                    tool_calls=[{"function": {"name": "plar_query_experiments", "arguments": {"category": "Experiment", "take": 1}}}],
+                    raw={},
+                )
+            ],
+            registry=reg,
+        )
+
+        out = agent.handle(user_text="最新实验区精选的标题是什么")
+        self.assertEqual(out["answer"], "ok")
+        self.assertEqual(len(out["tool_results"]), 1)
+        self.assertTrue(out["tool_results"][0].ok)
+        got_args = out["tool_results"][0].data["args"]
+        self.assertIn("tags", got_args)
+        self.assertIn("精选", got_args["tags"])
+
     def test_executor_violates_plan_twice_raises(self):
         reg = ToolRegistry()
         reg.register(
@@ -422,7 +534,12 @@ class TestAurexAgent(unittest.TestCase):
                 # NL plan attempt (empty -> triggers fallback)
                 OllamaChatResponse(content="", tool_calls=[], raw={}),
             ],
-            executor_resps=[OllamaChatResponse(content="fallback ok", tool_calls=[], raw={})],
+            executor_resps=[
+                # executor(json-plan) attempt (invalid -> fallback)
+                OllamaChatResponse(content="not json", tool_calls=[], raw={}),
+                # final fallback answer
+                OllamaChatResponse(content="fallback ok", tool_calls=[], raw={}),
+            ],
             registry=reg,
         )
         out = agent.handle(user_text="publish twice")
