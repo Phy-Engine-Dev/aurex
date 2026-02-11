@@ -407,7 +407,8 @@ def get_relations(
 
     skip_i = max(0, int(skip))
     take_i = max(1, int(take))
-    take_i = min(take_i, 100)
+    # Backend rejects take > 24 (400 Input.Field.Invalid).
+    take_i = min(take_i, 24)
     q = (query or "").strip()
 
     def _extract_users(obj: Any) -> list[dict[str, Any]]:
@@ -439,21 +440,35 @@ def get_relations(
             return [x for x in data if isinstance(x, dict)]
         return []
 
-    wrapper = getattr(user, "get_relations", None)
-    if callable(wrapper):
-        last: Exception | None = None
-        for dt_variant in (dt, str(dt)):
-            try:
-                return _extract_users(
-                    wrapper(user_id=uid, display_type=dt_variant, skip=skip_i, take=take_i, query=q)
-                )
-            except Exception as e:
-                last = e
-        raise PLARError(f"get_relations failed via wrapper: {last}") from last
-
     token = getattr(user, "token", None)
     auth_code = getattr(user, "auth_code", None)
-    if not isinstance(token, str) or not token.strip() or not isinstance(auth_code, str) or not auth_code.strip():
+    can_http = isinstance(token, str) and token.strip() and isinstance(auth_code, str) and auth_code.strip()
+
+    wrapper = getattr(user, "get_relations", None)
+    if callable(wrapper) and dt in (0, 1):
+        # physicsLab.web.User.get_relations expects display_type as "Follower"|"Following",
+        # while some wrappers accept numeric codes. Try both forms.
+        last: Exception | None = None
+        variants: list[str | int] = []
+        if isinstance(display_type, str) and display_type.strip():
+            variants.append(display_type.strip())
+        variants.append("Follower" if dt == 0 else "Following")
+        variants.extend([dt, str(dt)])
+        seen: set[str] = set()
+        for dt_variant in variants:
+            k = str(dt_variant)
+            if k in seen:
+                continue
+            seen.add(k)
+            try:
+                return _extract_users(wrapper(user_id=uid, display_type=dt_variant, skip=skip_i, take=take_i, query=q))
+            except Exception as e:
+                last = e
+        # If wrapper failed, fall back to HTTP when possible.
+        if not can_http:
+            raise PLARError(f"get_relations failed via wrapper: {last}") from last
+
+    if not can_http:
         raise PLARError("get_relations is not callable and token/auth_code are missing")
 
     status_code, data = post_json_no_env_proxy(

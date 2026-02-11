@@ -122,8 +122,11 @@ def _plan_system_prompt(*, tools: list[dict[str, Any]], max_steps: int) -> str:
         "例：用户问 “what is the 中 means in chinese” 应该输出 user_lang=\"en\"。\n"
         "如果用户输入包含 CONTEXT_JSON（含 target.type/target.id）：当用户要求“总结/回顾/提取这个留言板/评论区/这条通知对应内容”，必须先使用 local_get_target_context 获取本地上下文（args.target_key 必须是 \"<type>:<id>\"，或传 target_type+target_id）。\n"
         "如果用户输入包含 CONTEXT_JSON（含 comment.author_id/author_nickname）且用户用“我/我的”指代提问者本人：你必须把“我”解释为 comment.author_id（而不是 target.id）。\n"
+        "如果用户输入包含 CONTEXT_JSON，且 target.type=User，并且用户用“该用户/这个用户/此用户”指代当前对象：你必须把“该用户”解释为 target.id（不是 comment.author_id）。\n"
         "如果用户要求“列出评论/查看留言板/查看评论区”，并且目标明确为某个 User/Experiment/Discussion（有 id）：优先使用 plar_get_comments（target_type/target_id/take/skip）。\n"
+        "如果用户问“最早/第一条评论/最早留言/oldest comment/first comment”且目标明确：优先使用 plar_get_oldest_comment（target_type/target_id/take/max_pages）。\n"
         "如果用户问“某人发布的第一个/最早的实验/作品”：先用 plar_get_user 得到 user_id，再用 plar_oldest_by_user 找到最早实验ID，然后再按需获取评论区。\n"
+        "如果用户问“用户A有没有关注用户B/是否关注/关注了没/does A follow B”：优先使用 plar_check_following（args.follower_name/followee_name 或 follower_user_id/followee_user_id）。\n"
         "plar_query_experiments.sort 建议只用 Default/Popularity/Random 或 0/1/2（避免使用 newest/hot 等非后端支持的字符串）。\n"
         "提示：sort=Popularity 表示热门/热度；sort=Default/0 可用于最新/最近。\n"
         "plar_query_experiments 支持 tags/exclude_tags 过滤。用户说“精选/Featured/精”时，必须加 args.tags 包含 \"精选\"（也允许写 \"Featured\" 或 \"Tag.Featured\"）。\n"
@@ -164,8 +167,11 @@ def _plan_nl_system_prompt(*, tools: list[dict[str, Any]], max_steps: int) -> st
         "语言选择：你必须根据用户输入判断 user_lang（语言代码字符串），以用户表达的主要语言为准。\n"
         "如果用户输入包含 CONTEXT_JSON（含 target.type/target.id）且用户要求“总结/回顾/提取留言板/评论区/上下文”：第一步必须是 tool=local_get_target_context（args.target_key=\"<type>:<id>\"，或 args.target_type+args.target_id）。\n"
         "如果用户输入包含 CONTEXT_JSON（含 comment.author_id）且用户用“我/我的”指代提问者本人：你必须把“我”解释为 comment.author_id（而不是 target.id）。\n"
+        "如果用户输入包含 CONTEXT_JSON，且 target.type=User，并且用户用“该用户/这个用户/此用户”指代当前对象：你必须把“该用户”解释为 target.id（不是 comment.author_id）。\n"
         "如果用户要求“列出评论/查看留言板/查看评论区”且目标明确有 id：优先用 tool=plar_get_comments（target_type/target_id/take/skip）。\n"
+        "如果用户问“最早/第一条评论/最早留言/oldest comment/first comment”且目标明确：优先用 tool=plar_get_oldest_comment（target_type/target_id/take/max_pages）。\n"
         "如果用户问“某人发布的第一个/最早的实验/作品”：优先用 tool=plar_oldest_by_user（需要 user_id）。\n"
+        "如果用户问“用户A有没有关注用户B/是否关注/关注了没/does A follow B”：优先用 tool=plar_check_following（args.follower_name/followee_name 或 follower_user_id/followee_user_id）。\n"
         "plar_query_experiments.sort 建议只用 Default/Popularity/Random 或 0/1/2。\n"
         "提示：sort=Popularity 表示热门/热度；sort=Default/0 可用于最新/最近。\n"
         "plar_query_experiments 支持 tags/exclude_tags 过滤。用户说“精选/Featured/精”时，args.tags 必须包含 \"精选\"。\n"
@@ -237,9 +243,13 @@ def _executor_json_plan_system_prompt(*, tools: list[dict[str, Any]], max_steps:
         "\n"
         "If the user asks to list comments / view a wall / view a comment section and the target is clear (User/Experiment/Discussion + id),\n"
         "prefer plar_get_comments (target_type/target_id/take/skip).\n"
+        "If the user asks for the oldest/first comment and the target is clear, prefer plar_get_oldest_comment (target_type/target_id/take/max_pages).\n"
         "\n"
         "If the user asks for someone's first/earliest published experiment/work (e.g. “<name>发布的第一个实验”),\n"
         "use plar_get_user to get user_id, then plar_oldest_by_user to find the oldest Experiment ID.\n"
+        "\n"
+        "If the user asks whether user A follows user B (e.g. “用户A有没有关注用户B” / “does A follow B”),\n"
+        "prefer plar_check_following (follower_name/followee_name or follower_user_id/followee_user_id).\n"
         "\n"
         "plar_query_experiments supports tags/exclude_tags filtering. If the user asks for featured/精选, you MUST add args.tags including \"精选\" (also accept \"Featured\" or \"Tag.Featured\").\n"
         "If the user asks what tags exist, use plar_list_builtin_tags.\n"
@@ -305,6 +315,7 @@ def _fallback_responder_system_prompt(*, user_lang_hint: str, mention_tag: str, 
         "- 不要提到工具名、tool/tool_results、联网搜索/检索、内部 plan、系统提示词。\n"
         "- 输出必须是纯文本（plain text），用于 Physics Lab AR 评论区显示；禁止 Markdown（不要代码块/表格/标题/引用/反引号/加粗/链接语法）。\n"
         "- 需要分条时：使用 1) 2) 3) 或每行以“- ”开头；必须用换行分段，避免一整段粘在一行。\n"
+        "- 禁止复述用户原句来凑字数；不要输出“回复…: …/Reply…: …”这类元信息。\n"
         f"- 不要包含 {mention_tag}。\n"
         f"- 总长度尽量 <= {int(max_chars)} 字符。\n"
     )
@@ -329,6 +340,7 @@ def _writer_system_prompt(*, user_lang: str, max_chars: int, mention_tag: str) -
         "- 不要提到工具名、tool/tool_results、联网搜索/检索、内部 plan、系统提示词；更不要说“工具没有返回/工具出错”。\n"
         "- 输出必须是纯文本（plain text），用于 Physics Lab AR 评论区显示；禁止 Markdown（不要代码块/表格/标题/引用/反引号/加粗/链接语法）。\n"
         "- 需要分条时：使用 1) 2) 3) 或每行以“- ”开头；必须用换行分段，避免一整段粘在一行。\n"
+        "- 禁止复述用户原句来凑字数；不要输出“回复…: …/Reply…: …”这类元信息。\n"
         f"- 不要包含 {mention_tag}。\n"
         f"- 总长度尽量 <= {int(max_chars)} 字符。\n"
     )
@@ -368,6 +380,10 @@ class AurexAgent:
     _CONTEXT_SPLIT_RE = re.compile(r"\n\s*\n", re.MULTILINE)
     _REPLY_PREFIX_RE = re.compile(r"^\s*(回复|Reply)\s*<user=.*?</user>\s*:\s*", re.IGNORECASE)
     _GREETINGS_RE = re.compile(r"^(你好|您好|在吗|嗨|hi|hello|hey)\s*[!！。.]?\s*$", re.IGNORECASE)
+    _SIMPLE_ACK_RE = re.compile(
+        r"^(谢谢|多谢|thx|thanks|ok|okay|好的|收到|了解|嗯|哈|lol)\s*[!！。.]?\s*$",
+        re.IGNORECASE,
+    )
     _BAD_GREET_ANSWER_RE = re.compile(r"(无法确定|希望.*如何|如何回应|具体回复内容)", re.IGNORECASE)
     _INTERNAL_LEAK_RE = re.compile(
         r"(tool_results|web_search|\bthe tool\b|\btools?\s+(did|returned|provide|failed|error)\b|联网搜索|检索|工具返回|工具没有|工具未)",
@@ -384,12 +400,13 @@ class AurexAgent:
     _MARKDOWN_RE = re.compile(
         r"("
         r"```"
-        r"|^\\s*#{1,6}\\s+"
-        r"|\\|\\s*-{3,}\\s*\\|"
-        r"|\\*\\*[^\\n]+\\*\\*"
-        r"|__[^\\n]+__"
-        r"|\\[[^\\]]+\\]\\([^\\)]+\\)"
-        r"|^\\s*>\\s+"
+        r"|^\s*#{1,6}\s+"
+        r"|^\s*>\s+"
+        r"|\*\*"
+        r"|__"
+        r"|`[^`\n]+`"
+        r"|\[[^\]]+\]\([^)]+\)"
+        r"|^\s*\|.*\|\s*$"
         r")",
         re.MULTILINE,
     )
@@ -401,12 +418,369 @@ class AurexAgent:
         r"(总结|分析|回顾|提取|概括|梳理|汇总|列出|查看|summarize|analyse|analyze|review|extract|list|show)",
         re.IGNORECASE,
     )
+    _THIS_USER_REF_RE = re.compile(r"(该用户|这个用户|此用户|this\\s+user|the\\s+user)", re.IGNORECASE)
+    _THIS_TARGET_REF_RE = re.compile(
+        r"(这个|该|本|此|上述|刚才|上面|这里|这条|这篇)\s*.{0,8}(留言板|评论区|实验|讨论|作品|帖子|通知|消息|用户)"
+        r"|\b(this|that)\s+(board|wall|thread|post|experiment|discussion|user)\b",
+        re.IGNORECASE,
+    )
     _MY_SELF_QUERY_RE = re.compile(
         r"(^|\\b)(我的|我)(\\b|$)",
         re.IGNORECASE,
     )
+    _MY_ID_QUERY_RE = re.compile(
+        r"("
+        r"(我的|我).{0,6}(id|ID|用户id|用户ID|user\\s*id|userid)"
+        r"|\\bwhat\\s+is\\s+my\\s+id\\b"
+        r"|\\bmy\\s+user\\s*id\\b"
+        r")",
+        re.IGNORECASE,
+    )
     _LATEST_QUERY_RE = re.compile(r"(最新|最近|latest|recent|newest)", re.IGNORECASE)
     _HOT_QUERY_RE = re.compile(r"(热门|最热|热度|popular|hot|trending)", re.IGNORECASE)
+    _HEX24_FULL_RE = re.compile(r"^[0-9a-fA-F]{24}$")
+    _FOLLOW_QUERY_RE = re.compile(
+        r"(有没有关注|是否关注|关注了.*吗|关注了吗|是否(在)?关注|"
+        r"\bdoes\b.+\bfollow\b|\bis\b.+\bfollowing\b|\bfollow(s|ing)?\b)",
+        re.IGNORECASE,
+    )
+    _AT_NAME_RE = re.compile(r"[@＠]\s*([^\s，。,。.！!?:：；;（）()<>]{1,32})")
+    _USER_NAME_TOKEN_RE = re.compile(r"(?:用户|user)\s*([A-Za-z0-9_\-]{2,40}|[\u4e00-\u9fff]{1,20})", re.IGNORECASE)
+    _DISCUSSION_AREA_RE = re.compile(r"(讨论区|黑洞区|黑洞|discussion\\s*area)", re.IGNORECASE)
+    _EXPERIMENT_AREA_RE = re.compile(r"(实验区|实验(?!室))", re.IGNORECASE)
+    _HEX24_ANY_RE = re.compile(r"[0-9a-fA-F]{24}")
+    _OLDEST_COMMENT_QUERY_RE = re.compile(
+        r"(最早|最先|第一条|首条).{0,8}(评论|留言)"
+        r"|\\boldest\\b.{0,12}\\b(comment|message)\\b"
+        r"|\\bfirst\\b.{0,12}\\bcomment\\b",
+        re.IGNORECASE,
+    )
+    _LATEST_FUN_EXPERIMENT_QUERY_RE = re.compile(
+        r"(最新|最近|latest|newest).{0,16}(娱乐实验|fun\\s*experiment|娱乐.*实验)",
+        re.IGNORECASE,
+    )
+
+    def _looks_like_my_latest_query(self, visible_req: str) -> tuple[bool, str]:
+        v = (visible_req or "").strip()
+        if not v:
+            return False, ""
+        if not self._LATEST_QUERY_RE.search(v):
+            return False, ""
+
+        # Chinese: 我/我的；English: my/me.
+        if not (re.search(r"(我的|我)", v) or re.search(r"\bmy\b|\bme\b", v, re.IGNORECASE)):
+            return False, ""
+
+        wants_exp = ("实验" in v) or ("作品" in v) or (re.search(r"\bexperiment\b|\bwork\b", v, re.IGNORECASE) is not None)
+        wants_disc = ("讨论" in v) or (re.search(r"\bdiscussion\b", v, re.IGNORECASE) is not None)
+        if not (wants_exp or wants_disc):
+            return False, ""
+        category = "Discussion" if (wants_disc and not wants_exp) else "Experiment"
+        return True, category
+
+    def _looks_like_my_id_query(self, visible_req: str) -> bool:
+        v = (visible_req or "").strip()
+        if not v:
+            return False
+        return self._MY_ID_QUERY_RE.search(v) is not None
+
+    def _extract_follow_pair_from_text(self, visible_req: str) -> tuple[str, str]:
+        s = (visible_req or "").strip()
+        if not s:
+            return "", ""
+        names: list[str] = []
+        for m in self._AT_NAME_RE.finditer(s):
+            n = str(m.group(1) or "").strip().lstrip("@＠").strip()
+            if n:
+                names.append(n)
+        for m in self._USER_NAME_TOKEN_RE.finditer(s):
+            n = str(m.group(1) or "").strip().lstrip("@＠").strip()
+            if n:
+                names.append(n)
+        uniq: list[str] = []
+        seen: set[str] = set()
+        for n in names:
+            if n in seen:
+                continue
+            seen.add(n)
+            uniq.append(n)
+        if len(uniq) >= 2:
+            return uniq[0], uniq[1]
+        return "", ""
+
+    def _looks_like_follow_query(self, visible_req: str) -> bool:
+        s = (visible_req or "").strip()
+        if not s:
+            return False
+        if self._FOLLOW_QUERY_RE.search(s) is None:
+            return False
+        a, b = self._extract_follow_pair_from_text(s)
+        return bool(a and b)
+
+    def _looks_like_this_user_query(self, *, visible_req: str, ctx_target_type: str, ctx_target_id: str) -> bool:
+        if not (visible_req or "").strip():
+            return False
+        if ctx_target_type != "User" or not ctx_target_id:
+            return False
+        if self._THIS_USER_REF_RE.search(visible_req) is None:
+            return False
+        # If the user explicitly asks "my/我的", it is not a "this user" query.
+        if re.search(r"(我的|我)\b", visible_req) or re.search(r"\bmy\b|\bme\b", visible_req, re.IGNORECASE):
+            return False
+        return True
+
+    def _looks_like_target_owner_user_query(self, *, visible_req: str, ctx_target_type: str, ctx_target_id: str) -> bool:
+        """“该用户/this user” referring to the OWNER of the current Experiment/Discussion target."""
+        if not (visible_req or "").strip():
+            return False
+        if ctx_target_type not in ("Experiment", "Discussion") or not ctx_target_id:
+            return False
+        if self._THIS_USER_REF_RE.search(visible_req) is None:
+            return False
+        # If the user explicitly asks "my/我的", it is not a "this user" query.
+        if re.search(r"(我的|我)\b", visible_req) or re.search(r"\bmy\b|\bme\b", visible_req, re.IGNORECASE):
+            return False
+        return True
+
+    def _should_prefetch_context_in_plan(self, *, visible_req: str, ctx_target_type: str, ctx_target_id: str) -> bool:
+        v = (visible_req or "").strip()
+        if not v:
+            return False
+        if not (ctx_target_type and ctx_target_id):
+            return False
+        if self._GREETINGS_RE.match(v) or self._SIMPLE_ACK_RE.match(v):
+            return False
+        if self._looks_like_my_id_query(v):
+            return False
+        # Default: when we're handling a reply/notification with CONTEXT_JSON, fetch recent context first.
+        # This improves answer quality for common follow-up questions, without relying on fragile heuristics.
+        return True
+
+    def _try_build_follow_answer(self, *, user_lang: str, tool_results: list[ToolResult]) -> str:
+        # Prefer the latest successful plar_check_following result.
+        for tr in reversed(tool_results or []):
+            if not getattr(tr, "ok", False):
+                continue
+            data = getattr(tr, "data", None)
+            if not isinstance(data, dict):
+                continue
+            if "is_following" not in data or "follower" not in data or "followee" not in data:
+                continue
+            follower = data.get("follower") if isinstance(data.get("follower"), dict) else {}
+            followee = data.get("followee") if isinstance(data.get("followee"), dict) else {}
+            follower_n = str(follower.get("nickname") or follower.get("id") or "").strip()
+            followee_n = str(followee.get("nickname") or followee.get("id") or "").strip()
+            is_following = bool(data.get("is_following"))
+            checked = data.get("checked") if isinstance(data.get("checked"), dict) else {}
+            incomplete = bool(checked.get("incomplete"))
+            lang = (user_lang or "en").strip().lower()
+            if lang.startswith("zh"):
+                verdict = "关注了" if is_following else "没有关注"
+                note = ""
+                if incomplete and not is_following:
+                    note = "\n注：关注列表过长，当前仅扫描到上限页数，结论可能不完整。"
+                return f"结论：{follower_n} {verdict} {followee_n}。{note}".strip()
+            verdict = "is following" if is_following else "is not following"
+            note = ""
+            if incomplete and not is_following:
+                note = "\nNote: the following list is large and the scan hit a page limit, so the result may be incomplete."
+            return f"Conclusion: {follower_n} {verdict} {followee_n}.{note}".strip()
+        return ""
+
+    def _try_build_comment_context_brief(self, *, user_lang: str, tool_results: list[ToolResult]) -> str:
+        """Best-effort plain-text brief of a comment section from tool_results."""
+        picked: dict[str, Any] | None = None
+        for tr in reversed(tool_results or []):
+            if not getattr(tr, "ok", False):
+                continue
+            data = getattr(tr, "data", None)
+            if not isinstance(data, dict):
+                continue
+            comments = data.get("comments")
+            if isinstance(comments, list):
+                picked = data
+                break
+        if not isinstance(picked, dict):
+            return ""
+        comments0 = picked.get("comments")
+        if not isinstance(comments0, list):
+            return ""
+        comments: list[dict[str, Any]] = [c for c in comments0 if isinstance(c, dict)]
+        lang = (user_lang or "en").strip().lower()
+
+        def _author(c: dict[str, Any]) -> str:
+            return str(c.get("author_nickname") or c.get("author") or c.get("author_id") or "unknown").strip() or "unknown"
+
+        def _text(c: dict[str, Any]) -> str:
+            t = str(c.get("text") or c.get("content") or c.get("body") or "").strip()
+            t = " ".join(t.split()).strip()
+            if len(t) > 120:
+                t = t[:119] + "…"
+            return t
+
+        if not comments:
+            if lang.startswith("zh"):
+                return "该评论区当前未获取到可用评论内容。"
+            return "No usable comments were found in the current context."
+
+        last_n = comments[-8:] if len(comments) > 8 else comments
+        lines = []
+        if lang.startswith("zh"):
+            lines.append(f"已获取到该评论区最近 {len(comments)} 条评论（显示最后 {len(last_n)} 条）：")
+        else:
+            lines.append(f"Fetched {len(comments)} recent comments (showing last {len(last_n)}):")
+        for c in last_n:
+            at = _author(c)
+            tx = _text(c)
+            if not tx:
+                continue
+            lines.append(f"- {at}: {tx}")
+        return "\n".join(lines).strip()
+
+    def _try_build_this_user_latest_work_answer(
+        self,
+        *,
+        user_lang: str,
+        visible_req: str,
+        plan: Plan,
+        tool_results: list[ToolResult],
+    ) -> str:
+        if not (visible_req or "").strip():
+            return ""
+        if self._THIS_USER_REF_RE.search(visible_req) is None:
+            return ""
+        if self._LATEST_QUERY_RE.search(visible_req) is None and self._HOT_QUERY_RE.search(visible_req) is None:
+            return ""
+
+        # Find the latest successful plar_query_experiments result.
+        step_tool_by_id = {s.id: s.tool for s in (plan.steps or [])}
+        items: list[dict[str, Any]] | None = None
+        for tr in reversed(tool_results or []):
+            if not getattr(tr, "ok", False):
+                continue
+            if step_tool_by_id.get(getattr(tr, "step_id", "")) != "plar_query_experiments":
+                continue
+            data = getattr(tr, "data", None)
+            if isinstance(data, list):
+                items = [x for x in data if isinstance(x, dict)]
+                break
+        if items is None:
+            return ""
+
+        lang = (user_lang or "en").strip().lower()
+        is_disc = self._DISCUSSION_AREA_RE.search(visible_req) is not None
+        is_featured = ("精选" in visible_req) or (re.search(r"\bfeatured\b", visible_req, re.IGNORECASE) is not None)
+        area = "讨论区" if is_disc else "实验区"
+        feat = "精选" if is_featured else ""
+
+        if not items:
+            if lang.startswith("zh"):
+                return f"未查询到该用户的{area}{feat}作品。".strip()
+            return f"No {('featured ' if is_featured else '')}{('discussion' if is_disc else 'experiment')} items were found for this user.".strip()
+
+        it0 = items[0]
+        subject = str(it0.get("subject") or it0.get("title") or it0.get("name") or "").strip()
+        sid = str(it0.get("id") or "").strip()
+        author = str(it0.get("user_nickname") or it0.get("user_id") or "").strip()
+        desc = str(it0.get("description") or "").strip()
+        if desc:
+            desc = desc.replace("\r", " ").strip()
+        if len(desc) > 240:
+            desc = desc[:239] + "…"
+
+        if lang.startswith("zh"):
+            lines = []
+            if subject:
+                lines.append(f"该用户最新的{area}{feat}作品是：{subject}" + (f"（ID：{sid}）" if sid else ""))
+            else:
+                lines.append(f"该用户最新的{area}{feat}作品ID是：{sid}" if sid else f"该用户最新的{area}{feat}作品已查询到，但标题为空。")
+            if author:
+                lines.append(f"作者：{author}")
+            if desc:
+                lines.append(f"简介：{desc}")
+            return "\n".join([x for x in lines if x]).strip()
+
+        lines = []
+        if subject:
+            lines.append(
+                f"Latest {('featured ' if is_featured else '')}{('discussion' if is_disc else 'experiment')} item: {subject}"
+                + (f" (ID: {sid})" if sid else "")
+            )
+        else:
+            lines.append(f"Latest item ID: {sid}" if sid else "Latest item found, but title is empty.")
+        if author:
+            lines.append(f"Author: {author}")
+        if desc:
+            lines.append(f"Description: {desc}")
+        return "\n".join([x for x in lines if x]).strip()
+
+    def _try_build_latest_fun_experiment_title_answer(
+        self,
+        *,
+        user_lang: str,
+        visible_req: str,
+        plan: Plan,
+        tool_results: list[ToolResult],
+    ) -> str:
+        v = (visible_req or "").strip()
+        if not v:
+            return ""
+        if self._LATEST_FUN_EXPERIMENT_QUERY_RE.search(v) is None:
+            return ""
+        # Find the latest successful plar_query_experiments result.
+        step_tool_by_id = {s.id: s.tool for s in (plan.steps or [])}
+        items: list[dict[str, Any]] | None = None
+        for tr in reversed(tool_results or []):
+            if not getattr(tr, "ok", False):
+                continue
+            if step_tool_by_id and step_tool_by_id.get(getattr(tr, "step_id", "")) != "plar_query_experiments":
+                continue
+            data = getattr(tr, "data", None)
+            if isinstance(data, list):
+                items = [x for x in data if isinstance(x, dict)]
+                break
+        if items is None:
+            return ""
+
+        lang = (user_lang or "en").strip().lower()
+        if not items:
+            return "暂未查询到最新的娱乐实验。" if lang.startswith("zh") else "No latest fun/entertainment experiment was found."
+
+        it0 = items[0]
+        subject = str(it0.get("subject") or it0.get("title") or it0.get("name") or "").strip()
+        sid = str(it0.get("id") or "").strip()
+        if lang.startswith("zh"):
+            if subject:
+                return f"最新的娱乐实验标题是：{subject}" + (f"（ID：{sid}）" if sid else "")
+            return f"已查询到最新的娱乐实验，但标题为空。" + (f"（ID：{sid}）" if sid else "")
+        if subject:
+            return f"Latest fun/entertainment experiment title: {subject}" + (f" (ID: {sid})" if sid else "")
+        return "Latest fun/entertainment experiment found, but title is empty." + (f" (ID: {sid})" if sid else "")
+
+    def _try_extract_user_id_from_results(self, tool_results: list[ToolResult]) -> str:
+        for tr in reversed(tool_results or []):
+            if not getattr(tr, "ok", False):
+                continue
+            data = getattr(tr, "data", None)
+            if not isinstance(data, dict):
+                continue
+            uid = str(data.get("id") or data.get("user_id") or "").strip()
+            if uid and self._HEX24_FULL_RE.fullmatch(uid):
+                return uid
+            # plar_get_experiment_context / local_get_target_context may nest author info.
+            author = data.get("author")
+            if isinstance(author, dict):
+                au = str(author.get("id") or author.get("ID") or author.get("user_id") or "").strip()
+                if au and self._HEX24_FULL_RE.fullmatch(au):
+                    return au
+            target = data.get("target")
+            if isinstance(target, dict):
+                ta = target.get("author")
+                if isinstance(ta, dict):
+                    tu = str(ta.get("id") or ta.get("ID") or ta.get("user_id") or "").strip()
+                    if tu and self._HEX24_FULL_RE.fullmatch(tu):
+                        return tu
+        return ""
 
     def _extract_user_visible_text(self, user_text: str) -> str:
         s = (user_text or "").strip()
@@ -421,6 +795,55 @@ class AurexAgent:
         s = re.sub(r"</?user[^>]*>", " ", s, flags=re.IGNORECASE)
         s = " ".join(s.split()).strip()
         return s
+
+    def _clean_plar_text(self, text: str) -> str:
+        s = str(text or "").replace("\r\n", "\n").replace("\r", "\n")
+        s = re.sub(r"</?user[^>]*>", " ", s, flags=re.IGNORECASE)
+        s = re.sub(r"</?experiment[^>]*>", " ", s, flags=re.IGNORECASE)
+        s = self._REPLY_PREFIX_RE.sub("", s).strip()
+        s = " ".join(s.split()).strip()
+        return s
+
+    def _normalize_user_text_for_llm(self, user_text: str) -> str:
+        """Keep CONTEXT_JSON, but strip reply-prefix/meta from the visible body to reduce echoing."""
+        s = (user_text or "").strip()
+        if not s:
+            return ""
+        if not s.startswith("CONTEXT_JSON:"):
+            return s
+        parts = self._CONTEXT_SPLIT_RE.split(s, maxsplit=1)
+        if not parts:
+            return s
+        header = parts[0].strip()
+        visible = self._extract_user_visible_text(s)
+        if visible:
+            return header + "\n\n" + visible
+        return header
+
+    def _looks_like_echo(self, *, visible_req: str, answer: str) -> bool:
+        v = (visible_req or "").strip()
+        a = (answer or "").strip()
+        if not v or not a:
+            return False
+        # Remove optional leading @mention from the answer.
+        a2 = re.sub(r"^[@＠][^\\s]{1,64}\\s+", "", a).strip()
+
+        def _norm(x: str) -> str:
+            x2 = re.sub(r"[\\s:：，。,。.！!？?（）()\\[\\]<>《》“”\"'`]+", "", x)
+            return x2.casefold()
+
+        nv = _norm(v)
+        na = _norm(a2)
+        if not nv or not na:
+            return False
+        if na in nv or nv in na:
+            # Allow small additions; otherwise treat as echo.
+            longer = max(len(na), len(nv))
+            shorter = min(len(na), len(nv))
+            if longer <= 0:
+                return False
+            return (longer - shorter) <= max(12, int(longer * 0.15))
+        return False
 
     def _extract_context_target(self, user_text: str) -> tuple[str, str]:
         """Extract (target_type, target_id) from the leading CONTEXT_JSON if present."""
@@ -463,6 +886,105 @@ class AurexAgent:
         aid = str(c.get("author_id") or "").strip()
         nick = str(c.get("author_nickname") or "").strip()
         return aid, nick
+
+    def _try_build_oldest_comment_answer(self, *, user_lang: str, visible_req: str, tool_results: list[ToolResult]) -> str:
+        v = (visible_req or "").strip()
+        if not v:
+            return ""
+        if self._OLDEST_COMMENT_QUERY_RE.search(v) is None:
+            return ""
+
+        lang = (user_lang or "en").strip().lower()
+
+        # Prefer the dedicated oldest-comment scan result if present.
+        for tr in reversed(tool_results or []):
+            if not getattr(tr, "ok", False):
+                continue
+            data = getattr(tr, "data", None)
+            if not isinstance(data, dict):
+                continue
+            oc = data.get("oldest_comment")
+            if not isinstance(oc, dict):
+                continue
+            author = str(oc.get("author_nickname") or oc.get("author_id") or "unknown").strip() or "unknown"
+            text = self._clean_plar_text(str(oc.get("text") or ""))
+            if len(text) > 260:
+                text = text[:259] + "…"
+            incomplete = bool(data.get("incomplete"))
+            pages = data.get("pages_scanned")
+            scanned = data.get("comments_scanned")
+            try:
+                pages_i = int(pages) if pages is not None else None
+            except Exception:
+                pages_i = None
+            try:
+                scanned_i = int(scanned) if scanned is not None else None
+            except Exception:
+                scanned_i = None
+
+            meta = ""
+            if pages_i is not None and scanned_i is not None:
+                meta = f"（已扫描 {pages_i} 页 / {scanned_i} 条）"
+            elif pages_i is not None:
+                meta = f"（已扫描 {pages_i} 页）"
+
+            if lang.startswith("zh"):
+                lines = ["最早的一条评论" + meta + "：", f"作者：{author}"]
+                if text:
+                    lines.append(f"内容：{text}")
+                else:
+                    lines.append("内容：（空或不可解析）")
+                if incomplete:
+                    lines.append("注：已扫描到上限页数，可能不是全量最早。")
+                return "\n".join(lines).strip()
+
+            lines = [f"Oldest comment{meta}:", f"Author: {author}"]
+            lines.append(f"Content: {text or '(empty/unavailable)'}")
+            if incomplete:
+                lines.append("Note: reached the page limit, so the result may be incomplete.")
+            return "\n".join(lines).strip()
+
+        # Fallback: use whatever comments we have (often from prefetched local context or a single page),
+        # but make it explicit that this may not be the global oldest comment.
+        comments: list[dict[str, Any]] = []
+        for tr in reversed(tool_results or []):
+            if not getattr(tr, "ok", False):
+                continue
+            data = getattr(tr, "data", None)
+            if isinstance(data, dict) and isinstance(data.get("comments"), list):
+                comments = [c for c in data.get("comments") if isinstance(c, dict)]
+                break
+        if not comments:
+            for tr in reversed(tool_results or []):
+                if not getattr(tr, "ok", False):
+                    continue
+                data = getattr(tr, "data", None)
+                if isinstance(data, list):
+                    comments = [c for c in data if isinstance(c, dict)]
+                    break
+        if not comments:
+            return ""
+
+        def _ts(c: dict[str, Any]) -> int:
+            v0 = c.get("ts_ms")
+            try:
+                return int(v0) if v0 is not None else 0
+            except Exception:
+                return 0
+
+        oldest = min(comments, key=_ts)
+        author = str(oldest.get("author_nickname") or oldest.get("author_id") or "unknown").strip() or "unknown"
+        text = self._clean_plar_text(str(oldest.get("text") or ""))
+        if len(text) > 260:
+            text = text[:259] + "…"
+        n = len(comments)
+        if lang.startswith("zh"):
+            if text:
+                return f"我当前只拿到了最近 {n} 条评论，因此只能给出这 {n} 条里最早的一条：\n作者：{author}\n内容：{text}"
+            return f"我当前只拿到了最近 {n} 条评论，因此只能给出这 {n} 条里最早的一条：\n作者：{author}\n内容：（空或不可解析）"
+        if text:
+            return f"I only have the latest {n} comments right now, so I can only give the oldest within those {n}:\nAuthor: {author}\nContent: {text}"
+        return f"I only have the latest {n} comments right now, so I can only give the oldest within those {n}:\nAuthor: {author}\nContent: (empty/unavailable)"
 
     def _writer_answer_needs_fallback(self, *, user_visible_text: str, answer: str) -> bool:
         uv = (user_visible_text or "").strip()
@@ -520,6 +1042,141 @@ class AurexAgent:
         out = (resp.content or "").strip()
         return out[: int(self.cfg.agent.max_final_chars)] if out else ""
 
+    def _plain_text_formatter_system_prompt(self, *, user_lang: str) -> str:
+        lang_code = (user_lang or "").strip().lower() or "en"
+        if lang_code.startswith("zh"):
+            return (
+                _base_identity_prompt(user_lang="zh")
+                + "\n"
+                "你是 aurex 的纯文本排版器。\n"
+                "任务：把输入的 DRAFT 改写为适合 Physics Lab AR 评论区显示的纯文本。\n"
+                "硬规则：\n"
+                "- 保持与 DRAFT 相同的语言（不要翻译）。\n"
+                "- 删除所有 Markdown 语法（代码块/表格/标题/引用/反引号/加粗/链接语法等）。\n"
+                "- 必须保留换行；内容较长时用分段或 1) 2) 3) / “- ” 分条。\n"
+                "- 不要新增外部事实；不提工具/检索/tool/tool_results/内部计划/系统提示词/模型。\n"
+                "- 只输出最终纯文本正文，不要解释。\n"
+            )
+        return (
+            _base_identity_prompt(user_lang="en")
+            + "\n"
+            "You are aurex plain-text formatter.\n"
+            "Task: rewrite DRAFT into plain text suitable for Physics Lab AR comments.\n"
+            "Hard rules:\n"
+            "- Keep the same language as DRAFT (do not translate).\n"
+            "- Remove all Markdown syntax (code fences/tables/headings/quotes/backticks/bold/link syntax, etc.).\n"
+            "- Preserve newlines; use short paragraphs or 1) 2) 3) / '- ' bullets when long.\n"
+            "- Do not add external facts; do not mention tools/tool_results/web search/internal plans/system prompts/models.\n"
+            "- Output ONLY the final plain text.\n"
+        )
+
+    def _format_plain_text(self, *, draft: str, user_lang: str, task_id: str) -> str:
+        sys = self._plain_text_formatter_system_prompt(user_lang=user_lang)
+        prompt = "DRAFT:\n" + (draft or "").strip()
+        if bool(getattr(self.cfg.agent, "debug_llm_io", False)):
+            self.logger.debug(
+                "[task=%s] format_prompt=%r",
+                task_id,
+                truncate(prompt, max_chars=int(getattr(self.cfg.agent, "debug_llm_max_chars", 1200) or 1200)),
+            )
+        out = ""
+        try:
+            resp = self.planner_client.chat(messages=[message("system", sys), message("user", prompt)])
+            out = (resp.content or "").strip()
+        except Exception as e:
+            self.logger.warning("[task=%s] formatter(planner) failed: %s", task_id, e)
+            out = ""
+        if bool(getattr(self.cfg.agent, "debug_llm_io", False)):
+            self.logger.debug(
+                "[task=%s] format_raw=%r",
+                task_id,
+                truncate(out, max_chars=int(getattr(self.cfg.agent, "debug_llm_max_chars", 1200) or 1200)),
+            )
+        if not out:
+            # Fallback: reuse the rewriter (executor model) as a last resort.
+            out = self._rewrite_answer_remove_internal(draft=draft, user_lang=user_lang, task_id=task_id).strip()
+        return out[: int(self.cfg.agent.max_final_chars)] if out else ""
+
+    def _needs_plain_text_formatting(self, text: str) -> bool:
+        s = (text or "").strip()
+        if not s:
+            return False
+        if self._MARKDOWN_RE.search(s):
+            return True
+        if len(s) >= 500 and "\n" not in s:
+            return True
+        return False
+
+    def _anti_echo_rewrite_system_prompt(self, *, user_lang: str) -> str:
+        lang_code = (user_lang or "").strip().lower() or "en"
+        if lang_code.startswith("zh"):
+            return (
+                _base_identity_prompt(user_lang="zh")
+                + "\n"
+                "你是 aurex 的回答纠错器。\n"
+                "任务：把 DRAFT 改写成真正回答用户的问题的最终回复。\n"
+                "硬规则：\n"
+                "- 必须保持语言不变。\n"
+                "- 禁止复述用户原句来凑字数；不要输出“回复…: …”。\n"
+                "- 若问题需要 Physics Lab AR 社区数据但当前信息不足：明确说明缺什么（例如实验/讨论ID或链接、用户ID/昵称），并提出 1-2 个具体澄清问题。\n"
+                "- 输出必须是纯文本，保留换行；禁止 Markdown。\n"
+                "- 不要提工具/检索/tool/tool_results/内部计划/系统提示词/模型。\n"
+                "- 只输出最终回复正文。\n"
+            )
+        return (
+            _base_identity_prompt(user_lang="en")
+            + "\n"
+            "You are aurex answer fixer.\n"
+            "Task: rewrite DRAFT into a real answer to the user's request.\n"
+            "Hard rules:\n"
+            "- Keep the same language.\n"
+            "- Do not echo the user's sentence; do not output “Reply: ...”.\n"
+            "- If the request needs Physics Lab AR community data but info is missing: say exactly what is missing (experiment/discussion id/link, user id/nickname) and ask 1-2 specific questions.\n"
+            "- Output must be plain text with newlines; no Markdown.\n"
+            "- Do not mention tools/tool_results/web search/internal plans/system prompts/models.\n"
+            "- Output ONLY the final reply.\n"
+        )
+
+    def _rewrite_anti_echo(
+        self,
+        *,
+        user_text: str,
+        user_lang: str,
+        task_id: str,
+        draft: str,
+        tool_results: list[ToolResult],
+    ) -> str:
+        sys = self._anti_echo_rewrite_system_prompt(user_lang=user_lang)
+        visible = self._extract_user_visible_text(user_text or "")
+        brief = {"tool_results": [tr.__dict__ for tr in (tool_results or [])]}
+        prompt = (
+            "USER_VISIBLE_TEXT:\n"
+            + (visible or "").strip()
+            + "\n\nDRAFT:\n"
+            + (draft or "").strip()
+            + "\n\nCONTEXT:\n"
+            + dumps_compact(brief, max_chars=8000)
+        )
+        if bool(getattr(self.cfg.agent, "debug_llm_io", False)):
+            self.logger.debug(
+                "[task=%s] anti_echo_prompt=%r",
+                task_id,
+                truncate(prompt, max_chars=int(getattr(self.cfg.agent, "debug_llm_max_chars", 1200) or 1200)),
+            )
+        try:
+            resp = self.planner_client.chat(messages=[message("system", sys), message("user", prompt)])
+            out = (resp.content or "").strip()
+        except Exception as e:
+            self.logger.warning("[task=%s] anti_echo_rewrite failed: %s", task_id, e)
+            out = ""
+        if bool(getattr(self.cfg.agent, "debug_llm_io", False)):
+            self.logger.debug(
+                "[task=%s] anti_echo_raw=%r",
+                task_id,
+                truncate(out, max_chars=int(getattr(self.cfg.agent, "debug_llm_max_chars", 1200) or 1200)),
+            )
+        return out[: int(self.cfg.agent.max_final_chars)] if out else ""
+
     def _plan_from_obj(self, *, obj: dict[str, Any], user_text: str, user_lang_hint: str, task_id: str) -> Plan:
         got_task_id = str(obj.get("task_id") or task_id).strip() or task_id
         got_lang_raw = str(obj.get("user_lang") or user_lang_hint).strip() or user_lang_hint
@@ -537,6 +1194,170 @@ class AurexAgent:
         visible = self._extract_user_visible_text(user_text or "")
         ctx_type, ctx_id = self._extract_context_target(user_text or "")
         author_id, author_nick = self._extract_context_comment_author(user_text or "")
+        if author_id and self._looks_like_my_id_query(visible):
+            self.logger.info(
+                "[task=%s] planning patched: answering my-id using author_id=%s (%s) without tools",
+                got_task_id,
+                author_id,
+                author_nick or "?",
+            )
+            goal = goal or "回答用户自己的 Physics Lab 用户ID"
+            steps_raw = []
+        elif self._looks_like_this_user_query(visible_req=visible, ctx_target_type=ctx_type, ctx_target_id=ctx_id):
+            wants_latest = self._LATEST_QUERY_RE.search(visible) is not None
+            wants_hot = self._HOT_QUERY_RE.search(visible) is not None
+            if wants_latest or wants_hot:
+                # "该用户" refers to the current User target (wall owner) in CONTEXT_JSON.
+                category = "Discussion" if self._DISCUSSION_AREA_RE.search(visible) else "Experiment"
+                tags: list[str] = []
+                if "精选" in visible or re.search(r"\bfeatured\b", visible, re.IGNORECASE):
+                    tags.append("精选")
+                # "物理类讨论区" is essentially the Exchange(交流) area in Discussion.
+                if re.search(r"(物理类讨论区|交流区|\bexchange\b)", visible, re.IGNORECASE) or ("讨论区" in visible and "物理类" in visible):
+                    tags.append("交流")
+                if re.search(r"(问与答|问答|\bq\\s*&\\s*a\\b|\bq&a\\b)", visible, re.IGNORECASE):
+                    tags.append("问与答")
+                if re.search(r"(聊天|\bchat(room)?\\b)", visible, re.IGNORECASE):
+                    tags.append("聊天")
+                if re.search(r"(小说|\bstories\\b)", visible, re.IGNORECASE):
+                    tags.append("小说专区")
+                if re.search(r"(\\bbug\\b|BUG)", visible, re.IGNORECASE):
+                    tags.append("BUG")
+                sort = "Popularity" if wants_hot else 0
+                tag_hint = f", tags={tags}" if tags else ""
+                self.logger.info(
+                    "[task=%s] planning patched: treating 'this user' as target user_id=%s (%s latest/hot %s)",
+                    got_task_id,
+                    ctx_id,
+                    ctx_type,
+                    category,
+                )
+                goal = goal or "查询该用户最新/热门作品"
+                steps_raw = [
+                    {
+                        "id": "s1",
+                        "tool": "plar_query_experiments",
+                        "hint": f"category={category}, user_id={ctx_id}{tag_hint}, sort={sort}, take=1",
+                    }
+                ]
+        elif self._looks_like_target_owner_user_query(visible_req=visible, ctx_target_type=ctx_type, ctx_target_id=ctx_id):
+            wants_latest = self._LATEST_QUERY_RE.search(visible) is not None
+            wants_hot = self._HOT_QUERY_RE.search(visible) is not None
+            if wants_latest or wants_hot:
+                # "该用户" refers to the OWNER of the current Experiment/Discussion target in CONTEXT_JSON.
+                category = "Discussion" if self._DISCUSSION_AREA_RE.search(visible) else "Experiment"
+                tags: list[str] = []
+                if "精选" in visible or re.search(r"\bfeatured\b", visible, re.IGNORECASE):
+                    tags.append("精选")
+                if category == "Discussion":
+                    if re.search(r"(物理类讨论区|交流区|\bexchange\b)", visible, re.IGNORECASE) or (
+                        "讨论区" in visible and "物理类" in visible
+                    ):
+                        tags.append("交流")
+                    if re.search(r"(问与答|问答|\bq\s*&\s*a\b|\bq&a\b)", visible, re.IGNORECASE):
+                        tags.append("问与答")
+                    if re.search(r"(聊天|\bchat(room)?\b)", visible, re.IGNORECASE):
+                        tags.append("聊天")
+                    if re.search(r"(小说|\bstories\b)", visible, re.IGNORECASE):
+                        tags.append("小说专区")
+                    if re.search(r"(\bbug\b|BUG)", visible, re.IGNORECASE):
+                        tags.append("BUG")
+                sort = "Popularity" if wants_hot else 0
+                tag_hint = f", tags={tags}" if tags else ""
+                self.logger.info(
+                    "[task=%s] planning patched: resolving 'this user' via target owner (target=%s:%s) then latest/hot %s",
+                    got_task_id,
+                    ctx_type,
+                    ctx_id,
+                    category,
+                )
+                goal = goal or "查询该用户最新/热门作品"
+                steps_raw = [
+                    {
+                        "id": "s1",
+                        "tool": "plar_get_experiment_context",
+                        "hint": f"summary_id={ctx_id}, category={ctx_type} (get author.id)",
+                    },
+                    {
+                        "id": "s2",
+                        "tool": "plar_query_experiments",
+                        "hint": f"category={category}, user_id=<author.id from s1>{tag_hint}, sort={sort}, take=1",
+                    },
+                ]
+        elif self._looks_like_follow_query(visible):
+            # Robustness: if user asks follow relationship and the planner forgot tools,
+            # force a single check tool step to avoid "无法确认".
+            has_rel = any(
+                isinstance(s, dict)
+                and str(s.get("tool") or "").strip() in ("plar_get_relations", "plar_check_following")
+                for s in (steps_raw or [])
+            )
+            if not has_rel:
+                follower_name, followee_name = self._extract_follow_pair_from_text(visible)
+                if follower_name and followee_name:
+                    self.logger.info(
+                        "[task=%s] planning patched: forcing plar_check_following (%s -> %s)",
+                        got_task_id,
+                        follower_name,
+                        followee_name,
+                    )
+                    goal = goal or "判断用户关注关系"
+                    steps_raw = [
+                        {
+                            "id": "s1",
+                            "tool": "plar_check_following",
+                            "hint": f"follower_name={follower_name}, followee_name={followee_name}",
+                        }
+                    ]
+        elif self._OLDEST_COMMENT_QUERY_RE.search(visible):
+            # Robustness: "oldest/first comment" is NOT the oldest among the prefetched context.
+            # We must page through comments (best-effort) to find the true oldest.
+            has_oldest = any(
+                isinstance(s, dict) and str(s.get("tool") or "").strip() == "plar_get_oldest_comment" for s in (steps_raw or [])
+            )
+            if not has_oldest:
+                name = ""
+                m = self._USER_NAME_TOKEN_RE.search(visible)
+                if m:
+                    name = str(m.group(1) or "").strip()
+                if not name:
+                    m2 = self._AT_NAME_RE.search(visible)
+                    if m2:
+                        name = str(m2.group(1) or "").strip()
+                name = name.lstrip("@＠").strip()
+                if name and name.casefold() == "aurex":
+                    name = ""
+
+                if name:
+                    self.logger.info(
+                        "[task=%s] planning patched: oldest comment for user %s (via plar_get_user -> plar_get_oldest_comment)",
+                        got_task_id,
+                        name,
+                    )
+                    goal = goal or "查询用户留言板最早评论"
+                    steps_raw = [
+                        {"id": "s1", "tool": "plar_get_user", "hint": f"name={name} (get user_id)"},
+                        {"id": "s2", "tool": "plar_get_oldest_comment", "hint": "target_type=User, target_id=<id from s1>, take=50, max_pages=200"},
+                    ]
+                else:
+                    hex_m = self._HEX24_ANY_RE.search(visible or "")
+                    tid = hex_m.group(0) if hex_m else ""
+                    ttype = ""
+                    if "实验" in visible or re.search(r"\bexperiment\b", visible, re.IGNORECASE):
+                        ttype = "Experiment"
+                    elif "讨论" in visible or re.search(r"\bdiscussion\b", visible, re.IGNORECASE):
+                        ttype = "Discussion"
+                    elif ctx_type in ("User", "Experiment", "Discussion"):
+                        ttype = ctx_type
+                    else:
+                        ttype = "User"
+                    if not tid and ctx_id and ctx_type in ("User", "Experiment", "Discussion"):
+                        tid = ctx_id
+                        ttype = ctx_type
+                    if tid:
+                        self.logger.info("[task=%s] planning patched: oldest comment for target %s:%s", got_task_id, ttype, tid)
+                        goal = goal or "查询评论区最早评论"
+                        steps_raw = [{"id": "s1", "tool": "plar_get_oldest_comment", "hint": f"target_type={ttype}, target_id={tid}, take=50, max_pages=200"}]
         if ctx_type and ctx_id and self._FORCE_LOCAL_CONTEXT_RE.search(visible) and self._FORCE_LOCAL_CONTEXT_ACTION_RE.search(visible):
             self.logger.info(
                 "[task=%s] planning patched: forcing local_get_target_context for current context (%s:%s)",
@@ -573,6 +1394,48 @@ class AurexAgent:
                             "hint": f"category={category}, user_id={author_id}, sort=0, take=1 (latest)",
                         }
                     ]
+
+        # Prefetch local context in-plan when it helps answer (but skip trivial questions).
+        prefetch_enabled = bool(getattr(self.cfg.agent, "prefetch_context_in_plan", True))
+        if prefetch_enabled and ctx_type and ctx_id and self._should_prefetch_context_in_plan(
+            visible_req=visible,
+            ctx_target_type=ctx_type,
+            ctx_target_id=ctx_id,
+        ):
+            has_local_ctx_tool = any(getattr(t, "name", "") == "local_get_target_context" for t in self.tools.list())
+            if has_local_ctx_tool:
+                already_has = any(
+                    isinstance(s, dict) and str(s.get("tool") or "").strip() == "local_get_target_context" for s in (steps_raw or [])
+                )
+                if not already_has:
+                    max_steps = int(self.cfg.agent.max_plan_steps)
+                    if len(steps_raw) + 1 <= max_steps:
+                        take = int(getattr(self.cfg.agent, "prefetch_context_take", 10) or 10)
+                        if take <= 0:
+                            take = 10
+                        if take > 50:
+                            take = 50
+                        used_ids = {str(s.get("id") or "").strip() for s in (steps_raw or []) if isinstance(s, dict)}
+                        sid = "ctx0"
+                        i = 0
+                        while sid in used_ids:
+                            i += 1
+                            sid = f"ctx{i}"
+                        self.logger.info(
+                            "[task=%s] planning patched: prefetching local context first (%s:%s take=%d)",
+                            got_task_id,
+                            ctx_type,
+                            ctx_id,
+                            take,
+                        )
+                        steps_raw = [
+                            {
+                                "id": sid,
+                                "tool": "local_get_target_context",
+                                "hint": f'target_key="{ctx_type}:{ctx_id}" take={take} (prefetch)',
+                            }
+                        ] + list(steps_raw or [])
+                        goal = goal or "获取当前上下文以辅助回复"
 
         if len(steps_raw) > int(self.cfg.agent.max_plan_steps):
             raise AurexAgentError("Planner produced too many steps")
@@ -808,6 +1671,59 @@ class AurexAgent:
         if not ans:
             # Last resort: do not crash the runloop; return a minimal message.
             return "暂时无法生成回复，请稍后再试。" if user_lang_hint == "zh" else "I couldn't generate a reply right now. Please try again."
+        if self._INTERNAL_LEAK_RE.search(ans):
+            self.logger.warning("[task=%s] fallback answer contained internal/tool mentions; rewriting", task_id)
+            rewritten = self._rewrite_answer_remove_internal(draft=ans, user_lang=user_lang_hint, task_id=task_id)
+            if rewritten:
+                ans = rewritten.strip()
+        if self._needs_plain_text_formatting(ans):
+            self.logger.warning("[task=%s] fallback answer needs plain-text formatting; rewriting", task_id)
+            formatted = self._format_plain_text(draft=ans, user_lang=user_lang_hint, task_id=task_id)
+            if formatted:
+                ans = formatted.strip()
+
+        # Hallucination guard: if the user is clearly asking for Physics Lab community data (latest/hot/first comments, etc.)
+        # and planning failed, do NOT let the fallback guess facts.
+        visible = self._extract_user_visible_text(user_text or "")
+        needs_community_data = re.search(
+            r"(留言板|评论区|实验区|讨论区|精选|热门|最热|最新|历史热门|发布.*第一个|第一个实验|第一个讨论|第一个作品|User:|Experiment:|Discussion:|[0-9a-f]{24})",
+            visible,
+            re.IGNORECASE,
+        )
+        needs_specific_answer = re.search(
+            r"(是谁|什么人|哪个|标题|内容|列出|有哪些|latest|popular|hot|first|who|title|list|show)",
+            visible,
+            re.IGNORECASE,
+        )
+        author_id, author_nick = self._extract_context_comment_author(user_text or "")
+        if needs_community_data and needs_specific_answer:
+            uncertainty_ok = re.search(
+                r"(无法|不能|暂时.*无法|无法确认|无法核实|需要.*(ID|链接|用户)|请提供|稍后重试|"
+                r"can't|cannot|unable|verify|provide|please\s+share|link|id)",
+                ans,
+                re.IGNORECASE,
+            )
+            suspicious_echo = bool(author_nick and author_nick not in visible and author_nick in ans)
+            if (not uncertainty_ok) or suspicious_echo:
+                self.logger.warning("[task=%s] fallback looked ungrounded for community-data query; using safe refusal", task_id)
+                if (user_lang_hint or "").lower().startswith("zh"):
+                    ans = (
+                        "我现在无法直接核实你提到的 Physics Lab AR 社区数据。\n"
+                        "请提供：\n"
+                        "1) 用户昵称或用户ID\n"
+                        "2) 实验/讨论ID或链接\n"
+                        "3) 你要查看的范围（最新/最早/第N条评论）\n"
+                        "我再帮你查询并回答。"
+                    )
+                else:
+                    ans = (
+                        "I can't verify the Physics Lab AR community data from the current message.\n"
+                        "Please provide:\n"
+                        "1) the user nickname or user_id\n"
+                        "2) the experiment/discussion id or link\n"
+                        "3) what range you want (latest/earliest/Nth comment)\n"
+                        "Then I can look it up and answer."
+                    )
         return ans[: int(self.cfg.agent.max_final_chars)]
 
     def _parse_tool_call(self, resp_content: str, tool_calls: list[dict[str, Any]]) -> tuple[str, dict[str, Any]]:
@@ -1066,34 +1982,328 @@ class AurexAgent:
                                         tool_args["target_type"] = ctx_type
                             if ttype and tid:
                                 tool_args["target_key"] = f"{ttype}:{tid}"
-                    if tool_name == "plar_query_experiments":
-                        # Robustness: for "精选/featured" requests, ensure tag filter is applied even if the LLM forgot.
+                    if tool_name == "plar_get_comments":
+                        # Robustness: executor frequently omits target_id or uses unrelated strings (e.g. task_id).
                         if not isinstance(tool_args, dict):
                             tool_args = {}
                         visible_req = self._extract_user_visible_text(user_text or "")
+                        ctx_ttype, ctx_tid = self._extract_context_target(user_text or "")
+
+                        # Canonicalize target_type.
+                        ttype_in = str(tool_args.get("target_type") or "").strip()
+                        if ttype_in.casefold() in ("user", "experiment", "discussion"):
+                            ttype_in = ttype_in[:1].upper() + ttype_in[1:].casefold()
+                        if ttype_in not in ("User", "Experiment", "Discussion"):
+                            # Default to current context target type when available.
+                            ttype_in = ctx_ttype if ctx_ttype in ("User", "Experiment", "Discussion") else "User"
+                        tool_args["target_type"] = ttype_in
+
+                        tid_in = str(tool_args.get("target_id") or "").strip()
+                        has_hex = bool(self._HEX24_ANY_RE.search(tid_in or ""))
+                        if not has_hex:
+                            # If the user says "该用户/用户评论区", prefer a User wall target.
+                            want_user_wall = re.search(r"(该用户|这个用户|此用户|用户).{0,8}(评论区|留言板)", visible_req) is not None
+                            if want_user_wall:
+                                if ctx_ttype == "User" and ctx_tid:
+                                    tool_args["target_type"] = "User"
+                                    tool_args["target_id"] = ctx_tid
+                                else:
+                                    uid_prev = self._try_extract_user_id_from_results(results)
+                                    if uid_prev:
+                                        tool_args["target_type"] = "User"
+                                        tool_args["target_id"] = uid_prev
+                                    elif ctx_tid and ctx_ttype:
+                                        tool_args["target_type"] = ctx_ttype
+                                        tool_args["target_id"] = ctx_tid
+                            else:
+                                if ctx_tid and ctx_ttype:
+                                    tool_args["target_type"] = ctx_ttype
+                                    tool_args["target_id"] = ctx_tid
+
+                        # Clamp take and normalize skip (physicsLab expects skip as unix_ms timestamp).
+                        take = tool_args.get("take")
+                        try:
+                            take_i = int(take) if take is not None else 20
+                        except Exception:
+                            take_i = 20
+                        if take_i <= 0:
+                            take_i = 20
+                        # physicsLab server rejects take > 20 (400 Input.Field.Invalid).
+                        if take_i > 20:
+                            take_i = 20
+                        tool_args["take"] = take_i
+
+                        skip = tool_args.get("skip")
+                        try:
+                            skip_i = int(skip) if skip is not None else 0
+                        except Exception:
+                            skip_i = 0
+                        # If executor uses offset-like small numbers, reset to 0 to avoid empty pages.
+                        if 0 < skip_i < 10_000_000_000:
+                            skip_i = 0
+                        if skip_i < 0:
+                            skip_i = 0
+                        tool_args["skip"] = skip_i
+                    if tool_name == "plar_get_oldest_comment":
+                        # Robustness: executor may omit/garble target_id; fill from CONTEXT_JSON or prior tool results.
+                        if not isinstance(tool_args, dict):
+                            tool_args = {}
+                        visible_req = self._extract_user_visible_text(user_text or "")
+                        ctx_ttype, ctx_tid = self._extract_context_target(user_text or "")
+
+                        # Canonicalize target_type.
+                        ttype_in = str(tool_args.get("target_type") or "").strip()
+                        if ttype_in.casefold() in ("user", "experiment", "discussion"):
+                            ttype_in = ttype_in[:1].upper() + ttype_in[1:].casefold()
+                        if ttype_in not in ("User", "Experiment", "Discussion"):
+                            ttype_in = ctx_ttype if ctx_ttype in ("User", "Experiment", "Discussion") else "User"
+                        tool_args["target_type"] = ttype_in
+
+                        tid_in = str(tool_args.get("target_id") or "").strip()
+                        has_hex = bool(self._HEX24_ANY_RE.search(tid_in or ""))
+                        if not has_hex:
+                            want_user_wall = re.search(r"(该用户|这个用户|此用户|用户).{0,8}(评论区|留言板)", visible_req) is not None
+                            if want_user_wall:
+                                if ctx_ttype == "User" and ctx_tid:
+                                    tool_args["target_type"] = "User"
+                                    tool_args["target_id"] = ctx_tid
+                                else:
+                                    uid_prev = self._try_extract_user_id_from_results(results)
+                                    if uid_prev:
+                                        tool_args["target_type"] = "User"
+                                        tool_args["target_id"] = uid_prev
+                                    elif ctx_tid and ctx_ttype:
+                                        tool_args["target_type"] = ctx_ttype
+                                        tool_args["target_id"] = ctx_tid
+                            else:
+                                # Default to current target when present; otherwise try last known user id.
+                                if ctx_tid and ctx_ttype:
+                                    tool_args["target_type"] = ctx_ttype
+                                    tool_args["target_id"] = ctx_tid
+                                else:
+                                    uid_prev = self._try_extract_user_id_from_results(results)
+                                    if uid_prev:
+                                        tool_args["target_type"] = "User"
+                                        tool_args["target_id"] = uid_prev
+
+                        # Clamp take.
+                        take = tool_args.get("take")
+                        try:
+                            take_i = int(take) if take is not None else 20
+                        except Exception:
+                            take_i = 20
+                        if take_i <= 0:
+                            take_i = 20
+                        # physicsLab server rejects take > 20 (400 Input.Field.Invalid).
+                        if take_i > 20:
+                            take_i = 20
+                        tool_args["take"] = take_i
+
+                        # Clamp max_pages.
+                        mp = tool_args.get("max_pages")
+                        try:
+                            mp_i = int(mp) if mp is not None else 200
+                        except Exception:
+                            mp_i = 200
+                        if mp_i < 1:
+                            mp_i = 1
+                        if mp_i > 800:
+                            mp_i = 800
+                        tool_args["max_pages"] = mp_i
+
+                        # Normalize skip (unix_ms). If an offset-like small number is provided, reset to 0.
+                        skip = tool_args.get("skip")
+                        try:
+                            skip_i = int(skip) if skip is not None else 0
+                        except Exception:
+                            skip_i = 0
+                        if 0 < skip_i < 10_000_000_000:
+                            skip_i = 0
+                        if skip_i < 0:
+                            skip_i = 0
+                        tool_args["skip"] = skip_i
+                    if tool_name == "plar_query_experiments":
+                        if not isinstance(tool_args, dict):
+                            tool_args = {}
+                        visible_req = self._extract_user_visible_text(user_text or "")
+                        ctx_ttype, ctx_tid = self._extract_context_target(user_text or "")
+
+                        # If user asks for "my latest" content, use the comment author_id from CONTEXT_JSON when present.
+                        # In console/chat mode (no CONTEXT_JSON), fall back to the logged-in account user_id.
+                        is_my_latest, my_latest_cat = self._looks_like_my_latest_query(visible_req)
+                        author_id, _author_nick = self._extract_context_comment_author(user_text or "")
+                        user_id_in = str(tool_args.get("user_id") or "").strip()
+                        if is_my_latest:
+                            if author_id and self._HEX24_FULL_RE.fullmatch(author_id) and user_id_in != author_id:
+                                tool_args["user_id"] = author_id
+                                user_id_in = author_id
+                                self.logger.debug(
+                                    "[task=%s] step=%s injected user_id=author_id for my-latest query",
+                                    plan.task_id,
+                                    step.id,
+                                )
+                            elif runtime.user is not None:
+                                rid = str(getattr(runtime.user, "user_id", "") or getattr(runtime.user, "id", "") or "").strip()
+                                if rid and self._HEX24_FULL_RE.fullmatch(rid) and user_id_in != rid:
+                                    tool_args["user_id"] = rid
+                                    user_id_in = rid
+                                    self.logger.debug(
+                                        "[task=%s] step=%s injected user_id=self for my-latest query",
+                                        plan.task_id,
+                                        step.id,
+                                    )
+
+                        # If user says "该用户/这个用户" on a User wall, treat it as the target user (wall owner).
+                        if self._looks_like_this_user_query(
+                            visible_req=visible_req,
+                            ctx_target_type=ctx_ttype,
+                            ctx_target_id=ctx_tid,
+                        ):
+                            if ctx_tid and user_id_in != ctx_tid:
+                                tool_args["user_id"] = ctx_tid
+                                user_id_in = ctx_tid
+                                self.logger.debug(
+                                    "[task=%s] step=%s injected user_id=target.id for this-user query",
+                                    plan.task_id,
+                                    step.id,
+                                )
+                        else:
+                            # If the user did NOT reference a specific user (no "my/我的", no "this user/该用户", no @name),
+                            # treat the query as GLOBAL and do not constrain by user_id.
+                            explicit_user_ref = bool(
+                                is_my_latest
+                                or re.search(r"(我的|我)", visible_req)
+                                or self._THIS_USER_REF_RE.search(visible_req or "")
+                                or self._AT_NAME_RE.search(visible_req or "")
+                                or self._USER_NAME_TOKEN_RE.search(visible_req or "")
+                            )
+                            if not explicit_user_ref and str(tool_args.get("user_id") or "").strip():
+                                tool_args.pop("user_id", None)
+                                user_id_in = ""
+                                self.logger.debug(
+                                    "[task=%s] step=%s removed user_id for global query",
+                                    plan.task_id,
+                                    step.id,
+                                )
+
+                        # If the plan is clearly user-scoped (common patterns:
+                        # - plar_get_user -> plar_query_experiments
+                        # - plar_get_experiment_context -> plar_query_experiments (query works by the target owner)
+                        # - local_get_target_context -> plar_query_experiments (author info cached in local context)
+                        # but executor forgot to pass user_id, fill it from previous tool results.
+                        if not str(tool_args.get("user_id") or "").strip() and any(
+                            st.tool in ("plar_get_user", "plar_get_experiment_context", "local_get_target_context") for st in plan.steps
+                        ):
+                            uid_prev = self._try_extract_user_id_from_results(results)
+                            if uid_prev:
+                                tool_args["user_id"] = uid_prev
+                                self.logger.debug(
+                                    "[task=%s] step=%s injected user_id from previous user-resolution tool result",
+                                    plan.task_id,
+                                    step.id,
+                                )
+
+                        # If still missing, parse a direct user_id hint like "user_id=..." from step.hint.
+                        if not str(tool_args.get("user_id") or "").strip() and step.hint:
+                            m_uid = re.search(r"user_id\\s*[:=]\\s*([0-9a-fA-F]{24})", step.hint)
+                            if m_uid:
+                                tool_args["user_id"] = m_uid.group(1)
+
+                        # Ensure category is set; executor sometimes omits required args.
+                        cat_in = str(tool_args.get("category") or "").strip()
+                        if not cat_in:
+                            if my_latest_cat:
+                                tool_args["category"] = my_latest_cat
+                            else:
+                                tool_args["category"] = (
+                                    "Discussion"
+                                    if ("讨论" in visible_req or re.search(r"\bdiscussion\b", visible_req, re.IGNORECASE) is not None)
+                                    else "Experiment"
+                                )
+                        else:
+                            # If the user explicitly says "讨论区/实验区", correct mismatched category.
+                            if tool_args.get("category") in ("Experiment", "Discussion"):
+                                if self._DISCUSSION_AREA_RE.search(visible_req) and tool_args.get("category") != "Discussion":
+                                    tool_args["category"] = "Discussion"
+                                    self.logger.debug(
+                                        "[task=%s] step=%s corrected category to Discussion based on user text",
+                                        plan.task_id,
+                                        step.id,
+                                    )
+                                if self._EXPERIMENT_AREA_RE.search(visible_req) and tool_args.get("category") != "Experiment":
+                                    tool_args["category"] = "Experiment"
+                                    self.logger.debug(
+                                        "[task=%s] step=%s corrected category to Experiment based on user text",
+                                        plan.task_id,
+                                        step.id,
+                                    )
+
+                        # Heuristic sort defaults: hot -> Popularity, latest -> Default.
+                        if "sort" not in tool_args or tool_args.get("sort") in (None, ""):
+                            if self._HOT_QUERY_RE.search(visible_req):
+                                tool_args["sort"] = "Popularity"
+                            elif self._LATEST_QUERY_RE.search(visible_req):
+                                tool_args["sort"] = 0
+
+                        # Tag injection (精选 + discussion sub-areas).
+                        existing = tool_args.get("tags")
+                        tags_list: list[str] = []
+                        if isinstance(existing, list):
+                            tags_list = [str(x).strip() for x in existing if str(x).strip()]
+                        elif isinstance(existing, str) and existing.strip():
+                            tags_list = [existing.strip()]
+                        elif existing is not None:
+                            sx = str(existing).strip()
+                            if sx:
+                                tags_list = [sx]
+
+                        tags_changed = False
+
+                        def _add_tag(tag: str) -> None:
+                            nonlocal tags_changed
+                            if tag and tag not in tags_list:
+                                tags_list.append(tag)
+                                tags_changed = True
+
                         want_featured = (
                             ("精选" in visible_req and "精选申请" not in visible_req)
                             or re.search(r"\bfeatured\b", visible_req, re.IGNORECASE) is not None
                         )
                         if want_featured:
-                            existing = tool_args.get("tags")
-                            tags_list: list[str] = []
-                            if isinstance(existing, list):
-                                tags_list = [str(x).strip() for x in existing if str(x).strip()]
-                            elif isinstance(existing, str) and existing.strip():
-                                tags_list = [existing.strip()]
-                            elif existing is not None:
-                                sx = str(existing).strip()
-                                if sx:
-                                    tags_list = [sx]
-                            if "精选" not in tags_list:
-                                tags_list.append("精选")
-                                tool_args["tags"] = tags_list
-                                self.logger.debug(
-                                    "[task=%s] step=%s injected tag '精选' into plar_query_experiments",
-                                    plan.task_id,
-                                    step.id,
-                                )
+                            _add_tag("精选")
+
+                        # "娱乐实验" tag (FunExperiment). Planner often outputs "娱乐" which matches nothing.
+                        want_fun = (
+                            ("娱乐实验" in visible_req)
+                            or (re.search(r"\bfun\s*experiment\b", visible_req, re.IGNORECASE) is not None)
+                            or ("娱乐" in visible_req and "实验" in visible_req)
+                        )
+                        if want_fun:
+                            if "娱乐" in tags_list and "娱乐实验" not in tags_list:
+                                tags_list = [t for t in tags_list if t != "娱乐"]
+                                tags_changed = True
+                            _add_tag("娱乐实验")
+
+                        if tool_args.get("category") == "Discussion":
+                            if re.search(r"(物理类讨论区|交流区|\bexchange\b)", visible_req, re.IGNORECASE) or ("讨论区" in visible_req and "物理类" in visible_req):
+                                _add_tag("交流")
+                            if re.search(r"(问与答|问答|\bq\\s*&\\s*a\\b|\bq&a\\b)", visible_req, re.IGNORECASE):
+                                _add_tag("问与答")
+                            if re.search(r"(聊天|\bchat(room)?\b)", visible_req, re.IGNORECASE):
+                                _add_tag("聊天")
+                            if re.search(r"(小说|\bstories\b)", visible_req, re.IGNORECASE):
+                                _add_tag("小说专区")
+                            if re.search(r"(\bbug\b|BUG)", visible_req, re.IGNORECASE):
+                                _add_tag("BUG")
+
+                        if tags_changed:
+                            tool_args["tags"] = tags_list
+                            self.logger.debug(
+                                "[task=%s] step=%s injected tags into plar_query_experiments: %s",
+                                plan.task_id,
+                                step.id,
+                                tags_list,
+                            )
                     data = tool.handler(runtime, tool_args)
                     tr = ToolResult(task_id=plan.task_id, step_id=step.id, ok=True, data=data, error=None)
                 except ToolError as e:
@@ -1157,7 +2367,25 @@ class AurexAgent:
         user_lang: str,
     ) -> str:
         if end_final:
-            return end_final[: int(self.cfg.agent.max_final_chars)]
+            ans = (end_final or "").strip()
+            # Common executor/tool error leak: "24-hex id" validation messages.
+            if re.search(r"\b24-hex\b|\bhex\s+string\b", ans, re.IGNORECASE):
+                lang = (user_lang or "en").strip().lower()
+                if lang.startswith("zh"):
+                    ans = "需要提供有效的 24 位十六进制 ID（用户/实验/讨论）。请提供正确的 ID 或链接后我再帮你查询。"
+                else:
+                    ans = "I need a valid 24-hex id (user/experiment/discussion). Please provide the id or link so I can look it up."
+            if self._INTERNAL_LEAK_RE.search(ans):
+                self.logger.warning("[task=%s] end.final contained internal/tool mentions; rewriting", plan.task_id)
+                rewritten = self._rewrite_answer_remove_internal(draft=ans, user_lang=user_lang, task_id=plan.task_id)
+                if rewritten:
+                    ans = rewritten.strip()
+            if self._needs_plain_text_formatting(ans):
+                self.logger.warning("[task=%s] end.final needs plain-text formatting; rewriting", plan.task_id)
+                formatted = self._format_plain_text(draft=ans, user_lang=user_lang, task_id=plan.task_id)
+                if formatted:
+                    ans = formatted.strip()
+            return ans[: int(self.cfg.agent.max_final_chars)]
 
         self.logger.info(
             "[task=%s] write_answer start (tool_results=%d)",
@@ -1205,6 +2433,11 @@ class AurexAgent:
             rewritten = self._rewrite_answer_remove_internal(draft=ans, user_lang=user_lang, task_id=plan.task_id)
             if rewritten:
                 ans = rewritten.strip()
+        if self._needs_plain_text_formatting(ans):
+            self.logger.warning("[task=%s] writer answer needs plain-text formatting; rewriting", plan.task_id)
+            formatted = self._format_plain_text(draft=ans, user_lang=user_lang, task_id=plan.task_id)
+            if formatted:
+                ans = formatted.strip()
         self.logger.info("[task=%s] write_answer done (len=%d)", plan.task_id, len(ans))
         return ans[: int(self.cfg.agent.max_final_chars)]
 
@@ -1267,6 +2500,11 @@ class AurexAgent:
             rewritten = self._rewrite_answer_remove_internal(draft=ans, user_lang=user_lang, task_id=plan.task_id)
             if rewritten:
                 ans = rewritten.strip()
+        if self._needs_plain_text_formatting(ans):
+            self.logger.warning("[task=%s] executor-writer answer needs plain-text formatting; rewriting", plan.task_id)
+            formatted = self._format_plain_text(draft=ans, user_lang=user_lang, task_id=plan.task_id)
+            if formatted:
+                ans = formatted.strip()
         self.logger.info("[task=%s] write_answer_by_executor done (len=%d)", plan.task_id, len(ans))
         return ans[: int(self.cfg.agent.max_final_chars)]
 
@@ -1284,23 +2522,44 @@ class AurexAgent:
             clean_text = clean_text.replace(mention, " ").strip()
 
         # Language hint should be based on the user's visible text (not CONTEXT_JSON / ids).
-        visible = self._extract_user_visible_text(clean_text)
+        llm_text = self._normalize_user_text_for_llm(clean_text)
+        visible = self._extract_user_visible_text(llm_text)
         user_lang_hint = detect_user_lang_hint(visible or clean_text)
         self.logger.info("[task=%s] handle start (lang_hint=%s)", tid, user_lang_hint)
-        plan = self.plan(user_text=clean_text, user_lang_hint=user_lang_hint, task_id=tid)
+        ctx_author_id, ctx_author_nick = self._extract_context_comment_author(llm_text)
+        ctx_target_type, ctx_target_id = self._extract_context_target(llm_text)
+        plan = self.plan(user_text=llm_text, user_lang_hint=user_lang_hint, task_id=tid)
         if not bool(getattr(plan, "planner_ok", True)):
             self.logger.warning("[task=%s] planner failed; using executor fallback answer", tid)
             answer = self.fallback_answer_by_executor(
-                user_text=clean_text,
+                user_text=llm_text,
                 user_lang_hint=user_lang_hint,
                 task_id=tid,
             )
+            # Deterministic correction: for "my id" questions with CONTEXT_JSON, never guess.
+            if ctx_author_id and self._looks_like_my_id_query(visible):
+                lang = (user_lang_hint or "").strip().lower()
+                if lang.startswith("zh"):
+                    answer = f"你的用户ID是：{ctx_author_id}"
+                else:
+                    answer = f"Your user ID is: {ctx_author_id}"
+            # Anti-echo: avoid copying the user's sentence back.
+            if self._looks_like_echo(visible_req=visible, answer=answer):
+                safe = self._rewrite_anti_echo(
+                    user_text=llm_text,
+                    user_lang=user_lang_hint,
+                    task_id=tid,
+                    draft=answer,
+                    tool_results=[],
+                )
+                if safe:
+                    answer = safe
             return {"task_id": tid, "plan": plan, "tool_results": [], "answer": answer}
 
-        tool_results, end_final = self.execute(plan=plan, user_text=clean_text, user=user, user_lang=plan.user_lang)
+        tool_results, end_final = self.execute(plan=plan, user_text=llm_text, user=user, user_lang=plan.user_lang)
         try:
             answer = self.write_answer(
-                user_text=clean_text,
+                user_text=llm_text,
                 plan=plan,
                 tool_results=tool_results,
                 end_final=end_final,
@@ -1310,7 +2569,7 @@ class AurexAgent:
             self.logger.error("[task=%s] writer failed (%s); using executor writer fallback", tid, e)
             try:
                 answer = self.write_answer_by_executor(
-                    user_text=clean_text,
+                    user_text=llm_text,
                     plan=plan,
                     tool_results=tool_results,
                     end_final=end_final,
@@ -1319,16 +2578,107 @@ class AurexAgent:
             except Exception as e2:
                 self.logger.error("[task=%s] executor-writer failed (%s); using safe fallback", tid, e2)
                 answer = self.fallback_answer_by_executor(
-                    user_text=clean_text,
+                    user_text=llm_text,
                     user_lang_hint=plan.user_lang or user_lang_hint,
                     task_id=tid,
                 )
         if self._writer_answer_needs_fallback(user_visible_text=visible, answer=answer):
             self.logger.warning("[task=%s] writer answer looked low-quality; using executor fallback", tid)
             answer = self.fallback_answer_by_executor(
-                user_text=clean_text,
+                user_text=llm_text,
                 user_lang_hint=plan.user_lang or user_lang_hint,
                 task_id=tid,
             )
+
+        # Deterministic correction: "我的ID是什么" must refer to the current comment author, not the wall owner (target.id).
+        if ctx_author_id and self._looks_like_my_id_query(visible):
+            if ctx_author_id not in (answer or ""):
+                self.logger.warning(
+                    "[task=%s] correcting wrong my-id answer (target=%s:%s author=%s nick=%s)",
+                    tid,
+                    ctx_target_type or "?",
+                    ctx_target_id or "?",
+                    ctx_author_id,
+                    ctx_author_nick or "?",
+                )
+                lang = (plan.user_lang or user_lang_hint or "en").strip().lower()
+                if lang.startswith("zh"):
+                    answer = f"你的用户ID是：{ctx_author_id}"
+                else:
+                    answer = f"Your user ID is: {ctx_author_id}"
+
+        # Deterministic formatting for follow-relationship checks (avoid vague / ungrounded answers).
+        if self._looks_like_follow_query(visible):
+            forced = self._try_build_follow_answer(user_lang=plan.user_lang or user_lang_hint, tool_results=tool_results)
+            if forced:
+                answer = forced
+
+        # Deterministic answer for "最早的评论/留言" from prefetched local context (prevents executor arg bugs leaking to users).
+        oldest = self._try_build_oldest_comment_answer(
+            user_lang=plan.user_lang or user_lang_hint,
+            visible_req=visible,
+            tool_results=tool_results,
+        )
+        if oldest:
+            answer = oldest
+
+        # Deterministic answer for "最新的娱乐实验标题".
+        fun_latest = self._try_build_latest_fun_experiment_title_answer(
+            user_lang=plan.user_lang or user_lang_hint,
+            visible_req=visible,
+            plan=plan,
+            tool_results=tool_results,
+        )
+        if fun_latest:
+            answer = fun_latest
+
+        # Deterministic answer for "该用户最新/热门..." queries when we have QueryExperiments results.
+        if self._looks_like_this_user_query(
+            visible_req=visible, ctx_target_type=ctx_target_type, ctx_target_id=ctx_target_id
+        ) or self._looks_like_target_owner_user_query(
+            visible_req=visible, ctx_target_type=ctx_target_type, ctx_target_id=ctx_target_id
+        ):
+            forced_latest = self._try_build_this_user_latest_work_answer(
+                user_lang=plan.user_lang or user_lang_hint,
+                visible_req=visible,
+                plan=plan,
+                tool_results=tool_results,
+            )
+            if forced_latest:
+                answer = forced_latest
+
+        # Anti-echo: if the model just repeats the user's request, rewrite into a real answer or a precise clarification.
+        if self._looks_like_echo(visible_req=visible, answer=answer):
+            self.logger.warning("[task=%s] answer looks like echo; rewriting", tid)
+            rewritten = self._rewrite_anti_echo(
+                user_text=llm_text,
+                user_lang=plan.user_lang or user_lang_hint,
+                task_id=tid,
+                draft=answer,
+                tool_results=tool_results,
+            )
+            if rewritten:
+                answer = rewritten.strip()
+            if self._looks_like_echo(visible_req=visible, answer=answer):
+                # Last resort: deterministic clarification for community-data queries.
+                if self._COMMUNITY_DATA_NEEDS_LOOKUP_RE.search(visible or ""):
+                    # If we already have comment context, show a compact brief instead of asking for IDs again.
+                    brief = self._try_build_comment_context_brief(user_lang=plan.user_lang or user_lang_hint, tool_results=tool_results)
+                    if brief:
+                        answer = brief
+                    else:
+                        lang = (plan.user_lang or user_lang_hint or "en").strip().lower()
+                        if lang.startswith("zh"):
+                            answer = (
+                                "我理解你的问题，但当前消息里缺少可定位的对象。\n"
+                                "请补充：实验/讨论的链接或ID（24位），或明确目标用户ID/昵称。\n"
+                                "你也可以直接把要概括的评论区链接发来。"
+                            )
+                        else:
+                            answer = (
+                                "I understand the request, but the message lacks a resolvable target.\n"
+                                "Please provide the experiment/discussion link or id (24-hex), or the target user id/nickname.\n"
+                                "You can also paste the comment-section link you want me to summarize."
+                            )
         self.logger.info("[task=%s] handle done", plan.task_id)
         return {"task_id": plan.task_id, "plan": plan, "tool_results": tool_results, "answer": answer}

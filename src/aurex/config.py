@@ -148,6 +148,8 @@ class AgentConfig:
     debug_llm_max_chars: int = 1200
     force_reply_prefix: bool = True
     final_reply_only: bool = True
+    prefetch_context_in_plan: bool = True
+    prefetch_context_take: int = 10
     context_db_enabled: bool = True
     context_db_keep_last_comments: int = 200
     targets: list[dict[str, str]] = field(default_factory=list)
@@ -334,6 +336,12 @@ def load_config(path: str) -> AurexConfig:
             if "final_reply_only" in agent_raw
             else agent_defaults.final_reply_only
         ),
+        prefetch_context_in_plan=bool(
+            agent_raw.get("prefetch_context_in_plan")
+            if "prefetch_context_in_plan" in agent_raw
+            else agent_defaults.prefetch_context_in_plan
+        ),
+        prefetch_context_take=int(agent_raw.get("prefetch_context_take") or agent_defaults.prefetch_context_take),
         context_db_enabled=bool(
             agent_raw.get("context_db_enabled")
             if "context_db_enabled" in agent_raw

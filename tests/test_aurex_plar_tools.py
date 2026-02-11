@@ -10,7 +10,12 @@ if SRC not in sys.path:
     sys.path.insert(0, SRC)
 
 from aurex.config import AurexConfig  # noqa: E402
-from aurex.tools.plar_tools import plar_oldest_by_user, plar_query_experiments  # noqa: E402
+from aurex.tools.plar_tools import (
+    plar_check_following,
+    plar_get_oldest_comment,
+    plar_oldest_by_user,
+    plar_query_experiments,
+)  # noqa: E402
 from aurex.tools.registry import ToolRuntime  # noqa: E402
 
 
@@ -170,6 +175,92 @@ class TestPlarQueryExperimentsTool(unittest.TestCase):
             _out = plar_query_experiments(rt, {"category": "Experiment", "take": 1, "tags": ["多体系统"]})
 
         self.assertEqual(calls[0]["tags"], ["多体系统"])
+
+
+class TestPlarCheckFollowingTool(unittest.TestCase):
+    def _rt(self) -> ToolRuntime:
+        return ToolRuntime(
+            task_id="T",
+            user_lang="zh",
+            config_path=os.path.join(ROOT, "dummy.json"),
+            config=AurexConfig(),
+            cache_dir=os.path.join(ROOT, ".tmp"),
+            user=object(),
+            planner_client=None,
+        )
+
+    def test_query_then_scan_finds_match(self):
+        rt = self._rt()
+
+        def fake_get_user_by_name(_user, *, name: str):
+            if name == "goodenough":
+                return {"User": {"ID": "0" * 24, "Nickname": "goodenough"}, "Statistic": {}}
+            if name == "MapMaths":
+                return {"User": {"ID": "1" * 24, "Nickname": "MapMaths"}, "Statistic": {}}
+            raise RuntimeError("unknown user")
+
+        # First: query path returns empty; then scan returns a page containing the followee.
+        calls = []
+
+        def fake_get_relations(_user, *, user_id: str, display_type, skip: int, take: int, query: str):
+            calls.append({"user_id": user_id, "display_type": display_type, "skip": skip, "take": take, "query": query})
+            if query:
+                return []
+            if skip == 0:
+                return [{"ID": "1" * 24, "Nickname": "MapMaths"}]
+            return []
+
+        with mock.patch("aurex.tools.plar_tools.plar.get_user_by_name", side_effect=fake_get_user_by_name):
+            with mock.patch("aurex.tools.plar_tools.plar.get_relations", side_effect=fake_get_relations):
+                out = plar_check_following(rt, {"follower_name": "goodenough", "followee_name": "MapMaths", "max_pages": 3})
+
+        self.assertTrue(out["is_following"])
+        self.assertEqual(out["follower"]["id"], "0" * 24)
+        self.assertEqual(out["followee"]["id"], "1" * 24)
+        self.assertTrue(any(c["query"] == "MapMaths" for c in calls))
+        self.assertTrue(any(c["query"] == "" for c in calls))
+
+
+class TestPlarGetOldestCommentTool(unittest.TestCase):
+    def _rt(self) -> ToolRuntime:
+        return ToolRuntime(
+            task_id="T",
+            user_lang="zh",
+            config_path=os.path.join(ROOT, "dummy.json"),
+            config=AurexConfig(),
+            cache_dir=os.path.join(ROOT, ".tmp"),
+            user=object(),
+            planner_client=None,
+        )
+
+    def test_pages_until_oldest(self):
+        rt = self._rt()
+        calls: list[int] = []
+
+        def fake_get_comments(_user, *, target_id: str, target_type: str, take: int, skip: int):
+            calls.append(int(skip))
+            if skip == 0:
+                return [
+                    {"ID": "c3", "Timestamp": 300, "UserID": "u3", "Nickname": "n3", "Content": "t3"},
+                    {"ID": "c2", "Timestamp": 200, "UserID": "u2", "Nickname": "n2", "Content": "t2"},
+                ]
+            if skip == 199:
+                return [{"ID": "c1", "Timestamp": 100, "UserID": "u1", "Nickname": "n1", "Content": "t1"}]
+            return []
+
+        with mock.patch("aurex.tools.plar_tools.plar.get_comments", side_effect=fake_get_comments):
+            out = plar_get_oldest_comment(
+                rt,
+                {"target_type": "User", "target_id": "0" * 24, "take": 2, "max_pages": 10},
+            )
+
+        self.assertEqual(calls, [0, 199])
+        self.assertFalse(bool(out.get("incomplete")))
+        oldest = out.get("oldest_comment")
+        self.assertTrue(isinstance(oldest, dict))
+        self.assertEqual(oldest.get("id"), "c1")
+        self.assertEqual(oldest.get("author_nickname"), "n1")
+        self.assertEqual(oldest.get("text"), "t1")
 
 
 if __name__ == "__main__":

@@ -646,8 +646,9 @@ def run_forever(
     take = int(cfg.agent.comment_take)
     if take <= 0:
         take = 20
-    if take > 50:
-        take = 50
+    # physicsLab server rejects take > 20 (400 Input.Field.Invalid).
+    if take > 20:
+        take = 20
 
     pages = int(cfg.agent.comment_scan_pages)
     if pages <= 0:
@@ -766,9 +767,12 @@ def run_forever(
 
                 try:
                     all_comments: list[dict[str, Any]] = []
+                    # physicsLab.web.User.get_comments uses `skip` as unix_ms timestamp (not an offset).
+                    # Pagination strategy: keep fetching older pages by passing the minimum timestamp
+                    # from the previous page (minus 1ms to guarantee progress).
+                    skip_ts_ms = 0
                     for page in range(pages):
-                        skip = page * take
-                        chunk = plar.get_comments(user, target_id=tgt.id, target_type=tgt.type, take=take, skip=skip)
+                        chunk = plar.get_comments(user, target_id=tgt.id, target_type=tgt.type, take=take, skip=skip_ts_ms)
                         all_comments.extend(chunk)
                         if len(chunk) < take:
                             break
@@ -781,8 +785,26 @@ def run_forever(
                                 if ts_ms is None:
                                     continue
                                 min_ts_ms = ts_ms if min_ts_ms is None else min(min_ts_ms, ts_ms)
+                            if not isinstance(min_ts_ms, int):
+                                break
                             if isinstance(min_ts_ms, int) and min_ts_ms <= last_seen_ms:
                                 break
+                            if isinstance(min_ts_ms, int) and min_ts_ms > 0:
+                                skip_ts_ms = max(0, int(min_ts_ms) - 1)
+                        else:
+                            # Even without last_seen_ms, paginate a limited number of pages.
+                            min_ts_ms = None
+                            for c in chunk:
+                                if not isinstance(c, dict):
+                                    continue
+                                ts_ms = _comment_timestamp_ms(c)
+                                if ts_ms is None:
+                                    continue
+                                min_ts_ms = ts_ms if min_ts_ms is None else min(min_ts_ms, ts_ms)
+                            if not isinstance(min_ts_ms, int):
+                                break
+                            if isinstance(min_ts_ms, int) and min_ts_ms > 0:
+                                skip_ts_ms = max(0, int(min_ts_ms) - 1)
                     logger.info(
                         "[%s] fetched comments=%d (take=%d pages=%d)",
                         tgt.key,

@@ -414,6 +414,633 @@ class TestAurexAgent(unittest.TestCase):
         self.assertIn("tags", got_args)
         self.assertIn("精选", got_args["tags"])
 
+    def test_execute_injects_user_id_for_my_latest_query_from_context_json(self):
+        reg = ToolRegistry()
+
+        def _qe(_rt: ToolRuntime, args: dict) -> dict:
+            return {"args": dict(args)}
+
+        reg.register(
+            ToolSpec(
+                name="plar_query_experiments",
+                description="",
+                parameters={
+                    "type": "object",
+                    "properties": {"category": {"type": "string"}, "take": {"type": "integer"}, "user_id": {"type": ["string", "null"]}},
+                    "required": ["category"],
+                },
+                handler=_qe,
+            )
+        )
+        reg.register(
+            ToolSpec(
+                name="end",
+                description="",
+                parameters={"type": "object", "properties": {"final": {"type": "string"}}, "required": ["final"]},
+                handler=lambda _rt, args: {"final": args.get("final", "")},
+            )
+        )
+
+        author_id = "a" * 24
+        target_id = "b" * 24
+        agent = _mk_agent(
+            planner_resps=[
+                OllamaChatResponse(
+                    content='{"task_id":"TML","user_lang":"zh","goal":"g","steps":[{"id":"s1","tool":"plar_query_experiments","hint":"latest my experiment"}]}',
+                    tool_calls=[],
+                    raw={},
+                ),
+                OllamaChatResponse(content="ok", tool_calls=[], raw={}),
+            ],
+            executor_resps=[
+                OllamaChatResponse(
+                    content="",
+                    tool_calls=[
+                        {"function": {"name": "plar_query_experiments", "arguments": {"category": "Experiment", "take": 1}}}
+                    ],
+                    raw={},
+                )
+            ],
+            registry=reg,
+        )
+
+        user_text = (
+            'CONTEXT_JSON:\n{"target":{"type":"User","id":"'
+            + target_id
+            + '"},"comment":{"id":"c1","author_id":"'
+            + author_id
+            + '","author_nickname":"goodenough"}}\n\n我的最新实验是什么'
+        )
+        out = agent.handle(user_text=user_text)
+        self.assertEqual(out["answer"], "ok")
+        got_args = out["tool_results"][0].data["args"]
+        self.assertEqual(got_args.get("user_id"), author_id)
+
+    def test_execute_injects_user_id_from_previous_plar_get_user_result(self):
+        reg = ToolRegistry()
+
+        def _get_user(_rt: ToolRuntime, args: dict) -> dict:
+            return {"id": "c" * 24, "nickname": args.get("name")}
+
+        def _qe(_rt: ToolRuntime, args: dict) -> dict:
+            return {"args": dict(args)}
+
+        reg.register(
+            ToolSpec(
+                name="plar_get_user",
+                description="",
+                parameters={"type": "object", "properties": {"name": {"type": "string"}}, "required": ["name"]},
+                handler=_get_user,
+            )
+        )
+        reg.register(
+            ToolSpec(
+                name="plar_query_experiments",
+                description="",
+                parameters={
+                    "type": "object",
+                    "properties": {"category": {"type": "string"}, "take": {"type": "integer"}, "user_id": {"type": ["string", "null"]}},
+                    "required": ["category"],
+                },
+                handler=_qe,
+            )
+        )
+        reg.register(
+            ToolSpec(
+                name="end",
+                description="",
+                parameters={"type": "object", "properties": {"final": {"type": "string"}}, "required": ["final"]},
+                handler=lambda _rt, args: {"final": args.get("final", "")},
+            )
+        )
+
+        agent = _mk_agent(
+            planner_resps=[
+                OllamaChatResponse(
+                    content='{"task_id":"TUL","user_lang":"zh","goal":"g","steps":[{"id":"s1","tool":"plar_get_user","hint":"get user goodenough"},{"id":"s2","tool":"plar_query_experiments","hint":"latest by that user"}]}',
+                    tool_calls=[],
+                    raw={},
+                ),
+                OllamaChatResponse(content="ok", tool_calls=[], raw={}),
+            ],
+            executor_resps=[
+                OllamaChatResponse(
+                    content="",
+                    tool_calls=[{"function": {"name": "plar_get_user", "arguments": {"name": "goodenough"}}}],
+                    raw={},
+                ),
+                OllamaChatResponse(
+                    content="",
+                    tool_calls=[{"function": {"name": "plar_query_experiments", "arguments": {"category": "Experiment", "take": 1}}}],
+                    raw={},
+                ),
+            ],
+            registry=reg,
+        )
+
+        out = agent.handle(user_text="goodenough 的最新实验是什么")
+        self.assertEqual(out["answer"], "ok")
+        got_args = out["tool_results"][1].data["args"]
+        self.assertEqual(got_args.get("user_id"), "c" * 24)
+
+    def test_execute_this_user_latest_featured_discussion_uses_target_id_and_exchange_tag(self):
+        reg = ToolRegistry()
+
+        def _qe(_rt: ToolRuntime, args: dict) -> dict:
+            return {"args": dict(args)}
+
+        reg.register(
+            ToolSpec(
+                name="plar_query_experiments",
+                description="",
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "category": {"type": "string"},
+                        "take": {"type": "integer"},
+                        "user_id": {"type": ["string", "null"]},
+                        "tags": {"type": ["array", "null"]},
+                    },
+                    "required": ["category"],
+                },
+                handler=_qe,
+            )
+        )
+        reg.register(
+            ToolSpec(
+                name="end",
+                description="",
+                parameters={"type": "object", "properties": {"final": {"type": "string"}}, "required": ["final"]},
+                handler=lambda _rt, args: {"final": args.get("final", "")},
+            )
+        )
+
+        author_id = "a" * 24
+        target_id = "b" * 24
+        agent = _mk_agent(
+            planner_resps=[
+                # Planner forgets tools -> _plan_from_obj patch should force QueryExperiments.
+                OllamaChatResponse(content='{"task_id":"TTU","user_lang":"zh","goal":"g","steps":[]}', tool_calls=[], raw={}),
+                OllamaChatResponse(content="ok", tool_calls=[], raw={}),
+            ],
+            executor_resps=[
+                # Executor also forgets user_id/tags and uses wrong category; execute() should correct/inject.
+                OllamaChatResponse(
+                    content="",
+                    tool_calls=[
+                        {"function": {"name": "plar_query_experiments", "arguments": {"category": "Experiment", "take": 1}}}
+                    ],
+                    raw={},
+                )
+            ],
+            registry=reg,
+        )
+
+        user_text = (
+            'CONTEXT_JSON:\n{"target":{"type":"User","id":"'
+            + target_id
+            + '"},"comment":{"id":"c1","author_id":"'
+            + author_id
+            + '","author_nickname":"MapMaths"}}\n\n该用户最新的物理类讨论区精选作品是什么'
+        )
+        out = agent.handle(user_text=user_text)
+        self.assertEqual(out["answer"], "ok")
+        got_args = out["tool_results"][0].data["args"]
+        self.assertEqual(got_args.get("user_id"), target_id)
+        self.assertEqual(got_args.get("category"), "Discussion")
+        self.assertIn("tags", got_args)
+        self.assertIn("精选", got_args["tags"])
+        self.assertIn("交流", got_args["tags"])
+
+    def test_execute_this_user_latest_featured_discussion_on_experiment_target_uses_target_owner_author_id(self):
+        reg = ToolRegistry()
+
+        owner_id = "d" * 24
+
+        def _ctx(_rt: ToolRuntime, _args: dict) -> dict:
+            return {"author": {"id": owner_id, "nickname": "Owner"}}
+
+        def _qe(_rt: ToolRuntime, args: dict) -> dict:
+            return {"args": dict(args)}
+
+        reg.register(
+            ToolSpec(
+                name="plar_get_experiment_context",
+                description="",
+                parameters={"type": "object", "properties": {"summary_id": {"type": "string"}, "category": {"type": "string"}}},
+                handler=_ctx,
+            )
+        )
+        reg.register(
+            ToolSpec(
+                name="plar_query_experiments",
+                description="",
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "category": {"type": "string"},
+                        "take": {"type": "integer"},
+                        "user_id": {"type": ["string", "null"]},
+                        "tags": {"type": ["array", "null"]},
+                    },
+                    "required": ["category"],
+                },
+                handler=_qe,
+            )
+        )
+        reg.register(
+            ToolSpec(
+                name="end",
+                description="",
+                parameters={"type": "object", "properties": {"final": {"type": "string"}}, "required": ["final"]},
+                handler=lambda _rt, args: {"final": args.get("final", "")},
+            )
+        )
+
+        author_id = "a" * 24
+        target_id = "b" * 24  # experiment summary_id
+        agent = _mk_agent(
+            planner_resps=[
+                # Planner forgets tools -> _plan_from_obj patch should force context->QueryExperiments.
+                OllamaChatResponse(content='{"task_id":"TTX","user_lang":"zh","goal":"g","steps":[]}', tool_calls=[], raw={}),
+                OllamaChatResponse(content="ok", tool_calls=[], raw={}),
+            ],
+            executor_resps=[
+                OllamaChatResponse(
+                    content="",
+                    tool_calls=[{"function": {"name": "plar_get_experiment_context", "arguments": {"summary_id": target_id, "category": "Experiment"}}}],
+                    raw={},
+                ),
+                # Executor forgets user_id/tags and uses wrong category; execute() should correct/inject.
+                OllamaChatResponse(
+                    content="",
+                    tool_calls=[{"function": {"name": "plar_query_experiments", "arguments": {"category": "Experiment", "take": 1}}}],
+                    raw={},
+                ),
+            ],
+            registry=reg,
+        )
+
+        user_text = (
+            'CONTEXT_JSON:\n{"target":{"type":"Experiment","id":"'
+            + target_id
+            + '"},"comment":{"id":"c1","author_id":"'
+            + author_id
+            + '","author_nickname":"MapMaths"}}\n\n该用户最新的物理类讨论区精选作品是什么'
+        )
+        out = agent.handle(user_text=user_text)
+        self.assertEqual(out["answer"], "ok")
+        got_args = out["tool_results"][1].data["args"]
+        self.assertEqual(got_args.get("user_id"), owner_id)
+        self.assertEqual(got_args.get("category"), "Discussion")
+        self.assertIn("tags", got_args)
+        self.assertIn("精选", got_args["tags"])
+        self.assertIn("交流", got_args["tags"])
+
+    def test_writer_markdown_is_formatted_to_plain_text(self):
+        reg = ToolRegistry()
+        reg.register(
+            ToolSpec(
+                name="end",
+                description="",
+                parameters={"type": "object", "properties": {"final": {"type": "string"}}, "required": ["final"]},
+                handler=lambda _rt, args: {"final": args.get("final", "")},
+            )
+        )
+
+        agent = _mk_agent(
+            planner_resps=[
+                OllamaChatResponse(content='{"task_id":"TMD","user_lang":"en","goal":"g","steps":[]}', tool_calls=[], raw={}),
+                OllamaChatResponse(content="# Title\n\n- item1\n- item2", tool_calls=[], raw={}),
+                OllamaChatResponse(content="Title\n- item1\n- item2", tool_calls=[], raw={}),
+            ],
+            executor_resps=[],
+            registry=reg,
+        )
+        out = agent.handle(user_text="format it")
+        self.assertEqual(out["answer"], "Title\n- item1\n- item2")
+
+    def test_fallback_guard_refuses_ungrounded_community_data_answer(self):
+        reg = ToolRegistry()
+        reg.register(
+            ToolSpec(
+                name="end",
+                description="",
+                parameters={"type": "object", "properties": {"final": {"type": "string"}}, "required": ["final"]},
+                handler=lambda _rt, args: {"final": args.get("final", "")},
+            )
+        )
+
+        agent = _mk_agent(
+            planner_resps=[OllamaChatResponse(content="", tool_calls=[], raw={}), OllamaChatResponse(content="", tool_calls=[], raw={})],
+            executor_resps=[
+                # executor(json-plan) attempt (invalid -> fallback)
+                OllamaChatResponse(content="not json", tool_calls=[], raw={}),
+                # final fallback answer (ungrounded)
+                OllamaChatResponse(
+                    content="根据提供的信息，最后一个发帖的人是揉碎星月。",
+                    tool_calls=[],
+                    raw={},
+                ),
+            ],
+            registry=reg,
+        )
+
+        user_text = (
+            'CONTEXT_JSON:\n{"target":{"type":"User","id":"'
+            + ("b" * 24)
+            + '"},"comment":{"id":"c1","author_id":"'
+            + ("a" * 24)
+            + '","author_nickname":"揉碎星月"}}\n\n紫兰斋发布的第一个实验的评论区的第一个人是谁'
+        )
+        out = agent.handle(user_text=user_text)
+        self.assertIn("无法", out["answer"])
+        self.assertIn("请提供", out["answer"])
+
+    def test_my_id_query_returns_comment_author_id_not_target_id(self):
+        reg = ToolRegistry()
+        reg.register(
+            ToolSpec(
+                name="end",
+                description="",
+                parameters={"type": "object", "properties": {"final": {"type": "string"}}, "required": ["final"]},
+                handler=lambda _rt, args: {"final": args.get("final", "")},
+            )
+        )
+
+        author_id = "a" * 24
+        target_id = "b" * 24
+        agent = _mk_agent(
+            planner_resps=[
+                OllamaChatResponse(content='{"task_id":"TID","user_lang":"zh","goal":"g","steps":[]}', tool_calls=[], raw={}),
+                # writer outputs the WRONG id (target id) -> should be corrected deterministically.
+                OllamaChatResponse(content=f"你的用户ID是：{target_id}", tool_calls=[], raw={}),
+            ],
+            executor_resps=[],
+            registry=reg,
+        )
+        user_text = (
+            'CONTEXT_JSON:\n{"target":{"type":"User","id":"'
+            + target_id
+            + '"},"comment":{"id":"c1","author_id":"'
+            + author_id
+            + '","author_nickname":"揉碎星月"}}\n\n我的id是什么'
+        )
+        out = agent.handle(user_text=user_text)
+        self.assertEqual(out["answer"], f"你的用户ID是：{author_id}")
+
+    def test_follow_query_uses_check_tool_and_returns_deterministic_conclusion(self):
+        reg = ToolRegistry()
+
+        def _check(_rt: ToolRuntime, args: dict) -> dict:
+            return {
+                "follower": {"id": "0" * 24, "nickname": args.get("follower_name")},
+                "followee": {"id": "1" * 24, "nickname": args.get("followee_name")},
+                "is_following": True,
+                "matched": {"id": "1" * 24, "nickname": args.get("followee_name")},
+                "checked": {"pages_scanned": 1, "items_scanned": 1, "incomplete": False},
+            }
+
+        reg.register(
+            ToolSpec(
+                name="plar_check_following",
+                description="",
+                parameters={
+                    "type": "object",
+                    "properties": {"follower_name": {"type": "string"}, "followee_name": {"type": "string"}},
+                    "required": ["follower_name", "followee_name"],
+                },
+                handler=_check,
+            )
+        )
+        reg.register(
+            ToolSpec(
+                name="end",
+                description="",
+                parameters={"type": "object", "properties": {"final": {"type": "string"}}, "required": ["final"]},
+                handler=lambda _rt, args: {"final": args.get("final", "")},
+            )
+        )
+
+        agent = _mk_agent(
+            planner_resps=[
+                # Planner forgets tools -> plan patched should force plar_check_following.
+                OllamaChatResponse(content='{"task_id":"TF","user_lang":"zh","goal":"g","steps":[]}', tool_calls=[], raw={}),
+                # Writer tries to be vague; deterministic conclusion should override.
+                OllamaChatResponse(content="无法确认。", tool_calls=[], raw={}),
+            ],
+            executor_resps=[
+                OllamaChatResponse(
+                    content="",
+                    tool_calls=[
+                        {"function": {"name": "plar_check_following", "arguments": {"follower_name": "goodenough", "followee_name": "MapMaths"}}}
+                    ],
+                    raw={},
+                )
+            ],
+            registry=reg,
+        )
+        out = agent.handle(user_text="用户goodenough有没有关注用户MapMaths")
+        self.assertIn("结论：", out["answer"])
+        self.assertIn("goodenough", out["answer"])
+        self.assertIn("MapMaths", out["answer"])
+        self.assertIn("关注了", out["answer"])
+
+    def test_oldest_comment_query_uses_scan_result_deterministically(self):
+        reg = ToolRegistry()
+
+        def _oldest(_rt: ToolRuntime, _args: dict) -> dict:
+            return {
+                "target": {"type": "User", "id": "0" * 24},
+                "pages_scanned": 2,
+                "comments_scanned": 3,
+                "incomplete": False,
+                "oldest_comment": {"id": "c1", "ts_ms": 1, "author_nickname": "ydhfgdus", "author_id": "u1", "text": "难绷"},
+                "comments": [{"id": "c1", "ts_ms": 1, "author_nickname": "ydhfgdus", "author_id": "u1", "text": "难绷"}],
+            }
+
+        reg.register(
+            ToolSpec(
+                name="plar_get_oldest_comment",
+                description="",
+                parameters={"type": "object", "properties": {"target_type": {"type": "string"}, "target_id": {"type": "string"}}},
+                handler=_oldest,
+            )
+        )
+        reg.register(
+            ToolSpec(
+                name="end",
+                description="",
+                parameters={"type": "object", "properties": {"final": {"type": "string"}}, "required": ["final"]},
+                handler=lambda _rt, args: {"final": args.get("final", "")},
+            )
+        )
+
+        agent = _mk_agent(
+            planner_resps=[
+                OllamaChatResponse(
+                    content='{"task_id":"TOC","user_lang":"zh","goal":"g","steps":[{"id":"s1","tool":"plar_get_oldest_comment","hint":"scan"}]}',
+                    tool_calls=[],
+                    raw={},
+                ),
+                # writer output is ignored by deterministic post-processing.
+                OllamaChatResponse(content="随便写点", tool_calls=[], raw={}),
+            ],
+            executor_resps=[
+                OllamaChatResponse(
+                    content="",
+                    tool_calls=[
+                        {"function": {"name": "plar_get_oldest_comment", "arguments": {"target_type": "User", "target_id": "0" * 24}}}
+                    ],
+                    raw={},
+                )
+            ],
+            registry=reg,
+        )
+
+        out = agent.handle(user_text="用户MapMaths的留言板里最早的评论是谁发布的？内容是什么")
+        self.assertTrue(out["answer"].startswith("最早的一条评论"))
+        self.assertIn("作者：ydhfgdus", out["answer"])
+        self.assertIn("内容：难绷", out["answer"])
+
+    def test_planner_patch_adds_oldest_comment_scan_steps(self):
+        reg = ToolRegistry()
+
+        def _get_user(_rt: ToolRuntime, args: dict) -> dict:
+            return {"id": "c" * 24, "nickname": args.get("name")}
+
+        def _oldest(_rt: ToolRuntime, _args: dict) -> dict:
+            return {
+                "target": {"type": "User", "id": "c" * 24},
+                "pages_scanned": 1,
+                "comments_scanned": 1,
+                "incomplete": False,
+                "oldest_comment": {"id": "c1", "ts_ms": 1, "author_nickname": "A", "author_id": "u", "text": "hi"},
+                "comments": [{"id": "c1", "ts_ms": 1, "author_nickname": "A", "author_id": "u", "text": "hi"}],
+            }
+
+        reg.register(
+            ToolSpec(
+                name="plar_get_user",
+                description="",
+                parameters={"type": "object", "properties": {"name": {"type": "string"}}, "required": ["name"]},
+                handler=_get_user,
+            )
+        )
+        reg.register(
+            ToolSpec(
+                name="plar_get_oldest_comment",
+                description="",
+                parameters={"type": "object", "properties": {"target_type": {"type": "string"}, "target_id": {"type": "string"}}},
+                handler=_oldest,
+            )
+        )
+        reg.register(
+            ToolSpec(
+                name="end",
+                description="",
+                parameters={"type": "object", "properties": {"final": {"type": "string"}}, "required": ["final"]},
+                handler=lambda _rt, args: {"final": args.get("final", "")},
+            )
+        )
+
+        agent = _mk_agent(
+            planner_resps=[
+                # Planner forgets tools -> _plan_from_obj patch should add get_user + oldest_comment scan.
+                OllamaChatResponse(content='{"task_id":"TPA","user_lang":"zh","goal":"g","steps":[]}', tool_calls=[], raw={}),
+                OllamaChatResponse(content="writer", tool_calls=[], raw={}),
+            ],
+            executor_resps=[
+                OllamaChatResponse(content="", tool_calls=[{"function": {"name": "plar_get_user", "arguments": {"name": "MapMaths"}}}], raw={}),
+                OllamaChatResponse(
+                    content="",
+                    tool_calls=[{"function": {"name": "plar_get_oldest_comment", "arguments": {"target_type": "User", "target_id": "c" * 24}}}],
+                    raw={},
+                ),
+            ],
+            registry=reg,
+        )
+
+        out = agent.handle(user_text="用户MapMaths的留言板里最早的评论是谁发布的？内容是什么")
+        self.assertEqual(len(out["tool_results"]), 2)
+        self.assertIn("作者：A", out["answer"])
+        self.assertIn("内容：hi", out["answer"])
+
+    def test_end_final_hex_error_is_sanitized_for_zh(self):
+        reg = ToolRegistry()
+        reg.register(
+            ToolSpec(
+                name="dummy",
+                description="",
+                parameters={"type": "object", "properties": {}, "required": []},
+                handler=lambda _rt, _args: {},
+            )
+        )
+        reg.register(
+            ToolSpec(
+                name="end",
+                description="",
+                parameters={"type": "object", "properties": {"final": {"type": "string"}}, "required": ["final"]},
+                handler=lambda _rt, args: {"final": args.get("final", "")},
+            )
+        )
+
+        agent = _mk_agent(
+            planner_resps=[
+                OllamaChatResponse(
+                    content='{"task_id":"TEND","user_lang":"zh","goal":"g","steps":[{"id":"s1","tool":"dummy","hint":"x"}]}',
+                    tool_calls=[],
+                    raw={},
+                )
+            ],
+            executor_resps=[
+                OllamaChatResponse(
+                    content="",
+                    tool_calls=[
+                        {
+                            "function": {
+                                "name": "end",
+                                "arguments": {
+                                    "final": "The user ID provided is not a 24-hex string. Please provide a valid user ID to proceed."
+                                },
+                            }
+                        }
+                    ],
+                    raw={},
+                )
+            ],
+            registry=reg,
+        )
+
+        out = agent.handle(user_text="列出评论")
+        self.assertIn("24 位十六进制 ID", out["answer"])
+        self.assertNotIn("24-hex", out["answer"])
+
+    def test_reply_prefix_is_stripped_for_llm_and_echo_is_rewritten(self):
+        reg = ToolRegistry()
+        reg.register(
+            ToolSpec(
+                name="end",
+                description="",
+                parameters={"type": "object", "properties": {"final": {"type": "string"}}, "required": ["final"]},
+                handler=lambda _rt, args: {"final": args.get("final", "")},
+            )
+        )
+        agent = _mk_agent(
+            planner_resps=[
+                OllamaChatResponse(content='{"task_id":"TE","user_lang":"zh","goal":"g","steps":[]}', tool_calls=[], raw={}),
+                # writer echoes the user request (bug)
+                OllamaChatResponse(content="概括实验RRR的评论区", tool_calls=[], raw={}),
+                # anti-echo rewriter produces a real clarification
+                OllamaChatResponse(content="我可以帮你概括评论区。请提供该实验/讨论的链接或ID。", tool_calls=[], raw={}),
+            ],
+            executor_resps=[],
+            registry=reg,
+        )
+        user_text = "回复<user=bbbbbbbbbbbbbbbbbbbbbbbb>@aurex</user>: 概括实验RRR的评论区"
+        out = agent.handle(user_text=user_text)
+        self.assertIn("请提供", out["answer"])
+
     def test_executor_violates_plan_twice_raises(self):
         reg = ToolRegistry()
         reg.register(

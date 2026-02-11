@@ -92,7 +92,8 @@ def local_get_target_context(runtime: ToolRuntime, args: dict[str, Any]) -> dict
         tid = tid.strip()
         if ttype and tid:
             try:
-                live = plar.get_comments(runtime.user, target_id=tid, target_type=ttype, take=max(20, take), skip=0)
+                # physicsLab server rejects take > 20 (400 Input.Field.Invalid).
+                live = plar.get_comments(runtime.user, target_id=tid, target_type=ttype, take=20, skip=0)
             except Exception as e:
                 raise ToolError(f"local_get_target_context: live fetch failed: {type(e).__name__}: {e}") from e
             records: list[dict[str, Any]] = []

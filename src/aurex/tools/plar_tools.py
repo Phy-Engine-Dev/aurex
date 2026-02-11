@@ -41,7 +41,11 @@ def _load_tag_name_to_value() -> dict[str, str]:
     global _TAG_NAME_TO_VALUE
     if _TAG_NAME_TO_VALUE is not None:
         return _TAG_NAME_TO_VALUE
-    mapping: dict[str, str] = {}
+    # Minimal built-in mapping for the most common tag names, so tools/tests work even
+    # when `physicsLab` isn't importable (e.g. in CI or offline environments).
+    mapping: dict[str, str] = {
+        "featured": "精选",
+    }
     try:
         from physicsLab import Tag as PLTag  # type: ignore
 
@@ -51,7 +55,7 @@ def _load_tag_name_to_value() -> dict[str, str]:
             if isinstance(name, str) and name.strip() and isinstance(val, str) and val.strip():
                 mapping[name.strip().casefold()] = val.strip()
     except Exception:
-        mapping = {}
+        pass
     _TAG_NAME_TO_VALUE = mapping
     return mapping
 
@@ -166,8 +170,9 @@ def plar_get_comments(runtime: ToolRuntime, args: dict[str, Any]) -> list[dict[s
     take = int(args.get("take") or 20)
     if take <= 0:
         take = 20
-    if take > 50:
-        take = 50
+    # physicsLab server rejects take > 20 (400 Input.Field.Invalid).
+    if take > 20:
+        take = 20
     skip = int(args.get("skip") or 0)
     if skip < 0:
         skip = 0
@@ -180,6 +185,112 @@ def plar_get_comments(runtime: ToolRuntime, args: dict[str, Any]) -> list[dict[s
         if rec is not None:
             out.append(rec)
     return out
+
+
+def plar_get_oldest_comment(runtime: ToolRuntime, args: dict[str, Any]) -> dict[str, Any]:
+    """Scan the whole comment section (best-effort) and return the oldest comment.
+
+    Notes:
+    - PhysicsLab get_comments(skip=...) uses unix_ms timestamp pagination (not offset).
+    - We page backwards by taking the minimum timestamp on each page and setting
+      next_skip_ts_ms = min_ts_ms - 1.
+    """
+    user = _require_user(runtime)
+    target_type = str(args.get("target_type") or "").strip()
+    if target_type.casefold() in ("user", "experiment", "discussion"):
+        target_type = target_type[:1].upper() + target_type[1:].casefold()
+    if target_type not in ("User", "Experiment", "Discussion"):
+        raise ToolError("plar_get_oldest_comment: target_type must be User|Experiment|Discussion")
+    target_id = _require_hex24(args.get("target_id"), where="plar_get_oldest_comment.target_id")
+
+    take = int(args.get("take") or 50)
+    if take <= 0:
+        take = 20
+    # physicsLab server rejects take > 20 (400 Input.Field.Invalid).
+    if take > 20:
+        take = 20
+
+    max_pages = int(args.get("max_pages") or 200)
+    if max_pages < 1:
+        max_pages = 1
+    if max_pages > 800:
+        max_pages = 800
+
+    # Optional starting skip (unix_ms). If an offset-like small number is provided, ignore it.
+    skip_in = args.get("skip") if "skip" in args else 0
+    try:
+        skip_ts_ms = int(skip_in) if skip_in is not None else 0
+    except Exception:
+        skip_ts_ms = 0
+    if 0 < skip_ts_ms < 10_000_000_000:
+        skip_ts_ms = 0
+    if skip_ts_ms < 0:
+        skip_ts_ms = 0
+
+    pages = 0
+    scanned = 0
+    oldest: dict[str, Any] | None = None
+    oldest_ts: int | None = None
+    prev_page_min_ts: int | None = None
+    seen_ids: set[str] = set()
+    stopped_by_limit = False
+
+    while pages < max_pages:
+        raw = plar.get_comments(user, target_id=target_id, target_type=target_type, take=take, skip=int(skip_ts_ms))
+        pages += 1
+        if not raw:
+            break
+
+        page_min_ts: int | None = None
+        any_new = False
+        for c in raw:
+            if not isinstance(c, dict):
+                continue
+            rec = _compact_comment(c)
+            if rec is None:
+                continue
+            cid = str(rec.get("id") or "").strip()
+            if not cid or cid in seen_ids:
+                continue
+            seen_ids.add(cid)
+            any_new = True
+            scanned += 1
+            try:
+                ts = int(rec.get("ts_ms") or 0)
+            except Exception:
+                ts = 0
+            if page_min_ts is None or ts < page_min_ts:
+                page_min_ts = ts
+            if oldest_ts is None or ts < oldest_ts:
+                oldest_ts = ts
+                oldest = rec
+
+        if page_min_ts is None:
+            break
+        # If the page is short, we likely reached the end.
+        if len(raw) < take:
+            break
+        # If we didn't make progress, avoid infinite loops.
+        if prev_page_min_ts is not None and page_min_ts >= prev_page_min_ts:
+            break
+        if not any_new and prev_page_min_ts is not None:
+            break
+
+        prev_page_min_ts = page_min_ts
+        skip_ts_ms = max(0, int(page_min_ts) - 1)
+
+    if pages >= max_pages:
+        stopped_by_limit = True
+
+    return {
+        "target": {"type": target_type, "id": target_id},
+        "pages_scanned": pages,
+        "comments_scanned": scanned,
+        "incomplete": bool(stopped_by_limit),
+        # Keep a "comments" list for compatibility with generic comment-based post-processing.
+        "comments": [oldest] if isinstance(oldest, dict) else [],
+        "oldest_comment": oldest,
+    }
 
 
 def _compact_qe_item(item: dict[str, Any], *, category_hint: str | None = None) -> dict[str, Any]:
@@ -462,6 +573,134 @@ def plar_get_experiment_context(runtime: ToolRuntime, args: dict[str, Any]) -> d
     )
 
 
+def plar_check_following(runtime: ToolRuntime, args: dict[str, Any]) -> dict[str, Any]:
+    """Check whether follower follows followee (best-effort, paginated)."""
+    user = _require_user(runtime)
+
+    follower_id_raw = args.get("follower_user_id")
+    follower_name_raw = args.get("follower_name")
+    followee_id_raw = args.get("followee_user_id")
+    followee_name_raw = args.get("followee_name")
+
+    def _resolve_user(*, uid_raw: Any, name_raw: Any, where: str) -> dict[str, Any]:
+        uid = None
+        name = None
+        if isinstance(uid_raw, str) and uid_raw.strip():
+            uid = _require_hex24(uid_raw, where=where + ".user_id")
+        if isinstance(name_raw, str) and name_raw.strip():
+            name = str(name_raw).strip().lstrip("@＠").strip() or None
+        if uid:
+            pkg = plar.get_user_by_id(user, user_id=uid)
+            compact = _compact_user_pkg(pkg)
+            return {"id": compact.get("id") or uid, "nickname": compact.get("nickname")}
+        if name:
+            pkg = plar.get_user_by_name(user, name=name)
+            compact = _compact_user_pkg(pkg)
+            cid = str(compact.get("id") or "").strip()
+            if cid:
+                return {"id": cid, "nickname": compact.get("nickname") or name}
+            # Extremely defensive: if API returns no id, still return name.
+            return {"id": None, "nickname": name}
+        raise ToolError(f"{where}: provide follower_user_id/follower_name and followee_user_id/followee_name")
+
+    follower = _resolve_user(uid_raw=follower_id_raw, name_raw=follower_name_raw, where="plar_check_following.follower")
+    followee = _resolve_user(uid_raw=followee_id_raw, name_raw=followee_name_raw, where="plar_check_following.followee")
+    follower_id = str(follower.get("id") or "").strip()
+    followee_id = str(followee.get("id") or "").strip()
+    follower_nick = str(follower.get("nickname") or "").strip()
+    followee_nick = str(followee.get("nickname") or "").strip()
+
+    if not follower_id or not followee_id:
+        raise ToolError("plar_check_following: failed to resolve both users' IDs")
+    if not _HEX24_RE.fullmatch(follower_id) or not _HEX24_RE.fullmatch(followee_id):
+        raise ToolError("plar_check_following: resolved user ids are not 24-hex IDs")
+
+    take = int(args.get("take") or 24)
+    if take <= 0:
+        take = 24
+    # Backend rejects take > 24 (400 Input.Field.Invalid).
+    if take > 24:
+        take = 24
+    max_pages = int(args.get("max_pages") or 50)
+    if max_pages < 1:
+        max_pages = 1
+    if max_pages > 200:
+        max_pages = 200
+
+    checked: dict[str, Any] = {
+        "display_type": "Following",
+        "query_first": True,
+        "take": take,
+        "max_pages": max_pages,
+    }
+
+    def _extract_user_obj(it: dict[str, Any]) -> dict[str, Any]:
+        if not isinstance(it, dict):
+            return {}
+        u = it.get("User")
+        return u if isinstance(u, dict) else it
+
+    def _extract_user_id(it: dict[str, Any]) -> str:
+        u = _extract_user_obj(it)
+        uid = plar.best_effort_extract_text(u.get("ID") or u.get("Id") or u.get("UserID")).strip()
+        return uid
+
+    def _match_from_list(items: list[dict[str, Any]]) -> dict[str, Any] | None:
+        for it in items or []:
+            if not isinstance(it, dict):
+                continue
+            uid = _extract_user_id(it)
+            if uid == followee_id:
+                u = _extract_user_obj(it)
+                nick = plar.best_effort_extract_text(u.get("Nickname") or u.get("Name")).strip() or None
+                return {"id": uid, "nickname": nick}
+        return None
+
+    # Phase 1: query filter (may be faster, but not always reliable).
+    matched: dict[str, Any] | None = None
+    if followee_nick:
+        try:
+            q_items = plar.get_relations(user, user_id=follower_id, display_type="Following", skip=0, take=take, query=followee_nick)
+            matched = _match_from_list(q_items)
+            checked["query"] = followee_nick
+            checked["query_count"] = len(q_items) if isinstance(q_items, list) else 0
+        except Exception as e:
+            checked["query_error"] = f"{type(e).__name__}: {e}"
+            matched = None
+    else:
+        checked["query"] = ""
+
+    # Phase 2: scan pages until exhausted or matched.
+    pages = 0
+    scanned = 0
+    if matched is None:
+        skip = 0
+        while pages < max_pages:
+            pages += 1
+            items = plar.get_relations(user, user_id=follower_id, display_type="Following", skip=skip, take=take, query="")
+            if not isinstance(items, list):
+                items = []
+            scanned += len(items)
+            m = _match_from_list(items)
+            if m is not None:
+                matched = m
+                break
+            if len(items) < take:
+                break
+            skip += take
+    checked["pages_scanned"] = pages
+    checked["items_scanned"] = scanned
+    checked["incomplete"] = bool(matched is None and pages >= max_pages)
+
+    return {
+        "follower": {"id": follower_id, "nickname": follower_nick or None},
+        "followee": {"id": followee_id, "nickname": followee_nick or None},
+        "is_following": bool(matched is not None),
+        "matched": matched,
+        "checked": checked,
+    }
+
+
 def plar_get_status_save(runtime: ToolRuntime, args: dict[str, Any]) -> dict[str, Any]:
     user = _require_user(runtime)
     summary_id = _require_hex24(args.get("summary_id"), where="plar_get_status_save.summary_id")
@@ -567,8 +806,29 @@ PLAR_GET_COMMENTS_TOOL = {
         "properties": {
             "target_type": {"type": "string", "enum": ["User", "Experiment", "Discussion"]},
             "target_id": {"type": "string"},
-            "take": {"type": "integer", "minimum": 1, "maximum": 50, "default": 20},
+            "take": {"type": "integer", "minimum": 1, "maximum": 20, "default": 20},
             "skip": {"type": "integer", "minimum": 0, "default": 0},
+        },
+        "required": ["target_type", "target_id"],
+    },
+}
+
+PLAR_GET_OLDEST_COMMENT_TOOL = {
+    "name": "plar_get_oldest_comment",
+    "description": "Scan and return the oldest comment for a target (best-effort, paginated). Use when the user asks for “最早/第一条/oldest/first comment”.",
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "target_type": {"type": "string", "enum": ["User", "Experiment", "Discussion"]},
+            "target_id": {"type": "string"},
+            "take": {"type": "integer", "minimum": 1, "maximum": 20, "default": 20},
+            "max_pages": {"type": "integer", "minimum": 1, "maximum": 800, "default": 200},
+            "skip": {
+                "type": "integer",
+                "minimum": 0,
+                "default": 0,
+                "description": "Optional unix_ms timestamp to start scanning from (0 means latest).",
+            },
         },
         "required": ["target_type", "target_id"],
     },
@@ -603,7 +863,7 @@ PLAR_RELATIONS_TOOL = {
             "user_id": {"type": "string"},
             "display_type": {"type": ["string", "integer"], "default": "Following"},
             "skip": {"type": "integer", "minimum": 0, "default": 0},
-            "take": {"type": "integer", "minimum": 1, "maximum": 100, "default": 20},
+            "take": {"type": "integer", "minimum": 1, "maximum": 24, "default": 20},
             "query": {"type": "string", "default": ""},
         },
         "required": ["user_id"],
@@ -659,4 +919,21 @@ PLAR_LIST_TAGS_TOOL = {
     "name": "plar_list_builtin_tags",
     "description": "List built-in PhysicsLab Tag enum names/values (e.g. Featured=精选). Useful when user asks what tags exist or how to filter by tags.",
     "parameters": {"type": "object", "properties": {}, "required": []},
+}
+
+PLAR_CHECK_FOLLOWING_TOOL = {
+    "name": "plar_check_following",
+    "description": "Check whether one user follows another user (best-effort, paginated). Useful for queries like “用户A有没有关注用户B”.",
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "follower_user_id": {"type": ["string", "null"], "description": "Follower user ID (24-hex)."},
+            "follower_name": {"type": ["string", "null"], "description": "Follower nickname (with or without @)."},
+            "followee_user_id": {"type": ["string", "null"], "description": "Followee user ID (24-hex)."},
+            "followee_name": {"type": ["string", "null"], "description": "Followee nickname (with or without @)."},
+            "take": {"type": "integer", "minimum": 1, "maximum": 24, "default": 24},
+            "max_pages": {"type": "integer", "minimum": 1, "maximum": 200, "default": 50},
+        },
+        "required": [],
+    },
 }
