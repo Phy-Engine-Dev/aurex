@@ -1227,6 +1227,112 @@ class TestAurexAgent(unittest.TestCase):
         self.assertTrue(tool_results[0].ok)
         self.assertIsNotNone(end_final)
 
+    def test_publish_workflow_is_forced_and_upload_intro_prefixed_with_user_tag(self):
+        reg = ToolRegistry()
+
+        def _gen_v(_rt: ToolRuntime, args: dict) -> dict:
+            spec = str(args.get("spec") or "").strip()
+            self.assertTrue(bool(spec))
+            return {"verilog": "module top; endmodule", "top_module": str(args.get("top_module") or "top")}
+
+        def _v2sav(_rt: ToolRuntime, args: dict) -> dict:
+            self.assertEqual(str(args.get("verilog") or "").strip(), "module top; endmodule")
+            self.assertTrue(bool(args.get("force_build")))
+            return {"sav_path": "out.sav"}
+
+        def _write(_rt: ToolRuntime, args: dict) -> dict:
+            topic = str(args.get("topic") or "").strip()
+            self.assertTrue(bool(topic))
+            return {"title": "T", "introduction": "Intro", "tags": ["物理", "精选"]}
+
+        upload_calls: list[dict] = []
+
+        def _upload(_rt: ToolRuntime, args: dict) -> dict:
+            upload_calls.append(dict(args))
+            # Fail once to verify retry is allowed before success.
+            if len(upload_calls) == 1:
+                raise Exception("temporary upload failure")
+            return {"ok": True, "id": "x"}
+
+        reg.register(
+            ToolSpec(
+                name="llm_generate_verilog",
+                description="",
+                parameters={"type": "object", "properties": {"spec": {"type": "string"}, "top_module": {"type": "string"}}, "required": []},
+                handler=_gen_v,
+            )
+        )
+        reg.register(
+            ToolSpec(
+                name="verilog_to_sav",
+                description="",
+                parameters={"type": "object", "properties": {"verilog": {"type": "string"}}, "required": []},
+                handler=_v2sav,
+            )
+        )
+        reg.register(
+            ToolSpec(
+                name="llm_write_publish_text",
+                description="",
+                parameters={"type": "object", "properties": {"topic": {"type": "string"}}, "required": []},
+                handler=_write,
+            )
+        )
+        reg.register(
+            ToolSpec(
+                name="plar_upload_sav",
+                description="",
+                parameters={
+                    "type": "object",
+                    "properties": {"sav_path": {"type": "string"}, "title": {"type": "string"}, "introduction": {"type": "string"}},
+                    "required": ["sav_path", "title", "introduction"],
+                },
+                handler=_upload,
+            )
+        )
+        reg.register(
+            ToolSpec(
+                name="end",
+                description="",
+                parameters={"type": "object", "properties": {"final": {"type": "string"}}, "required": ["final"]},
+                handler=lambda _rt, args: {"final": args.get("final", "")},
+            )
+        )
+
+        agent = _mk_agent(
+            planner_resps=[
+                # Planner forgets steps; _plan_from_obj should force the full publish workflow.
+                OllamaChatResponse(content='{"task_id":"TPUB","user_lang":"zh","goal":"g","steps":[]}', tool_calls=[], raw={}),
+                OllamaChatResponse(content="ok", tool_calls=[], raw={}),
+            ],
+            executor_resps=[
+                OllamaChatResponse(content="", tool_calls=[{"function": {"name": "llm_generate_verilog", "arguments": {}}}], raw={}),
+                OllamaChatResponse(content="", tool_calls=[{"function": {"name": "verilog_to_sav", "arguments": {}}}], raw={}),
+                OllamaChatResponse(content="", tool_calls=[{"function": {"name": "llm_write_publish_text", "arguments": {}}}], raw={}),
+                OllamaChatResponse(content="", tool_calls=[{"function": {"name": "plar_upload_sav", "arguments": {}}}], raw={}),
+                OllamaChatResponse(content="", tool_calls=[{"function": {"name": "plar_upload_sav", "arguments": {}}}], raw={}),
+            ],
+            registry=reg,
+        )
+
+        author_id = "a" * 24
+        target_id = "b" * 24
+        user_text = (
+            'CONTEXT_JSON:\n{"target":{"type":"User","id":"'
+            + target_id
+            + '"},"comment":{"id":"c1","author_id":"'
+            + author_id
+            + '","author_nickname":"MapMaths"}}\n\n请发布一个实验：与门'
+        )
+        out = agent.handle(user_text=user_text)
+        self.assertEqual(out["answer"], "ok")
+
+        # Upload should be retried once.
+        self.assertEqual(len(upload_calls), 2)
+        intro = str(upload_calls[-1].get("introduction") or "")
+        self.assertTrue(intro.startswith(f"<user={author_id}>@MapMaths</user>\n\n"))
+        self.assertEqual(upload_calls[-1].get("category"), "Experiment")
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -14,14 +14,14 @@ def _resolve(runtime: ToolRuntime, path: str) -> str:
     return runtime.config.resolve_path(path, config_path=runtime.config_path)
 
 
-def _ensure_artifacts(runtime: ToolRuntime) -> tuple[str, str]:
+def _ensure_artifacts(runtime: ToolRuntime, *, force_build: bool = False) -> tuple[str, str]:
     cfg = runtime.config.phy_engine
     v2p = (cfg.verilog2plsav_path or "").strip()
     lib = (cfg.phyengine_lib_path or "").strip()
     if v2p and lib:
         return _resolve(runtime, v2p), _resolve(runtime, lib)
 
-    if not cfg.auto_build:
+    if not (cfg.auto_build or force_build):
         missing = []
         if not v2p:
             missing.append("verilog2plsav_path")
@@ -73,7 +73,8 @@ def verilog_to_sav(runtime: ToolRuntime, args: dict[str, Any]) -> dict[str, str]
         fd, out_sav = tempfile.mkstemp(prefix="aurex_", suffix=".sav", dir=runtime.cache_dir)
         os.close(fd)
 
-    v2p, _lib = _ensure_artifacts(runtime)
+    force_build = bool(args.get("force_build") or False)
+    v2p, _lib = _ensure_artifacts(runtime, force_build=force_build)
 
     os.makedirs(os.path.dirname(out_sav) or ".", exist_ok=True)
     with tempfile.TemporaryDirectory(dir=runtime.cache_dir) as td:
@@ -251,6 +252,11 @@ VERILOG_TO_SAV_TOOL = {
         "properties": {
             "verilog": {"type": "string", "description": "Verilog source code (Verilog-2001)."},
             "out_sav_path": {"type": ["string", "null"], "description": "Optional output path for .sav."},
+            "force_build": {
+                "type": "boolean",
+                "default": False,
+                "description": "If true, build Phy-Engine artifacts via CMake when paths are not configured.",
+            },
         },
         "required": ["verilog"],
     },
@@ -290,4 +296,3 @@ PE_SIMULATE_TOOL = {
         "required": ["spec"],
     },
 }
-

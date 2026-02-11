@@ -956,7 +956,7 @@ def run_forever(
                         continue
 
                     if bool(getattr(cfg.agent, "force_reply_prefix", True)):
-                        reply = prefix_user_mention(reply, nickname=author_nick)
+                        reply = prefix_user_mention(reply, user_id=author_id, nickname=author_nick)
 
                     if bool(getattr(cfg.agent, "strip_mention_tag_in_replies", True)):
                         mt = (cfg.agent.mention_tag or "").strip()

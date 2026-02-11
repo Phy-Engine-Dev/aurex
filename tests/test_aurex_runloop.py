@@ -54,10 +54,13 @@ class TestRunLoopHelpers(unittest.TestCase):
             self.assertEqual(got.replied_conversations["k"], 3.0)
 
     def test_prefix_user_mention(self):
-        self.assertEqual(prefix_user_mention("hello", nickname="abc"), "@abc hello")
-        self.assertEqual(prefix_user_mention("@abc hi", nickname="abc"), "@abc hi")
-        self.assertEqual(prefix_user_mention("＠abc  hi", nickname="abc"), "@abc hi")
-        self.assertEqual(prefix_user_mention("hi", nickname=""), "hi")
+        uid = "0123456789abcdef01234567"
+        self.assertEqual(prefix_user_mention("hello", user_id=uid, nickname="abc"), f"<user={uid}>@abc</user> hello")
+        self.assertEqual(prefix_user_mention(f"<user={uid}>@abc</user> hi", user_id=uid, nickname="abc"), f"<user={uid}>@abc</user> hi")
+        self.assertEqual(prefix_user_mention("@abc hi", user_id=uid, nickname="abc"), f"<user={uid}>@abc</user> hi")
+        self.assertEqual(prefix_user_mention("＠abc  hi", user_id=uid, nickname="abc"), f"<user={uid}>@abc</user> hi")
+        self.assertEqual(prefix_user_mention("hi", user_id=uid, nickname=""), "hi")
+        self.assertEqual(prefix_user_mention("hi", user_id="", nickname="abc"), "hi")
 
     def test_extract_trigger_text_normalizes_user_tags(self):
         s = "回复<user=698726c4fc064466378176b8>@aurex</user>: 你好"

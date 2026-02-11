@@ -150,6 +150,12 @@ def _plan_system_prompt(*, tools: list[dict[str, Any]], max_steps: int) -> str:
         "\n"
         "强制防刷屏约束：本次会话最多允许一次“发布实验/讨论”（tool=plar_upload_sav）。\n"
         "如果用户要求发布多个实验/讨论：只能规划一次发布，其余请在最终答复中要求用户下一次会话再发。\n"
+        "如果用户要求“发布实验/发布讨论/生成并发布/上传sav”：你必须规划完整发布流程（按顺序）：\n"
+        "1) tool=llm_generate_verilog（args.spec=<用户需求>, top_module=\"top\"）\n"
+        "2) tool=verilog_to_sav（args.verilog=<s1.verilog>, force_build=true）\n"
+        "3) tool=llm_write_publish_text（args.topic=<用户需求>, verilog=<s1.verilog>）\n"
+        "4) tool=plar_upload_sav（args.sav_path=<s2.sav_path>, title/introduction/tags=<s3>, category=Experiment 或 Discussion）\n"
+        "注意：发布的 introduction 必须是纯文本（无 Markdown）；不要包含 @aurex；不要手写 <user=...> 提醒标签（系统会自动添加到开头）。\n"
     )
 
 
@@ -187,6 +193,10 @@ def _plan_nl_system_prompt(*, tools: list[dict[str, Any]], max_steps: int) -> st
         + str(int(max_steps))
         + "），每步必须包含：tool=<tool_name>，以及 args 里需要哪些字段。\n"
         "- 如果无需工具：写“无需工具，直接回复”。\n"
+        "\n"
+        "发布实验/讨论规则：\n"
+        "- 若用户要求发布：必须依次规划 llm_generate_verilog -> verilog_to_sav(force_build=true) -> llm_write_publish_text -> plar_upload_sav。\n"
+        "- introduction 必须是纯文本；不要包含 @aurex；不要手写 <user=...> 提醒标签（系统会自动添加）。\n"
     )
 
 
@@ -270,6 +280,12 @@ def _executor_json_plan_system_prompt(*, tools: list[dict[str, Any]], max_steps:
         "If no tools are needed, set steps to an empty array.\n"
         "\n"
         "Anti-flood rule: at most one publish step per session (tool=plar_upload_sav).\n"
+        "\n"
+        "If the user asks to publish/upload an experiment/discussion (e.g. “发布实验/发布讨论/生成并发布/upload sav”), you MUST plan the full publish pipeline in order:\n"
+        "1) llm_generate_verilog (spec=<user request>)\n"
+        "2) verilog_to_sav (verilog=<s1.verilog>, force_build=true)\n"
+        "3) llm_write_publish_text (topic=<user request>, verilog=<s1.verilog>)\n"
+        "4) plar_upload_sav (sav_path=<s2.sav_path>, title/introduction/tags=<s3>, category=Experiment|Discussion)\n"
     )
 
 
@@ -459,6 +475,19 @@ class AurexAgent:
         r"(最新|最近|latest|newest).{0,16}(娱乐实验|fun\\s*experiment|娱乐.*实验)",
         re.IGNORECASE,
     )
+    _PUBLISH_REQUEST_RE = re.compile(
+        r"("
+        r"(帮我|请|我要|我想|我需要|能否|可以|麻烦)\s*(生成并)?发布"
+        r"|发布.{0,6}(实验|讨论|作品|帖子|sav)"
+        r"|上传.{0,6}(sav|SAV|实验|讨论)"
+        r"|\b(publish|upload)\b.{0,12}\b(experiment|discussion|sav)\b"
+        r")",
+        re.IGNORECASE,
+    )
+    _PUBLISH_FALSE_POSITIVE_RE = re.compile(
+        r"(发布.*第一个|发布.*最早|发布的第一个|发布的最早|first\\s+published|earliest\\s+published)",
+        re.IGNORECASE,
+    )
 
     def _looks_like_my_latest_query(self, visible_req: str) -> tuple[bool, str]:
         v = (visible_req or "").strip()
@@ -483,6 +512,23 @@ class AurexAgent:
         if not v:
             return False
         return self._MY_ID_QUERY_RE.search(v) is not None
+
+    def _looks_like_publish_request(self, visible_req: str) -> tuple[bool, str]:
+        v = (visible_req or "").strip()
+        if not v:
+            return False, ""
+        if self._PUBLISH_FALSE_POSITIVE_RE.search(v) is not None:
+            return False, ""
+        if self._PUBLISH_REQUEST_RE.search(v) is None:
+            return False, ""
+
+        lv = v.lower()
+        wants_disc = ("讨论" in v) or ("discussion" in lv)
+        wants_exp = ("实验" in v) or ("experiment" in lv)
+
+        if wants_disc and not wants_exp:
+            return True, "Discussion"
+        return True, "Experiment"
 
     def _extract_follow_pair_from_text(self, visible_req: str) -> tuple[str, str]:
         s = (visible_req or "").strip()
@@ -781,6 +827,47 @@ class AurexAgent:
                     if tu and self._HEX24_FULL_RE.fullmatch(tu):
                         return tu
         return ""
+
+    def _try_extract_verilog_from_results(self, tool_results: list[ToolResult]) -> str:
+        for tr in reversed(tool_results or []):
+            if not getattr(tr, "ok", False):
+                continue
+            data = getattr(tr, "data", None)
+            if not isinstance(data, dict):
+                continue
+            v = str(data.get("verilog") or "").strip()
+            if v:
+                return v
+        return ""
+
+    def _try_extract_sav_path_from_results(self, tool_results: list[ToolResult]) -> str:
+        for tr in reversed(tool_results or []):
+            if not getattr(tr, "ok", False):
+                continue
+            data = getattr(tr, "data", None)
+            if not isinstance(data, dict):
+                continue
+            p = str(data.get("sav_path") or data.get("path") or "").strip()
+            if p:
+                return p
+        return ""
+
+    def _try_extract_publish_text_from_results(self, tool_results: list[ToolResult]) -> tuple[str, str, list[str]]:
+        for tr in reversed(tool_results or []):
+            if not getattr(tr, "ok", False):
+                continue
+            data = getattr(tr, "data", None)
+            if not isinstance(data, dict):
+                continue
+            title = str(data.get("title") or "").strip()
+            intro = str(data.get("introduction") or "").strip()
+            tags = data.get("tags")
+            tags_list: list[str] = []
+            if isinstance(tags, list):
+                tags_list = [str(x).strip() for x in tags if str(x).strip()]
+            if title or intro or tags_list:
+                return title, intro, tags_list
+        return "", "", []
 
     def _extract_user_visible_text(self, user_text: str) -> str:
         s = (user_text or "").strip()
@@ -1194,6 +1281,7 @@ class AurexAgent:
         visible = self._extract_user_visible_text(user_text or "")
         ctx_type, ctx_id = self._extract_context_target(user_text or "")
         author_id, author_nick = self._extract_context_comment_author(user_text or "")
+        publish_ok, publish_cat = self._looks_like_publish_request(visible)
         if author_id and self._looks_like_my_id_query(visible):
             self.logger.info(
                 "[task=%s] planning patched: answering my-id using author_id=%s (%s) without tools",
@@ -1203,6 +1291,33 @@ class AurexAgent:
             )
             goal = goal or "回答用户自己的 Physics Lab 用户ID"
             steps_raw = []
+        elif publish_ok:
+            # Robustness: enforce the full publish workflow. This avoids the executor trying to upload
+            # without a .sav, or producing low-quality titles/introduction.
+            required = {"llm_generate_verilog", "verilog_to_sav", "llm_write_publish_text", "plar_upload_sav"}
+            present = {
+                str(s.get("tool") or "").strip()
+                for s in (steps_raw or [])
+                if isinstance(s, dict) and str(s.get("tool") or "").strip()
+            }
+            if not required.issubset(present):
+                self.logger.info(
+                    "[task=%s] planning patched: forcing publish workflow (category=%s)",
+                    got_task_id,
+                    publish_cat or "Experiment",
+                )
+                goal = goal or "生成并发布实验/讨论"
+                cat = publish_cat or "Experiment"
+                steps_raw = [
+                    {"id": "s1", "tool": "llm_generate_verilog", "hint": "spec=<user request>, top_module=top"},
+                    {"id": "s2", "tool": "verilog_to_sav", "hint": "verilog=<s1.verilog>, force_build=true"},
+                    {"id": "s3", "tool": "llm_write_publish_text", "hint": "topic=<user request>, verilog=<s1.verilog>"},
+                    {
+                        "id": "s4",
+                        "tool": "plar_upload_sav",
+                        "hint": f"sav_path=<s2.sav_path>, title/introduction/tags=<s3>, category={cat}",
+                    },
+                ]
         elif self._looks_like_this_user_query(visible_req=visible, ctx_target_type=ctx_type, ctx_target_id=ctx_id):
             wants_latest = self._LATEST_QUERY_RE.search(visible) is not None
             wants_hot = self._HOT_QUERY_RE.search(visible) is not None
@@ -1793,7 +1908,7 @@ class AurexAgent:
 
         results: list[ToolResult] = []
         end_final: str | None = None
-        publish_calls = 0
+        publish_successes = 0
 
         history: list[dict[str, Any]] = []
         history.append(message("system", _executor_system_prompt(user_lang=user_lang, mention_tag=self.cfg.agent.mention_tag)))
@@ -1941,22 +2056,21 @@ class AurexAgent:
                     tool_name, tool_args = tool_name2, tool_args2
 
                 try:
-                    if tool_name in _PUBLISH_TOOLS:
-                        publish_calls += 1
-                        if publish_calls > 1:
-                            if user_lang == "zh":
-                                end_final = "为避免实验/讨论发布冲刷：同一次会话最多发布 1 个实验/讨论。请在下一次会话再继续发布。"
-                            else:
-                                end_final = "To avoid flooding: at most 1 Experiment/Discussion publish per session. Please publish again in a new session."
-                            self.logger.warning(
-                                "[task=%s] step=%s publish blocked (tool=%s calls=%d)",
-                                plan.task_id,
-                                step.id,
-                                tool_name,
-                                publish_calls,
-                            )
-                            stop_execution = True
-                            break
+                    if tool_name in _PUBLISH_TOOLS and publish_successes >= 1:
+                        # Allow retries on failure, but never allow 2 successful publishes in a single session.
+                        if user_lang == "zh":
+                            end_final = "为避免实验/讨论发布冲刷：同一次会话最多发布成功 1 个实验/讨论。请在下一次会话再继续发布。"
+                        else:
+                            end_final = "To avoid flooding: at most 1 successful Experiment/Discussion publish per session. Please publish again in a new session."
+                        self.logger.warning(
+                            "[task=%s] step=%s publish blocked (tool=%s successes=%d)",
+                            plan.task_id,
+                            step.id,
+                            tool_name,
+                            publish_successes,
+                        )
+                        stop_execution = True
+                        break
                     tool = self.tools.get(tool_name)
                     self.logger.info(
                         "[task=%s] step=%s tool_run name=%s",
@@ -2304,6 +2418,81 @@ class AurexAgent:
                                 step.id,
                                 tags_list,
                             )
+                    if tool_name == "llm_generate_verilog":
+                        if not isinstance(tool_args, dict):
+                            tool_args = {}
+                        if not str(tool_args.get("spec") or "").strip():
+                            tool_args["spec"] = self._extract_user_visible_text(user_text or "")
+                        if not str(tool_args.get("top_module") or "").strip():
+                            tool_args["top_module"] = "top"
+                    if tool_name == "verilog_to_sav":
+                        if not isinstance(tool_args, dict):
+                            tool_args = {}
+                        if not str(tool_args.get("verilog") or "").strip():
+                            v_prev = self._try_extract_verilog_from_results(results)
+                            if v_prev:
+                                tool_args["verilog"] = v_prev
+                        if "force_build" not in tool_args:
+                            tool_args["force_build"] = True
+                    if tool_name == "llm_write_publish_text":
+                        if not isinstance(tool_args, dict):
+                            tool_args = {}
+                        if not str(tool_args.get("topic") or "").strip():
+                            tool_args["topic"] = self._extract_user_visible_text(user_text or "")
+                        if not str(tool_args.get("verilog") or "").strip():
+                            v_prev = self._try_extract_verilog_from_results(results)
+                            if v_prev:
+                                tool_args["verilog"] = v_prev
+                    if tool_name == "plar_upload_sav":
+                        if not isinstance(tool_args, dict):
+                            tool_args = {}
+                        if not str(tool_args.get("sav_path") or "").strip():
+                            p_prev = self._try_extract_sav_path_from_results(results)
+                            if p_prev:
+                                tool_args["sav_path"] = p_prev
+                        title = str(tool_args.get("title") or "").strip()
+                        intro = str(tool_args.get("introduction") or "").strip()
+                        tags0 = tool_args.get("tags")
+                        if (not title) or (not intro) or tags0 is None:
+                            t_prev, i_prev, tags_prev = self._try_extract_publish_text_from_results(results)
+                            if (not title) and t_prev:
+                                tool_args["title"] = t_prev
+                                title = t_prev
+                            if (not intro) and i_prev:
+                                tool_args["introduction"] = i_prev
+                                intro = i_prev
+                            if tags0 is None and tags_prev:
+                                tool_args["tags"] = tags_prev
+
+                        # Default category selection.
+                        cat = str(tool_args.get("category") or "").strip()
+                        if cat not in ("Experiment", "Discussion"):
+                            vis = self._extract_user_visible_text(user_text or "")
+                            _pub_ok, pub_cat = self._looks_like_publish_request(vis)
+                            tool_args["category"] = pub_cat or "Experiment"
+
+                        # Normalize + format introduction as plain text, and prefix with user mention.
+                        intro2 = str(tool_args.get("introduction") or "").strip()
+                        if intro2:
+                            mt = (self.cfg.agent.mention_tag or "").strip()
+                            if mt:
+                                replacement = mt[1:] if mt.startswith("@") and len(mt) > 1 else "aurex"
+                                intro2 = intro2.replace(mt, replacement).replace(mt.replace("@", "＠"), replacement)
+                            if self._needs_plain_text_formatting(intro2):
+                                formatted = self._format_plain_text(draft=intro2, user_lang=user_lang, task_id=plan.task_id)
+                                if formatted:
+                                    intro2 = formatted.strip()
+
+                            aid, anick = self._extract_context_comment_author(user_text or "")
+                            nick_clean = (anick or "").strip().lstrip("@＠").replace("\r", " ").replace("\n", " ").replace("\t", " ")
+                            nick_clean = " ".join(nick_clean.split()).strip()
+                            if nick_clean and " " in nick_clean:
+                                nick_clean = nick_clean.split(" ", 1)[0].strip()
+                            if aid and nick_clean:
+                                mention_line = f"<user={aid}>@{nick_clean}</user>"
+                                if not intro2.startswith(mention_line):
+                                    intro2 = mention_line + "\n\n" + intro2.lstrip()
+                            tool_args["introduction"] = intro2.strip()
                     data = tool.handler(runtime, tool_args)
                     tr = ToolResult(task_id=plan.task_id, step_id=step.id, ok=True, data=data, error=None)
                 except ToolError as e:
@@ -2319,6 +2508,8 @@ class AurexAgent:
                         step.id,
                         truncate(dumps_compact(tr.data, max_chars=4000), max_chars=800),
                     )
+                    if tool_name in _PUBLISH_TOOLS:
+                        publish_successes += 1
                     history.append(message("user", "TOOL_RESULT:\n" + dumps_compact(tr.__dict__, max_chars=8000)))
                     break
 

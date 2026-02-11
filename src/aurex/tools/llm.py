@@ -43,8 +43,8 @@ def llm_write_publish_text(runtime: ToolRuntime, args: dict[str, Any]) -> dict[s
     verilog = str(args.get("verilog") or "").strip()
     extra = str(args.get("extra") or "").strip()
 
-    lang = runtime.user_lang if runtime.user_lang in ("zh", "en") else "zh"
     client = _require_planner(runtime)
+    lang_code = (runtime.user_lang or "").strip().lower() or "en"
 
     sys = (
         "你是 Physics Lab AR 社区的实验发布编辑。\n"
@@ -54,7 +54,7 @@ def llm_write_publish_text(runtime: ToolRuntime, args: dict[str, Any]) -> dict[s
         "- title：短标题，<=40字（中文）或 <=80 chars（英文）。\n"
         "- introduction：发布简介/报告摘要，<=800字（中文）或 <=1200 chars（英文）。\n"
         "- tags：可选，字符串数组；仅在非常确定时给出。\n"
-        "- 语言：必须是用户语言（zh 用中文，en 用英文）。\n"
+        "- 语言：必须与用户语言一致（user_lang={lang_code}）。若以 zh 开头则用中文，否则用对应语言。\n"
         "- 不要包含 @aurex。\n"
     )
     user = "需求：\n" + topic
@@ -112,4 +112,3 @@ LLM_WRITE_PUBLISH_TEXT_TOOL = {
         "required": ["topic"],
     },
 }
-
