@@ -1,0 +1,85 @@
+{
+  "schema_version": 2,
+  "account": {
+    "email": "you@example.com",
+    "password": ""
+  },
+  "planner": {
+    "base_url": "http://127.0.0.1:11434",
+    "model": "qwen3:30b-a3b-thinking-2507-q4_K_M",
+    "timeout_sec": 240,
+    "temperature": 0.2,
+    "num_predict": 2048,
+    "extra_options": {}
+  },
+  "executor": {
+    "base_url": "http://127.0.0.1:11435",
+    "model": "command-r7b",
+    "timeout_sec": 240,
+    "temperature": 0.2,
+    "num_predict": 1024,
+    "extra_options": {}
+  },
+  "storage": {
+    "cache_dir": ".aurex/cache",
+    "context_db_path": ""
+  },
+  "web_search": {
+    "provider": "duckduckgo",
+    "max_results": 5,
+    "region": "cn-zh",
+    "safesearch": "moderate",
+    "time_range": "y"
+  },
+  "phy_engine": {
+    "auto_build": false,
+    "cmake_source_dir": "third-parties/Phy-Engine/src",
+    "cmake_build_dir": ".aurex/cache/phy-engine-build",
+    "cmake_build_type": "Release",
+    "build_timeout_sec": 900,
+    "run_timeout_sec": 300,
+    "verilog2plsav_path": "",
+    "phyengine_lib_path": "",
+    "verilog2plsav_args": [
+      "-O4",
+      "--layout",
+      "hier"
+    ]
+  },
+  "agent": {
+    "mention_tag": "@aurex",
+    "require_mention": true,
+    "user_targets_require_mention": true,
+    "trigger_on_reply_to_self": false,
+    "trigger_on_own_wall_without_mention": false,
+    "strip_mention_tag_in_replies": true,
+    "max_plan_steps": 10,
+    "max_tool_loops": 20,
+    "max_final_chars": 2000,
+    "dry_run": false,
+    "poll_interval_sec": 15,
+    "comment_take": 20,
+    "comment_scan_pages": 3,
+    "bootstrap_lookback_sec": 600,
+    "notifications_enabled": true,
+    "notification_category_ids": [
+      3
+    ],
+    "notification_take": 20,
+    "log_level": "INFO",
+    "debug_llm_io": false,
+    "debug_llm_max_chars": 1200,
+    "force_reply_prefix": true,
+    "final_reply_only": true,
+    "context_db_enabled": true,
+    "context_db_keep_last_comments": 200,
+    "reply_once": false,
+    "reply_once_ttl_sec": 0,
+    "targets": [
+      {
+        "type": "Experiment",
+        "id": "EXPERIMENT_ID_HERE"
+      }
+    ]
+  }
+}
