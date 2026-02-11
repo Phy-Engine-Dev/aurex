@@ -164,6 +164,32 @@ class TestQueryAndRelations(unittest.TestCase):
         self.assertEqual(q["Days"], "14")
         self.assertEqual(q["Sort"], "Popularity")
 
+    def test_query_experiments_direct_http_maps_newest_sort_to_default(self):
+        class User:
+            token = "tok"
+            auth_code = "auth"
+
+        captured = {}
+
+        class Resp:
+            status_code = 200
+
+            def json(self):
+                return {"Status": 200, "Message": "", "Data": {"$values": []}}
+
+        def post(_url, json=None, headers=None, timeout=None):
+            captured["json"] = json
+            return Resp()
+
+        fake_requests = types.ModuleType("requests")
+        fake_requests.post = post  # type: ignore[attr-defined]
+
+        with mock.patch.dict(sys.modules, {"requests": fake_requests}):
+            plar.query_experiments(User(), category="Experiment", take=1, sort="newest")
+
+        q = captured["json"]["Query"]
+        self.assertEqual(q["Sort"], 0)
+
     def test_get_relations_maps_display_type_names(self):
         class User:
             token = "t"
@@ -368,4 +394,3 @@ class TestStatusSaveAndPublish(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-

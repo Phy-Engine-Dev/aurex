@@ -112,8 +112,39 @@ def query_experiments(
         s = str(v).strip()
         if not s:
             return 0
-        # Keep the caller's string (e.g. "Popularity") to match web clients.
-        return s
+        # Common Chinese keywords (LLM / user input).
+        if ("热门" in s) or ("最热" in s) or ("热度" in s):
+            return "Popularity"
+        if ("随机" in s) or ("乱序" in s):
+            return "Random"
+        if ("最新" in s) or ("最近" in s):
+            return 0
+        low = s.casefold()
+        if low.isdigit():
+            try:
+                return int(low, 10)
+            except Exception:
+                return 0
+        # The backend accepts these string values (case-insensitive):
+        # - Default / Popularity / Random
+        if low in ("default", "popularity", "random"):
+            return s
+        # Substring fallbacks for common phrases (e.g. "most popular", "history hot", "latest").
+        if any(k in low for k in ("newest", "latest", "recent", "new ", "time")):
+            return 0
+        if any(k in low for k in ("popular", "popularity", "hot", "hottest", "trend")):
+            return "Popularity"
+        if any(k in low for k in ("random", "shuffle", "rand")):
+            return "Random"
+        # Common synonyms produced by LLMs; map them to supported values to avoid backend 500.
+        if low in ("newest", "latest", "recent", "new", "time"):
+            return 0
+        if low in ("hot", "popular", "hottest", "trending"):
+            return "Popularity"
+        if low in ("rand", "shuffle"):
+            return "Random"
+        # Unknown sort strings can crash the backend; fall back to default ordering.
+        return 0
 
     def _extract_values(obj: Any) -> list[dict[str, Any]]:
         if not isinstance(obj, dict):
@@ -871,4 +902,3 @@ def get_status_save(
         pass
 
     return status
-

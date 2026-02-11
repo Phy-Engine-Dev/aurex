@@ -121,6 +121,8 @@ def _plan_system_prompt(*, tools: list[dict[str, Any]], max_steps: int) -> str:
         "常用示例：zh_cn/zh_sg（简体），zh_tw/zh_hk/zh_mo（繁体），en，ja，ko，ru，de，fr，es，pt，ar，hi，th，vi。\n"
         "例：用户问 “what is the 中 means in chinese” 应该输出 user_lang=\"en\"。\n"
         "如果用户输入包含 CONTEXT_JSON（含 target.type/target.id）：当用户要求“总结/回顾/提取这个留言板/评论区/这条通知对应内容”，必须先使用 local_get_target_context 获取本地上下文（args.target_key 必须是 \"<type>:<id>\"，或传 target_type+target_id）。\n"
+        "如果用户要求“列出评论/查看留言板/查看评论区”，并且目标明确为某个 User/Experiment/Discussion（有 id）：优先使用 plar_get_comments（target_type/target_id/take/skip）。\n"
+        "plar_query_experiments.sort 建议只用 Default/Popularity/Random 或 0/1/2（避免使用 newest/hot 等非后端支持的字符串）。\n"
         "\n"
         "可用工具（只能从下列工具名中选择）：\n"
         + "\n".join(tool_lines)
@@ -156,6 +158,8 @@ def _plan_nl_system_prompt(*, tools: list[dict[str, Any]], max_steps: int) -> st
         "你的唯一输出：自然语言的“计划”（不要输出 JSON；不要输出 Markdown）。\n"
         "语言选择：你必须根据用户输入判断 user_lang（语言代码字符串），以用户表达的主要语言为准。\n"
         "如果用户输入包含 CONTEXT_JSON（含 target.type/target.id）且用户要求“总结/回顾/提取留言板/评论区/上下文”：第一步必须是 tool=local_get_target_context（args.target_key=\"<type>:<id>\"，或 args.target_type+args.target_id）。\n"
+        "如果用户要求“列出评论/查看留言板/查看评论区”且目标明确有 id：优先用 tool=plar_get_comments（target_type/target_id/take/skip）。\n"
+        "plar_query_experiments.sort 建议只用 Default/Popularity/Random 或 0/1/2。\n"
         "\n"
         "可用工具（只能从下列工具名中选择）：\n"
         + "\n".join(tool_lines)

@@ -43,6 +43,27 @@ def plar_get_user(runtime: ToolRuntime, args: dict[str, Any]) -> dict[str, Any]:
     raise ToolError("plar_get_user requires either name or user_id")
 
 
+def plar_get_comments(runtime: ToolRuntime, args: dict[str, Any]) -> list[dict[str, Any]]:
+    user = _require_user(runtime)
+    target_type = str(args.get("target_type") or "").strip()
+    if target_type.casefold() in ("user", "experiment", "discussion"):
+        target_type = target_type[:1].upper() + target_type[1:].casefold()
+    if target_type not in ("User", "Experiment", "Discussion"):
+        raise ToolError("plar_get_comments: target_type must be User|Experiment|Discussion")
+    target_id = str(args.get("target_id") or "").strip()
+    if not target_id:
+        raise ToolError("plar_get_comments: target_id is required")
+    take = int(args.get("take") or 20)
+    if take <= 0:
+        take = 20
+    if take > 50:
+        take = 50
+    skip = int(args.get("skip") or 0)
+    if skip < 0:
+        skip = 0
+    return plar.get_comments(user, target_id=target_id, target_type=target_type, take=take, skip=skip)
+
+
 def plar_get_relations(runtime: ToolRuntime, args: dict[str, Any]) -> list[dict[str, Any]]:
     user = _require_user(runtime)
     user_id = str(args.get("user_id") or "").strip()
@@ -149,6 +170,21 @@ PLAR_GET_USER_TOOL = {
     },
 }
 
+PLAR_GET_COMMENTS_TOOL = {
+    "name": "plar_get_comments",
+    "description": "List comments for a target (User wall / Experiment / Discussion).",
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "target_type": {"type": "string", "enum": ["User", "Experiment", "Discussion"]},
+            "target_id": {"type": "string"},
+            "take": {"type": "integer", "minimum": 1, "maximum": 50, "default": 20},
+            "skip": {"type": "integer", "minimum": 0, "default": 0},
+        },
+        "required": ["target_type", "target_id"],
+    },
+}
+
 PLAR_RELATIONS_TOOL = {
     "name": "plar_get_relations",
     "description": "List a user's relations (following/followers/banned/volunteers/editors/retired).",
@@ -209,4 +245,3 @@ PLAR_UPLOAD_SAV_TOOL = {
         "required": ["sav_path", "title", "introduction"],
     },
 }
-

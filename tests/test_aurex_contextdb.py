@@ -75,7 +75,31 @@ class TestLocalContextTool(unittest.TestCase):
             self.assertEqual(out.get("target_key"), "User:u1")
             self.assertEqual(out.get("comments_count"), 1)
 
+    def test_local_get_target_context_normalizes_target_key_case(self):
+        with tempfile.TemporaryDirectory() as td:
+            p = os.path.join(td, "context_db.json")
+            db = ContextDB(path=p)
+            db.upsert_target_comments(
+                target_key="User:u1",
+                target={"type": "User", "id": "u1"},
+                comments=[{"id": "c1", "ts_ms": 1, "author_nickname": "A", "text": "hi"}],
+                keep_last=200,
+            )
+
+            rt = ToolRuntime(
+                task_id="T",
+                user_lang="zh",
+                config_path=os.path.join(td, "cfg.json"),
+                config=AurexConfig(),
+                cache_dir=td,
+                user=None,
+                planner_client=None,
+            )
+            out = local_get_target_context(rt, {"target_key": "user:u1", "take": 20})
+            self.assertTrue(out.get("found"))
+            self.assertEqual(out.get("target_key"), "User:u1")
+            self.assertEqual(out.get("comments_count"), 1)
+
 
 if __name__ == "__main__":
     unittest.main()
-
