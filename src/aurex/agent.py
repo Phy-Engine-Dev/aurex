@@ -954,6 +954,59 @@ class AurexAgent:
             return "", ""
         return ttype, tid
 
+    def _infer_local_get_target_context_args(self, *, step_hint: str, user_text: str) -> dict[str, Any] | None:
+        """Best-effort args builder for local_get_target_context.
+
+        Used to recover from executor mistakes (e.g. calling tool=end for a local context step).
+        """
+        hint = str(step_hint or "").strip()
+
+        # Prefer CONTEXT_JSON when available (most reliable).
+        ctx_type, ctx_id = self._extract_context_target(user_text or "")
+
+        take: int | None = None
+        m_take = re.search(r"\\btake\\s*[:=]\\s*(\\d+)\\b", hint)
+        if m_take:
+            try:
+                take = int(m_take.group(1))
+            except Exception:
+                take = None
+        if take is not None:
+            if take <= 0:
+                take = 20
+            if take > 200:
+                take = 200
+
+        args: dict[str, Any] = {}
+        if take is not None:
+            args["take"] = take
+
+        if ctx_type and ctx_id:
+            args["target_key"] = f"{ctx_type}:{ctx_id}"
+            return args
+
+        # Next: parse from hint.
+        m_key = re.search(r'target_key\\s*[:=]\\s*"([^"]+)"', hint)
+        if not m_key:
+            m_key = re.search(r"\\btarget_key\\s*[:=]\\s*([^\\s,]+)", hint)
+        if m_key:
+            key = str(m_key.group(1) or "").strip()
+            if key:
+                args["target_key"] = key
+                return args
+
+        m_type = re.search(r"\\btarget_type\\s*[:=]\\s*(User|Experiment|Discussion)\\b", hint)
+        m_id = re.search(r"\\btarget_id\\s*[:=]\\s*([0-9a-zA-Z]{1,64})\\b", hint)
+        if m_type and m_id:
+            ttype = str(m_type.group(1) or "").strip()
+            tid = str(m_id.group(1) or "").strip()
+            if ttype and tid:
+                args["target_type"] = ttype
+                args["target_id"] = tid
+                return args
+
+        return None
+
     def _extract_context_comment_author(self, user_text: str) -> tuple[str, str]:
         """Extract (author_id, author_nickname) from the leading CONTEXT_JSON if present."""
         s = (user_text or "").strip()
@@ -1933,6 +1986,9 @@ class AurexAgent:
                 step.tool,
                 truncate(step.hint, max_chars=240),
             )
+            is_prefetch_local_context = (
+                step.tool == "local_get_target_context" and "prefetch" in str(step.hint or "").casefold()
+            )
             step_msg = {
                 "task_id": plan.task_id,
                 "step_id": step.id,
@@ -1999,15 +2055,45 @@ class AurexAgent:
                 )
 
                 if tool_name == "end":
-                    end_final = str(tool_args.get("final") or "").strip()
-                    self.logger.info(
-                        "[task=%s] step=%s end called final=%r",
-                        plan.task_id,
-                        step.id,
-                        truncate(end_final, max_chars=400),
-                    )
-                    stop_execution = True
-                    break
+                    # Recovery: the executor sometimes wrongly ends on local context prefetch steps.
+                    if step.tool == "local_get_target_context":
+                        inferred = self._infer_local_get_target_context_args(step_hint=step.hint, user_text=user_text)
+                        if inferred is not None:
+                            self.logger.warning(
+                                "[task=%s] step=%s executor ended early for local_get_target_context; overriding with inferred args",
+                                plan.task_id,
+                                step.id,
+                            )
+                            tool_name = step.tool
+                            tool_args = inferred
+                        elif is_prefetch_local_context:
+                            # Prefetch is best-effort and should never block other tasks (e.g. publish pipeline).
+                            self.logger.warning(
+                                "[task=%s] step=%s skipping failed local context prefetch (executor called end)",
+                                plan.task_id,
+                                step.id,
+                            )
+                            break
+                        else:
+                            end_final = str(tool_args.get("final") or "").strip()
+                            self.logger.info(
+                                "[task=%s] step=%s end called final=%r",
+                                plan.task_id,
+                                step.id,
+                                truncate(end_final, max_chars=400),
+                            )
+                            stop_execution = True
+                            break
+                    else:
+                        end_final = str(tool_args.get("final") or "").strip()
+                        self.logger.info(
+                            "[task=%s] step=%s end called final=%r",
+                            plan.task_id,
+                            step.id,
+                            truncate(end_final, max_chars=400),
+                        )
+                        stop_execution = True
+                        break
 
                 if tool_name != step.tool:
                     # Give a single corrective retry, then fail.
@@ -2520,6 +2606,14 @@ class AurexAgent:
                     truncate(tr.error, max_chars=800),
                 )
                 history.append(message("user", "TOOL_RESULT:\n" + dumps_compact(tr.__dict__, max_chars=8000)))
+                if is_prefetch_local_context:
+                    # Best-effort prefetch should not abort the rest of the plan.
+                    self.logger.warning(
+                        "[task=%s] step=%s local context prefetch failed; continuing without it",
+                        plan.task_id,
+                        step.id,
+                    )
+                    break
                 if step_attempt >= max_step_attempts:
                     self.logger.error(
                         "[task=%s] step=%s failed after %d attempt(s); stopping execution",

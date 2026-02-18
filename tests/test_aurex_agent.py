@@ -307,6 +307,70 @@ class TestAurexAgent(unittest.TestCase):
         self.assertEqual(out["tool_results"][0].data["target_type"], "User")
         self.assertEqual(out["tool_results"][0].data["target_id"], "u1")
 
+    def test_local_context_prefetch_end_does_not_abort_execution(self):
+        reg = ToolRegistry()
+
+        def _local_ctx(_rt: ToolRuntime, args: dict) -> dict:
+            return {
+                "target_key": args.get("target_key"),
+                "take": args.get("take"),
+            }
+
+        reg.register(
+            ToolSpec(
+                name="local_get_target_context",
+                description="",
+                parameters={"type": "object", "properties": {}, "required": []},
+                handler=_local_ctx,
+            )
+        )
+
+        def echo_tool(_rt, args):
+            return {"echo": args}
+
+        reg.register(
+            ToolSpec(
+                name="echo",
+                description="",
+                parameters={"type": "object", "properties": {"x": {"type": "integer"}}, "required": ["x"]},
+                handler=echo_tool,
+            )
+        )
+        reg.register(
+            ToolSpec(
+                name="end",
+                description="",
+                parameters={"type": "object", "properties": {"final": {"type": "string"}}, "required": ["final"]},
+                handler=lambda _rt, args: {"final": args.get("final", "")},
+            )
+        )
+
+        agent = _mk_agent(
+            planner_resps=[
+                OllamaChatResponse(
+                    content='{"task_id":"TPF","user_lang":"zh","goal":"g","steps":[{"id":"s1","tool":"echo","hint":"x=1"}]}',
+                    tool_calls=[],
+                    raw={},
+                ),
+                OllamaChatResponse(content="ok", tool_calls=[], raw={}),
+            ],
+            executor_resps=[
+                # BUG: executor incorrectly ends early on a prefetched local context step.
+                OllamaChatResponse(content='{"tool":"end","args":{"final":"需要用户ID"}}', tool_calls=[], raw={}),
+                OllamaChatResponse(
+                    content="",
+                    tool_calls=[{"function": {"name": "echo", "arguments": {"x": 1}}}],
+                    raw={},
+                ),
+            ],
+            registry=reg,
+        )
+
+        out = agent.handle(user_text='CONTEXT_JSON:\n{"target":{"type":"User","id":"u1"}}\n\n解释一下全加器')
+        self.assertEqual(out["answer"], "ok")
+        self.assertGreaterEqual(len(out["tool_results"]), 1)
+        self.assertTrue(any(tr.ok and tr.step_id == "s1" and tr.data.get("echo", {}).get("x") == 1 for tr in out["tool_results"]))
+
     def test_execute_retries_same_step_on_tool_error(self):
         reg = ToolRegistry()
 
