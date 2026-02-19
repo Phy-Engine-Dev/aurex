@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import os
+import re
+import shutil
 import subprocess
 import tempfile
 from typing import Any
@@ -65,18 +67,15 @@ def verilog_to_sav(runtime: ToolRuntime, args: dict[str, Any]) -> dict[str, str]
     if not verilog.strip():
         raise ToolError("verilog_to_sav: verilog is empty")
 
-    out_path = str(args.get("out_sav_path") or "").strip()
-    if out_path:
-        out_sav = _resolve(runtime, out_path)
-    else:
-        os.makedirs(runtime.cache_dir, exist_ok=True)
-        fd, out_sav = tempfile.mkstemp(prefix="aurex_", suffix=".sav", dir=runtime.cache_dir)
-        os.close(fd)
+    # Security: always write .sav into runtime.cache_dir; never allow arbitrary output paths.
+    os.makedirs(runtime.cache_dir, exist_ok=True)
+    fd, out_sav_tmp = tempfile.mkstemp(prefix="aurex_", suffix=".sav", dir=runtime.cache_dir)
+    os.close(fd)
 
     force_build = bool(args.get("force_build") or False)
     v2p, _lib = _ensure_artifacts(runtime, force_build=force_build)
 
-    os.makedirs(os.path.dirname(out_sav) or ".", exist_ok=True)
+    os.makedirs(os.path.dirname(out_sav_tmp) or ".", exist_ok=True)
     with tempfile.TemporaryDirectory(dir=runtime.cache_dir) as td:
         in_v = os.path.join(td, "in.v")
         with open(in_v, "w", encoding="utf-8") as f:
@@ -84,7 +83,7 @@ def verilog_to_sav(runtime: ToolRuntime, args: dict[str, Any]) -> dict[str, str]
             if not verilog.endswith("\n"):
                 f.write("\n")
 
-        cmd = [v2p, out_sav, in_v] + list(runtime.config.phy_engine.verilog2plsav_args)
+        cmd = [v2p, out_sav_tmp, in_v] + list(runtime.config.phy_engine.verilog2plsav_args)
         try:
             subprocess.run(cmd, check=True, capture_output=True, text=True, timeout=int(runtime.config.phy_engine.run_timeout_sec))
         except subprocess.TimeoutExpired as e:
@@ -93,7 +92,21 @@ def verilog_to_sav(runtime: ToolRuntime, args: dict[str, Any]) -> dict[str, str]
             msg = (e.stderr or e.stdout or "").strip()
             raise ToolError(f"verilog2plsav failed: {msg}") from e
 
-    return {"sav_path": out_sav}
+    # Stage the sav under cache_dir with a task-scoped, deterministic name.
+    task_id = str(getattr(runtime, "task_id", "") or "").strip() or "task"
+    safe_task = re.sub(r"[^A-Za-z0-9_.-]+", "_", task_id)[:120].strip("._-") or "task"
+    staged_dir = os.path.join(runtime.cache_dir, "staged_sav")
+    os.makedirs(staged_dir, exist_ok=True)
+    staged_sav = os.path.join(staged_dir, f"{safe_task}.sav")
+    try:
+        shutil.move(out_sav_tmp, staged_sav)
+    except Exception:
+        try:
+            shutil.copy2(out_sav_tmp, staged_sav)
+            os.remove(out_sav_tmp)
+        except Exception as e:
+            raise ToolError(f"verilog_to_sav: failed to stage .sav into cache: {type(e).__name__}: {e}") from e
+    return {"sav_path": staged_sav}
 
 
 _ANALYZE_TYPES = {"op": 0, "dc": 1, "ac": 2, "acop": 3, "tr": 4, "trop": 5}

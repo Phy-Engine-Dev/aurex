@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import os
 import re
+import shutil
 from typing import Any
 
 import plar
@@ -719,9 +721,26 @@ def plar_get_status_save(runtime: ToolRuntime, args: dict[str, Any]) -> dict[str
 
 def plar_upload_sav(runtime: ToolRuntime, args: dict[str, Any]) -> dict[str, Any]:
     user = _require_user(runtime)
-    sav_path = str(args.get("sav_path") or "").strip()
-    if not sav_path:
-        raise ToolError("plar_upload_sav: sav_path is required")
+    # Security: ignore any provided sav_path; only allow publishing the task-staged cache sav
+    # created by `verilog_to_sav` under runtime.cache_dir/staged_sav/<task_id>.sav.
+    task_id = str(getattr(runtime, "task_id", "") or "").strip() or "task"
+    safe_task = re.sub(r"[^A-Za-z0-9_.-]+", "_", task_id)[:120].strip("._-") or "task"
+    staged_dir = os.path.join(runtime.cache_dir, "staged_sav")
+    sav_path = os.path.join(staged_dir, f"{safe_task}.sav")
+    if not os.path.isfile(sav_path):
+        raise ToolError("plar_upload_sav: no staged .sav found for this task (run verilog_to_sav first)")
+    try:
+        real_staged = os.path.realpath(staged_dir) + os.sep
+        real_sav = os.path.realpath(sav_path)
+        if not real_sav.startswith(real_staged):
+            raise ToolError("plar_upload_sav: staged .sav path escapes cache_dir (refusing)")
+        if os.path.islink(sav_path):
+            raise ToolError("plar_upload_sav: staged .sav must not be a symlink")
+    except ToolError:
+        raise
+    except Exception:
+        # Best-effort; if filesystem checks fail, proceed with caution.
+        pass
     title = str(args.get("title") or "").strip()
     introduction = str(args.get("introduction") or "").strip()
     # NOTE: In aurex2, auto-publish is forced to the Discussion area.
@@ -758,6 +777,20 @@ def plar_upload_sav(runtime: ToolRuntime, args: dict[str, Any]) -> dict[str, Any
         out["reply_suggestion_zh"] = f"您要的讨论 {discussion_tag} 已经发布！"
     elif summary_id:
         out["reply_suggestion_zh"] = f"已发布到讨论区（Discussion），ID：{summary_id}"
+
+    # Archive the staged sav after publish (avoid leaving it in the active staging area).
+    try:
+        archive_dir = os.path.join(runtime.cache_dir, "log", "published_sav")
+        os.makedirs(archive_dir, exist_ok=True)
+        suffix = summary_id if summary_id else "unknown"
+        archive_name = f"{safe_task}_{suffix}.sav"
+        archive_name = re.sub(r"[^A-Za-z0-9_.-]+", "_", archive_name)[:160] or "published.sav"
+        archive_path = os.path.join(archive_dir, archive_name)
+        shutil.move(sav_path, archive_path)
+        out["sav_archived"] = True
+        out["sav_archive_name"] = archive_name
+    except Exception:
+        out["sav_archived"] = False
     return out
 
 
@@ -922,17 +955,17 @@ PLAR_STATUS_SAVE_TOOL = {
 
 PLAR_UPLOAD_SAV_TOOL = {
     "name": "plar_upload_sav",
-    "description": "Upload a local .sav to PhysicsLab and confirm it (forced to Discussion in aurex2).",
+    "description": "Upload the task-staged cached .sav to PhysicsLab and confirm it (forced to Discussion in aurex2).",
     "parameters": {
         "type": "object",
         "properties": {
-            "sav_path": {"type": "string"},
+            "sav_path": {"type": ["string", "null"], "description": "Ignored (publishes only the staged cache .sav for this task)."},
             "title": {"type": "string"},
             "introduction": {"type": "string"},
             "category": {"type": "string", "enum": ["Experiment", "Discussion"], "default": "Discussion"},
             "tags": {"type": ["array", "null"], "items": {"type": "string"}},
         },
-        "required": ["sav_path", "title", "introduction"],
+        "required": ["title", "introduction"],
     },
 }
 

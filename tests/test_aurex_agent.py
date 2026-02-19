@@ -1498,7 +1498,7 @@ class TestAurexAgent(unittest.TestCase):
             return {"title": "T", "introduction": "Intro", "tags": ["数字电路", "Verilog"]}
 
         def _upload(_rt: ToolRuntime, args: dict) -> dict:
-            self.assertEqual(args.get("sav_path"), "out.sav")
+            self.assertFalse("sav_path" in args)
             self.assertEqual(args.get("title"), "T")
             self.assertEqual(args.get("introduction"), "Intro")
             self.assertEqual(args.get("tags"), ["数字电路", "Verilog"])
@@ -1567,7 +1567,7 @@ class TestAurexAgent(unittest.TestCase):
             return {"title": "T", "introduction": "Intro", "tags": ["x"]}
 
         def _upload(_rt: ToolRuntime, args: dict) -> dict:
-            self.assertEqual(args.get("sav_path"), "out.sav")
+            self.assertFalse("sav_path" in args)
             return {"ok": True}
 
         reg.register(ToolSpec(name="llm_generate_verilog", description="", parameters={"type": "object", "properties": {}}, handler=_gen_v))
@@ -1602,6 +1602,64 @@ class TestAurexAgent(unittest.TestCase):
         self.assertIsNone(end_final)
         self.assertEqual(len(tool_results), 4)
         self.assertTrue(all(tr.ok for tr in tool_results))
+
+    def test_publish_confirmation_prefixes_discussion_tag_in_final_answer(self):
+        reg = ToolRegistry()
+
+        def _gen_v(_rt: ToolRuntime, _args: dict) -> dict:
+            return {"verilog": "module top; endmodule", "top_module": "top"}
+
+        def _v2sav(_rt: ToolRuntime, _args: dict) -> dict:
+            return {"sav_path": "out.sav"}
+
+        def _write(_rt: ToolRuntime, _args: dict) -> dict:
+            return {"title": "T", "introduction": "Intro", "tags": ["x"]}
+
+        def _upload(_rt: ToolRuntime, _args: dict) -> dict:
+            return {
+                "published": True,
+                "category": "Discussion",
+                "discussion_id": "a" * 24,
+                "discussion_tag": f"<discussion={'a' * 24}>RRR：为什么我们看到的天空是蓝色的</discussion>",
+                "reply_suggestion_zh": f"您要的讨论 <discussion={'a' * 24}>RRR：为什么我们看到的天空是蓝色的</discussion> 已经发布！",
+            }
+
+        reg.register(ToolSpec(name="llm_generate_verilog", description="", parameters={"type": "object", "properties": {}}, handler=_gen_v))
+        reg.register(ToolSpec(name="verilog_to_sav", description="", parameters={"type": "object", "properties": {}}, handler=_v2sav))
+        reg.register(ToolSpec(name="llm_write_publish_text", description="", parameters={"type": "object", "properties": {}}, handler=_write))
+        reg.register(ToolSpec(name="plar_upload_sav", description="", parameters={"type": "object", "properties": {}}, handler=_upload))
+        reg.register(
+            ToolSpec(
+                name="end",
+                description="",
+                parameters={"type": "object", "properties": {"final": {"type": "string"}}, "required": ["final"]},
+                handler=lambda _rt, args: {"final": args.get("final", "")},
+            )
+        )
+
+        agent = _mk_agent(
+            planner_resps=[
+                OllamaChatResponse(
+                    content='{"task_id":"TPUBX","user_lang":"zh","goal":"g","steps":[{"id":"s1","tool":"llm_generate_verilog","hint":"x"},{"id":"s2","tool":"verilog_to_sav","hint":"x"},{"id":"s3","tool":"llm_write_publish_text","hint":"x"},{"id":"s4","tool":"plar_upload_sav","hint":"x"}]}',
+                    tool_calls=[],
+                    raw={},
+                ),
+                # writer output (does NOT mention the discussion tag)
+                OllamaChatResponse(content="已完成。", tool_calls=[], raw={}),
+            ],
+            executor_resps=[
+                OllamaChatResponse(content="", tool_calls=[{"function": {"name": "llm_generate_verilog", "arguments": {}}}], raw={}),
+                OllamaChatResponse(content="", tool_calls=[{"function": {"name": "verilog_to_sav", "arguments": {}}}], raw={}),
+                OllamaChatResponse(content="", tool_calls=[{"function": {"name": "llm_write_publish_text", "arguments": {}}}], raw={}),
+                OllamaChatResponse(content="", tool_calls=[{"function": {"name": "plar_upload_sav", "arguments": {}}}], raw={}),
+            ],
+            registry=reg,
+        )
+
+        out = agent.handle(user_text="CONTEXT_JSON:\n{}\n\n请发布一个实验：test")
+        ans = str(out.get("answer") or "")
+        self.assertTrue(ans.startswith("您要的讨论 <discussion="))
+        self.assertTrue("<discussion=" in ans)
 
 
 if __name__ == "__main__":

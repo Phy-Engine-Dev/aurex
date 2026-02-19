@@ -1,5 +1,6 @@
 import os
 import sys
+import tempfile
 import unittest
 from unittest import mock
 
@@ -17,7 +18,7 @@ from aurex.tools.plar_tools import (
     plar_query_experiments,
     plar_upload_sav,
 )  # noqa: E402
-from aurex.tools.registry import ToolRuntime  # noqa: E402
+from aurex.tools.registry import ToolError, ToolRuntime  # noqa: E402
 
 
 class TestPlarOldestByUserTool(unittest.TestCase):
@@ -235,43 +236,85 @@ class TestPlarUploadSavTool(unittest.TestCase):
         )
 
     def test_forces_discussion_and_returns_discussion_tag(self):
-        rt = self._rt()
-        calls: list[dict] = []
+        with tempfile.TemporaryDirectory() as td:
+            staged_dir = os.path.join(td, "staged_sav")
+            os.makedirs(staged_dir, exist_ok=True)
+            staged = os.path.join(staged_dir, "T.sav")
+            with open(staged, "wb") as f:
+                f.write(b"x")
 
-        def fake_upload(*, user, sav_path: str, title: str, introduction: str, cache_dir: str, category_value: str, tags=None):
-            calls.append(
-                {
-                    "sav_path": sav_path,
-                    "title": title,
-                    "introduction": introduction,
-                    "cache_dir": cache_dir,
-                    "category_value": category_value,
-                    "tags": tags,
-                }
-            )
-            return {"summary_id": "a" * 24, "category": category_value}
-
-        with mock.patch("aurex.tools.plar_tools.plar.upload_sav_as_experiment", side_effect=fake_upload):
-            out = plar_upload_sav(
-                rt,
-                {
-                    "sav_path": "x.sav",
-                    "title": "RRR：为什么我们看到的天空是蓝色的",
-                    "introduction": "Intro",
-                    "category": "Experiment",
-                    "tags": ["物理"],
-                },
+            rt = ToolRuntime(
+                task_id="T",
+                user_lang="zh",
+                config_path=os.path.join(ROOT, "dummy.json"),
+                config=AurexConfig(),
+                cache_dir=td,
+                user=object(),
+                planner_client=None,
             )
 
-        self.assertEqual(calls[0]["category_value"], "Discussion")
-        self.assertTrue(out.get("published"))
-        self.assertEqual(out.get("category"), "Discussion")
-        self.assertEqual(out.get("discussion_id"), "a" * 24)
-        self.assertEqual(
-            out.get("discussion_tag"),
-            f"<discussion={'a' * 24}>RRR：为什么我们看到的天空是蓝色的</discussion>",
-        )
-        self.assertTrue("<discussion=" in str(out.get("reply_suggestion_zh") or ""))
+            calls: list[dict] = []
+
+            def fake_upload(*, user, sav_path: str, title: str, introduction: str, cache_dir: str, category_value: str, tags=None):
+                calls.append(
+                    {
+                        "sav_path": sav_path,
+                        "title": title,
+                        "introduction": introduction,
+                        "cache_dir": cache_dir,
+                        "category_value": category_value,
+                        "tags": tags,
+                    }
+                )
+                return {"summary_id": "a" * 24, "category": category_value}
+
+            with mock.patch("aurex.tools.plar_tools.plar.upload_sav_as_experiment", side_effect=fake_upload):
+                out = plar_upload_sav(
+                    rt,
+                    {
+                        "sav_path": "/definitely/not/used.sav",
+                        "title": "RRR：为什么我们看到的天空是蓝色的",
+                        "introduction": "Intro",
+                        "category": "Experiment",
+                        "tags": ["物理"],
+                    },
+                )
+
+            self.assertEqual(calls[0]["category_value"], "Discussion")
+            self.assertEqual(calls[0]["sav_path"], staged)
+            self.assertTrue(out.get("published"))
+            self.assertEqual(out.get("category"), "Discussion")
+            self.assertEqual(out.get("discussion_id"), "a" * 24)
+            self.assertEqual(
+                out.get("discussion_tag"),
+                f"<discussion={'a' * 24}>RRR：为什么我们看到的天空是蓝色的</discussion>",
+            )
+            self.assertTrue("<discussion=" in str(out.get("reply_suggestion_zh") or ""))
+            self.assertTrue(bool(out.get("sav_archived")))
+            self.assertTrue(isinstance(out.get("sav_archive_name"), str) and out.get("sav_archive_name"))
+            self.assertTrue(os.path.isfile(os.path.join(td, "log", "published_sav", str(out.get("sav_archive_name") or ""))))
+
+    def test_requires_staged_cache_sav(self):
+        with tempfile.TemporaryDirectory() as td:
+            rt = ToolRuntime(
+                task_id="T",
+                user_lang="zh",
+                config_path=os.path.join(ROOT, "dummy.json"),
+                config=AurexConfig(),
+                cache_dir=td,
+                user=object(),
+                planner_client=None,
+            )
+            with self.assertRaises(ToolError):
+                plar_upload_sav(
+                    rt,
+                    {
+                        "sav_path": "/definitely/not/found.sav",
+                        "title": "T",
+                        "introduction": "I",
+                        "category": "Experiment",
+                    },
+                )
 
 
 class TestPlarGetOldestCommentTool(unittest.TestCase):

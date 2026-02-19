@@ -910,6 +910,64 @@ class AurexAgent:
                 return title, intro, tags_list
         return "", "", []
 
+    def _redact_tool_result_for_llm(self, tr: ToolResult, *, tool_name: str) -> dict[str, Any]:
+        """Redact sensitive local paths from tool results before showing them to LLMs."""
+        d = {
+            "task_id": getattr(tr, "task_id", ""),
+            "step_id": getattr(tr, "step_id", ""),
+            "ok": bool(getattr(tr, "ok", False)),
+            "data": getattr(tr, "data", None),
+            "error": getattr(tr, "error", None),
+        }
+        data = d.get("data")
+        if isinstance(data, dict):
+            data2 = dict(data)
+            # Hide local filesystem paths (LLM must never be able to steer file access).
+            for k in ("sav_path", "out_sav_path", "used_sav_path", "path"):
+                if k in data2:
+                    data2.pop(k, None)
+            d["data"] = data2
+        if isinstance(d.get("error"), str):
+            # Avoid leaking local absolute paths in errors (best effort).
+            err = str(d["error"] or "")
+            err = re.sub(r"\"/(?:[^\"\\n]+)\"", "\"<redacted>\"", err)
+            d["error"] = err
+        return d
+
+    def _try_build_publish_success_brief(self, *, user_lang: str, plan: Plan, tool_results: list[ToolResult]) -> str:
+        """If a publish succeeded, return a short plain-text confirmation line (best-effort)."""
+        step_tool_by_id = {s.id: s.tool for s in (plan.steps or [])}
+        for tr in reversed(tool_results or []):
+            if not getattr(tr, "ok", False):
+                continue
+            if step_tool_by_id.get(getattr(tr, "step_id", "")) != "plar_upload_sav":
+                continue
+            data = getattr(tr, "data", None)
+            if not isinstance(data, dict):
+                continue
+
+            lang = (user_lang or "en").strip().lower()
+            if lang.startswith("zh"):
+                s = str(data.get("reply_suggestion_zh") or "").strip()
+                if s:
+                    return s
+                tag = str(data.get("discussion_tag") or "").strip()
+                if tag:
+                    return f"您要的讨论 {tag} 已经发布！"
+                did = str(data.get("discussion_id") or data.get("summary_id") or "").strip()
+                if did and self._HEX24_FULL_RE.fullmatch(did):
+                    return f"已发布到讨论区（Discussion），ID：{did}"
+                return ""
+
+            tag = str(data.get("discussion_tag") or "").strip()
+            if tag:
+                return f"Published: {tag}"
+            did = str(data.get("discussion_id") or data.get("summary_id") or "").strip()
+            if did and self._HEX24_FULL_RE.fullmatch(did):
+                return f"Published to Discussion (ID: {did})"
+            return ""
+        return ""
+
     def _resolve_step_ref(self, tool_results: list[ToolResult], *, step_id: str, path: str) -> Any | None:
         data: Any | None = None
         for tr in reversed(tool_results or []):
@@ -2645,17 +2703,8 @@ class AurexAgent:
                     if tool_name == "plar_upload_sav":
                         if not isinstance(tool_args, dict):
                             tool_args = {}
-                        sav_path = str(tool_args.get("sav_path") or "").strip()
-                        if sav_path.casefold() in ("your_file_path_here", "path/to/your_file.sav", "path/to/file.sav"):
-                            sav_path = ""
-                            tool_args.pop("sav_path", None)
-                        if self._has_unresolved_step_refs(sav_path):
-                            sav_path = ""
-                            tool_args.pop("sav_path", None)
-                        if not sav_path:
-                            p_prev = self._try_extract_sav_path_from_results(results)
-                            if p_prev:
-                                tool_args["sav_path"] = p_prev
+                        # Security: the upload tool must not receive any caller-provided path.
+                        tool_args.pop("sav_path", None)
                         title = str(tool_args.get("title") or "").strip()
                         if self._has_unresolved_step_refs(title):
                             title = ""
@@ -2725,7 +2774,12 @@ class AurexAgent:
                     )
                     if tool_name in _PUBLISH_TOOLS:
                         publish_successes += 1
-                    history.append(message("user", "TOOL_RESULT:\n" + dumps_compact(tr.__dict__, max_chars=8000)))
+                    history.append(
+                        message(
+                            "user",
+                            "TOOL_RESULT:\n" + dumps_compact(self._redact_tool_result_for_llm(tr, tool_name=tool_name), max_chars=8000),
+                        )
+                    )
                     break
 
                 self.logger.error(
@@ -2734,7 +2788,12 @@ class AurexAgent:
                     step.id,
                     truncate(tr.error, max_chars=800),
                 )
-                history.append(message("user", "TOOL_RESULT:\n" + dumps_compact(tr.__dict__, max_chars=8000)))
+                history.append(
+                    message(
+                        "user",
+                        "TOOL_RESULT:\n" + dumps_compact(self._redact_tool_result_for_llm(tr, tool_name=tool_name), max_chars=8000),
+                    )
+                )
                 if is_prefetch_local_context:
                     # Best-effort prefetch should not abort the rest of the plan.
                     self.logger.warning(
@@ -2812,11 +2871,15 @@ class AurexAgent:
             mention_tag=self.cfg.agent.mention_tag,
         )
         visible = self._extract_user_visible_text(user_text or "")
+        step_tool_by_id = {s.id: s.tool for s in (plan.steps or [])}
         brief = {
             "task_id": plan.task_id,
             "goal": plan.goal,
             "steps": [{"id": s.id, "tool": s.tool, "hint": s.hint} for s in plan.steps],
-            "tool_results": [tr.__dict__ for tr in tool_results],
+            "tool_results": [
+                self._redact_tool_result_for_llm(tr, tool_name=str(step_tool_by_id.get(tr.step_id, "") or ""))
+                for tr in tool_results
+            ],
         }
         prompt = (
             "用户可见文本：\n"
@@ -2879,11 +2942,15 @@ class AurexAgent:
             mention_tag=self.cfg.agent.mention_tag,
         )
         visible = self._extract_user_visible_text(user_text or "")
+        step_tool_by_id = {s.id: s.tool for s in (plan.steps or [])}
         brief = {
             "task_id": plan.task_id,
             "goal": plan.goal,
             "steps": [{"id": s.id, "tool": s.tool, "hint": s.hint} for s in plan.steps],
-            "tool_results": [tr.__dict__ for tr in tool_results],
+            "tool_results": [
+                self._redact_tool_result_for_llm(tr, tool_name=str(step_tool_by_id.get(tr.step_id, "") or ""))
+                for tr in tool_results
+            ],
         }
         prompt = (
             "用户可见文本：\n"
@@ -3003,6 +3070,15 @@ class AurexAgent:
                 user_lang_hint=plan.user_lang or user_lang_hint,
                 task_id=tid,
             )
+
+        # Prefer a deterministic publish confirmation when the publish tool succeeded.
+        pub_brief = self._try_build_publish_success_brief(
+            user_lang=plan.user_lang or user_lang_hint,
+            plan=plan,
+            tool_results=tool_results,
+        )
+        if pub_brief and "<discussion=" not in (answer or ""):
+            answer = (pub_brief + ("\n\n" + answer if (answer or "").strip() else "")).strip()
 
         # Deterministic correction: "我的ID是什么" must refer to the current comment author, not the wall owner (target.id).
         if ctx_author_id and self._looks_like_my_id_query(visible):
