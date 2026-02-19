@@ -366,7 +366,7 @@ class TestAurexAgent(unittest.TestCase):
             registry=reg,
         )
 
-        out = agent.handle(user_text='CONTEXT_JSON:\n{"target":{"type":"User","id":"u1"}}\n\n解释一下全加器')
+        out = agent.handle(user_text='CONTEXT_JSON:\n{"target":{"type":"User","id":"u1"}}\n\n留言板咋样')
         self.assertEqual(out["answer"], "ok")
         self.assertGreaterEqual(len(out["tool_results"]), 1)
         self.assertTrue(any(tr.ok and tr.step_id == "s1" and tr.data.get("echo", {}).get("x") == 1 for tr in out["tool_results"]))
@@ -422,7 +422,93 @@ class TestAurexAgent(unittest.TestCase):
         )
         out = agent.handle(user_text="run")
         self.assertEqual(out["answer"], "ok")
+
+    def test_fact_lookup_query_forces_web_search_when_planner_returns_no_steps(self):
+        reg = ToolRegistry()
+
+        reg.register(
+            ToolSpec(
+                name="web_search",
+                description="",
+                parameters={"type": "object", "properties": {}, "required": []},
+                handler=lambda _rt, _args: [{"title": "Human insulin", "url": "", "snippet": "molecular weight ~5808 Da"}],
+            )
+        )
+        reg.register(
+            ToolSpec(
+                name="end",
+                description="",
+                parameters={"type": "object", "properties": {"final": {"type": "string"}}, "required": ["final"]},
+                handler=lambda _rt, args: {"final": args.get("final", "")},
+            )
+        )
+
+        agent = _mk_agent(
+            planner_resps=[
+                OllamaChatResponse(content='{"task_id":"TFW","user_lang":"zh","goal":"g","steps":[]}', tool_calls=[], raw={}),
+                OllamaChatResponse(content="ok", tool_calls=[], raw={}),
+            ],
+            executor_resps=[
+                OllamaChatResponse(
+                    content="",
+                    tool_calls=[{"function": {"name": "web_search", "arguments": {"query": "人胰岛素 分子量"}}}],
+                    raw={},
+                )
+            ],
+            registry=reg,
+        )
+
+        out = agent.handle(
+            user_text='CONTEXT_JSON:\n{"target":{"type":"User","id":"u1"},"comment":{"id":"c1","author_id":"u2","author_nickname":"H2CO3"}}\n\n人胰岛素的分子量是多少'
+        )
+        self.assertEqual(out["answer"], "ok")
+        self.assertEqual([s.tool for s in out["plan"].steps], ["web_search"])
+        self.assertEqual(len(out["tool_results"]), 1)
+        self.assertTrue(out["tool_results"][0].ok)
         self.assertTrue(out["tool_results"][-1].ok)
+
+    def test_weather_query_forces_web_search_when_planner_returns_no_steps(self):
+        reg = ToolRegistry()
+
+        reg.register(
+            ToolSpec(
+                name="web_search",
+                description="",
+                parameters={"type": "object", "properties": {}, "required": []},
+                handler=lambda _rt, _args: [{"title": "Beijing weather", "url": "", "snippet": "Sunny 3°C"}],
+            )
+        )
+        reg.register(
+            ToolSpec(
+                name="end",
+                description="",
+                parameters={"type": "object", "properties": {"final": {"type": "string"}}, "required": ["final"]},
+                handler=lambda _rt, args: {"final": args.get("final", "")},
+            )
+        )
+
+        agent = _mk_agent(
+            planner_resps=[
+                OllamaChatResponse(content='{"task_id":"TFW2","user_lang":"zh","goal":"g","steps":[]}', tool_calls=[], raw={}),
+                OllamaChatResponse(content="ok", tool_calls=[], raw={}),
+            ],
+            executor_resps=[
+                OllamaChatResponse(
+                    content="",
+                    tool_calls=[{"function": {"name": "web_search", "arguments": {"query": "今日 北京 天气"}}}],
+                    raw={},
+                )
+            ],
+            registry=reg,
+        )
+
+        out = agent.handle(
+            user_text='CONTEXT_JSON:\n{"target":{"type":"User","id":"u1"},"comment":{"id":"c1","author_id":"u2","author_nickname":"H2CO3"}}\n\n今日北京天气怎么样'
+        )
+        self.assertEqual(out["answer"], "ok")
+        self.assertEqual([s.tool for s in out["plan"].steps], ["web_search"])
+        self.assertEqual(len(out["tool_results"]), 1)
+        self.assertTrue(out["tool_results"][0].ok)
 
     def test_execute_injects_featured_tag_for_query_experiments(self):
         reg = ToolRegistry()
@@ -1396,6 +1482,126 @@ class TestAurexAgent(unittest.TestCase):
         intro = str(upload_calls[-1].get("introduction") or "")
         self.assertTrue(intro.startswith(f"<user={author_id}>@MapMaths</user>\n\n"))
         self.assertEqual(upload_calls[-1].get("category"), "Experiment")
+
+    def test_executor_step_ref_placeholders_are_resolved_in_tool_args(self):
+        reg = ToolRegistry()
+
+        def _gen_v(_rt: ToolRuntime, _args: dict) -> dict:
+            return {"verilog": "module top; endmodule", "top_module": "top"}
+
+        def _v2sav(_rt: ToolRuntime, args: dict) -> dict:
+            self.assertEqual(str(args.get("verilog") or "").strip(), "module top; endmodule")
+            return {"sav_path": "out.sav"}
+
+        def _write(_rt: ToolRuntime, args: dict) -> dict:
+            self.assertEqual(str(args.get("verilog") or "").strip(), "module top; endmodule")
+            return {"title": "T", "introduction": "Intro", "tags": ["数字电路", "Verilog"]}
+
+        def _upload(_rt: ToolRuntime, args: dict) -> dict:
+            self.assertEqual(args.get("sav_path"), "out.sav")
+            self.assertEqual(args.get("title"), "T")
+            self.assertEqual(args.get("introduction"), "Intro")
+            self.assertEqual(args.get("tags"), ["数字电路", "Verilog"])
+            return {"ok": True}
+
+        reg.register(ToolSpec(name="llm_generate_verilog", description="", parameters={"type": "object", "properties": {}}, handler=_gen_v))
+        reg.register(ToolSpec(name="verilog_to_sav", description="", parameters={"type": "object", "properties": {}}, handler=_v2sav))
+        reg.register(ToolSpec(name="llm_write_publish_text", description="", parameters={"type": "object", "properties": {}}, handler=_write))
+        reg.register(ToolSpec(name="plar_upload_sav", description="", parameters={"type": "object", "properties": {}}, handler=_upload))
+
+        agent = _mk_agent(
+            planner_resps=[],
+            executor_resps=[
+                OllamaChatResponse(content="", tool_calls=[{"function": {"name": "llm_generate_verilog", "arguments": {"spec": "全加器", "top_module": "top"}}}], raw={}),
+                OllamaChatResponse(content="", tool_calls=[{"function": {"name": "verilog_to_sav", "arguments": {"verilog": "<s1.verilog>", "force_build": True}}}], raw={}),
+                OllamaChatResponse(content="", tool_calls=[{"function": {"name": "llm_write_publish_text", "arguments": {"topic": "全加器", "verilog": "<s1.verilog>"}}}], raw={}),
+                OllamaChatResponse(
+                    content="",
+                    tool_calls=[
+                        {
+                            "function": {
+                                "name": "plar_upload_sav",
+                                "arguments": {
+                                    "sav_path": "<s2.sav_path>",
+                                    "title": "<s3.title>",
+                                    "introduction": "<s3.introduction>",
+                                    "tags": "<s3.tags>",
+                                    "category": "Experiment",
+                                },
+                            }
+                        }
+                    ],
+                    raw={},
+                ),
+            ],
+            registry=reg,
+        )
+
+        plan = Plan(
+            task_id="Tref",
+            user_lang="zh",
+            goal="g",
+            steps=[
+                PlanStep(id="s1", tool="llm_generate_verilog", hint="spec=全加器"),
+                PlanStep(id="s2", tool="verilog_to_sav", hint="verilog=<s1.verilog>"),
+                PlanStep(id="s3", tool="llm_write_publish_text", hint="topic=全加器 verilog=<s1.verilog>"),
+                PlanStep(id="s4", tool="plar_upload_sav", hint="sav_path=<s2.sav_path> title/introduction/tags=<s3>"),
+            ],
+        )
+
+        tool_results, end_final = agent.execute(plan=plan, user_text="x", user=None, user_lang="zh")
+        self.assertIsNone(end_final)
+        self.assertEqual(len(tool_results), 4)
+        self.assertTrue(all(tr.ok for tr in tool_results))
+
+    def test_plar_upload_sav_overrides_obvious_dummy_sav_path(self):
+        reg = ToolRegistry()
+
+        def _gen_v(_rt: ToolRuntime, _args: dict) -> dict:
+            return {"verilog": "module top; endmodule", "top_module": "top"}
+
+        def _v2sav(_rt: ToolRuntime, _args: dict) -> dict:
+            return {"sav_path": "out.sav"}
+
+        def _write(_rt: ToolRuntime, _args: dict) -> dict:
+            return {"title": "T", "introduction": "Intro", "tags": ["x"]}
+
+        def _upload(_rt: ToolRuntime, args: dict) -> dict:
+            self.assertEqual(args.get("sav_path"), "out.sav")
+            return {"ok": True}
+
+        reg.register(ToolSpec(name="llm_generate_verilog", description="", parameters={"type": "object", "properties": {}}, handler=_gen_v))
+        reg.register(ToolSpec(name="verilog_to_sav", description="", parameters={"type": "object", "properties": {}}, handler=_v2sav))
+        reg.register(ToolSpec(name="llm_write_publish_text", description="", parameters={"type": "object", "properties": {}}, handler=_write))
+        reg.register(ToolSpec(name="plar_upload_sav", description="", parameters={"type": "object", "properties": {}}, handler=_upload))
+
+        agent = _mk_agent(
+            planner_resps=[],
+            executor_resps=[
+                OllamaChatResponse(content="", tool_calls=[{"function": {"name": "llm_generate_verilog", "arguments": {}}}], raw={}),
+                OllamaChatResponse(content="", tool_calls=[{"function": {"name": "verilog_to_sav", "arguments": {}}}], raw={}),
+                OllamaChatResponse(content="", tool_calls=[{"function": {"name": "llm_write_publish_text", "arguments": {}}}], raw={}),
+                OllamaChatResponse(content="", tool_calls=[{"function": {"name": "plar_upload_sav", "arguments": {"sav_path": "your_file_path_here"}}}], raw={}),
+            ],
+            registry=reg,
+        )
+
+        plan = Plan(
+            task_id="Tdum",
+            user_lang="zh",
+            goal="g",
+            steps=[
+                PlanStep(id="s1", tool="llm_generate_verilog", hint=""),
+                PlanStep(id="s2", tool="verilog_to_sav", hint=""),
+                PlanStep(id="s3", tool="llm_write_publish_text", hint=""),
+                PlanStep(id="s4", tool="plar_upload_sav", hint=""),
+            ],
+        )
+
+        tool_results, end_final = agent.execute(plan=plan, user_text="x", user=None, user_lang="zh")
+        self.assertIsNone(end_final)
+        self.assertEqual(len(tool_results), 4)
+        self.assertTrue(all(tr.ok for tr in tool_results))
 
 
 if __name__ == "__main__":

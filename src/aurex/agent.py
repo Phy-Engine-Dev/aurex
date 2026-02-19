@@ -465,6 +465,7 @@ class AurexAgent:
     _DISCUSSION_AREA_RE = re.compile(r"(讨论区|黑洞区|黑洞|discussion\\s*area)", re.IGNORECASE)
     _EXPERIMENT_AREA_RE = re.compile(r"(实验区|实验(?!室))", re.IGNORECASE)
     _HEX24_ANY_RE = re.compile(r"[0-9a-fA-F]{24}")
+    _STEP_REF_TOKEN_RE = re.compile(r"<([A-Za-z0-9_]+)(?:\.([A-Za-z0-9_.]+))?>")
     _OLDEST_COMMENT_QUERY_RE = re.compile(
         r"(最早|最先|第一条|首条).{0,8}(评论|留言)"
         r"|\\boldest\\b.{0,12}\\b(comment|message)\\b"
@@ -512,6 +513,36 @@ class AurexAgent:
         if not v:
             return False
         return self._MY_ID_QUERY_RE.search(v) is not None
+
+    def _looks_like_fact_lookup_query(self, visible_req: str) -> bool:
+        """Heuristic: user asks for a specific factual value that likely needs web lookup."""
+        v = (visible_req or "").strip()
+        if not v:
+            return False
+        # If the user is clearly asking about Physics Lab community data, we should use plar tools instead.
+        if self._COMMUNITY_DATA_NEEDS_LOOKUP_RE.search(v) is not None:
+            return False
+        # Biochem/chem: molecular weight, molar mass, etc.
+        if re.search(r"(相对分子质量|分子量|分子质量|摩尔质量|原子量|molecular\s*weight|molar\s*mass|atomic\s*weight)", v, re.IGNORECASE):
+            return True
+        # Weather: likely needs up-to-date web search (e.g., "今日北京天气", "Beijing weather today").
+        if re.search(r"(天气|weather)", v, re.IGNORECASE):
+            if re.search(
+                r"(今天|今日|现在|目前|实时|明天|后天|本周|未来|预报|"
+                r"forecast|temperature|temp|"
+                r"气温|温度|多少度|几度|℃|°c|°C|"
+                r"下雨|降雨|雨|雪|风|湿度|AQI|aqi|pm2\.5|PM2\.5)",
+                v,
+                re.IGNORECASE,
+            ):
+                return True
+            # Common Chinese pattern: "<place>天气" (e.g., 北京天气/上海天气).
+            if re.search(r"[\u4e00-\u9fff]{2,20}\s*天气", v):
+                return True
+            # Common English pattern: "weather <place>" / "<place> weather".
+            if re.search(r"\b\w+\s+weather\b|\bweather\s+\w+\b", v, re.IGNORECASE):
+                return True
+        return False
 
     def _looks_like_publish_request(self, visible_req: str) -> tuple[bool, str]:
         v = (visible_req or "").strip()
@@ -598,9 +629,19 @@ class AurexAgent:
             return False
         if self._looks_like_my_id_query(v):
             return False
-        # Default: when we're handling a reply/notification with CONTEXT_JSON, fetch recent context first.
-        # This improves answer quality for common follow-up questions, without relying on fragile heuristics.
-        return True
+        # Only prefetch when the request is likely about the current board/thread/context.
+        # Avoid wasting a tool step (and harming answer quality) for self-contained general questions.
+        if self._FORCE_LOCAL_CONTEXT_RE.search(v) is not None:
+            return True
+        if self._THIS_TARGET_REF_RE.search(v) is not None or self._THIS_USER_REF_RE.search(v) is not None:
+            return True
+        if re.search(
+            r"(留言板|评论区|评论|留言|实验|实验区|讨论|讨论区|作品|帖子|通知|消息|关注|粉丝|精选|发布|sav|User:|Experiment:|Discussion:|[0-9a-f]{24})",
+            v,
+            re.IGNORECASE,
+        ):
+            return True
+        return False
 
     def _try_build_follow_answer(self, *, user_lang: str, tool_results: list[ToolResult]) -> str:
         # Prefer the latest successful plar_check_following result.
@@ -868,6 +909,68 @@ class AurexAgent:
             if title or intro or tags_list:
                 return title, intro, tags_list
         return "", "", []
+
+    def _resolve_step_ref(self, tool_results: list[ToolResult], *, step_id: str, path: str) -> Any | None:
+        data: Any | None = None
+        for tr in reversed(tool_results or []):
+            if not getattr(tr, "ok", False):
+                continue
+            if str(getattr(tr, "step_id", "") or "").strip() != step_id:
+                continue
+            data = getattr(tr, "data", None)
+            break
+
+        if data is None:
+            return None
+        if not path:
+            return data
+
+        cur: Any = data
+        for seg in path.split("."):
+            if isinstance(cur, dict):
+                if seg not in cur:
+                    return None
+                cur = cur.get(seg)
+                continue
+            if isinstance(cur, list) and seg.isdigit():
+                i = int(seg)
+                if i < 0 or i >= len(cur):
+                    return None
+                cur = cur[i]
+                continue
+            return None
+        return cur
+
+    def _resolve_step_refs_in_obj(self, obj: Any, tool_results: list[ToolResult]) -> Any:
+        if isinstance(obj, dict):
+            return {k: self._resolve_step_refs_in_obj(v, tool_results) for k, v in obj.items()}
+        if isinstance(obj, list):
+            return [self._resolve_step_refs_in_obj(v, tool_results) for v in obj]
+        if isinstance(obj, str):
+            s = obj
+            m_full = self._STEP_REF_TOKEN_RE.fullmatch(s.strip())
+            if m_full:
+                step_id, path = m_full.group(1), m_full.group(2) or ""
+                resolved = self._resolve_step_ref(tool_results, step_id=step_id, path=path)
+                if resolved is not None:
+                    return resolved
+
+            def _repl(m: re.Match[str]) -> str:
+                step_id, path = m.group(1), m.group(2) or ""
+                resolved = self._resolve_step_ref(tool_results, step_id=step_id, path=path)
+                if resolved is None:
+                    return m.group(0)
+                if isinstance(resolved, (dict, list)):
+                    return dumps_compact(resolved, max_chars=8000)
+                return str(resolved)
+
+            return self._STEP_REF_TOKEN_RE.sub(_repl, s)
+        return obj
+
+    def _has_unresolved_step_refs(self, v: Any) -> bool:
+        if not isinstance(v, str):
+            return False
+        return self._STEP_REF_TOKEN_RE.search(v) is not None
 
     def _extract_user_visible_text(self, user_text: str) -> str:
         s = (user_text or "").strip()
@@ -1371,6 +1474,12 @@ class AurexAgent:
                         "hint": f"sav_path=<s2.sav_path>, title/introduction/tags=<s3>, category={cat}",
                     },
                 ]
+        elif (not steps_raw) and self._looks_like_fact_lookup_query(visible):
+            # Planner may output steps=[] for general questions, but the writer is not allowed to invent
+            # precise factual values. Ground it via web search.
+            self.logger.info("[task=%s] planning patched: using web_search for fact lookup", got_task_id)
+            goal = goal or visible
+            steps_raw = [{"id": "s1", "tool": "web_search", "hint": "query=<user request>, max_results=5"}]
         elif self._looks_like_this_user_query(visible_req=visible, ctx_target_type=ctx_type, ctx_target_id=ctx_id):
             wants_latest = self._LATEST_QUERY_RE.search(visible) is not None
             wants_hot = self._HOT_QUERY_RE.search(visible) is not None
@@ -2142,6 +2251,8 @@ class AurexAgent:
                     tool_name, tool_args = tool_name2, tool_args2
 
                 try:
+                    if isinstance(tool_args, (dict, list, str)):
+                        tool_args = self._resolve_step_refs_in_obj(tool_args, results)
                     if tool_name in _PUBLISH_TOOLS and publish_successes >= 1:
                         # Allow retries on failure, but never allow 2 successful publishes in a single session.
                         if user_lang == "zh":
@@ -2514,7 +2625,8 @@ class AurexAgent:
                     if tool_name == "verilog_to_sav":
                         if not isinstance(tool_args, dict):
                             tool_args = {}
-                        if not str(tool_args.get("verilog") or "").strip():
+                        verilog_in = str(tool_args.get("verilog") or "").strip()
+                        if (not verilog_in) or self._has_unresolved_step_refs(verilog_in):
                             v_prev = self._try_extract_verilog_from_results(results)
                             if v_prev:
                                 tool_args["verilog"] = v_prev
@@ -2525,20 +2637,37 @@ class AurexAgent:
                             tool_args = {}
                         if not str(tool_args.get("topic") or "").strip():
                             tool_args["topic"] = self._extract_user_visible_text(user_text or "")
-                        if not str(tool_args.get("verilog") or "").strip():
+                        verilog_in = str(tool_args.get("verilog") or "").strip()
+                        if (not verilog_in) or self._has_unresolved_step_refs(verilog_in):
                             v_prev = self._try_extract_verilog_from_results(results)
                             if v_prev:
                                 tool_args["verilog"] = v_prev
                     if tool_name == "plar_upload_sav":
                         if not isinstance(tool_args, dict):
                             tool_args = {}
-                        if not str(tool_args.get("sav_path") or "").strip():
+                        sav_path = str(tool_args.get("sav_path") or "").strip()
+                        if sav_path.casefold() in ("your_file_path_here", "path/to/your_file.sav", "path/to/file.sav"):
+                            sav_path = ""
+                            tool_args.pop("sav_path", None)
+                        if self._has_unresolved_step_refs(sav_path):
+                            sav_path = ""
+                            tool_args.pop("sav_path", None)
+                        if not sav_path:
                             p_prev = self._try_extract_sav_path_from_results(results)
                             if p_prev:
                                 tool_args["sav_path"] = p_prev
                         title = str(tool_args.get("title") or "").strip()
+                        if self._has_unresolved_step_refs(title):
+                            title = ""
+                            tool_args.pop("title", None)
                         intro = str(tool_args.get("introduction") or "").strip()
+                        if self._has_unresolved_step_refs(intro):
+                            intro = ""
+                            tool_args.pop("introduction", None)
                         tags0 = tool_args.get("tags")
+                        if isinstance(tags0, str) and self._has_unresolved_step_refs(tags0):
+                            tags0 = None
+                            tool_args.pop("tags", None)
                         if (not title) or (not intro) or tags0 is None:
                             t_prev, i_prev, tags_prev = self._try_extract_publish_text_from_results(results)
                             if (not title) and t_prev:

@@ -186,8 +186,62 @@ class AurexConfig:
             return ""
         if os.path.isabs(p):
             return p
-        base_dir = os.path.dirname(os.path.abspath(config_path))
-        return os.path.abspath(os.path.join(base_dir, p))
+        # Primary base: config file directory (legacy behavior).
+        base_cfg = os.path.dirname(os.path.abspath(config_path))
+        cand_cfg = os.path.abspath(os.path.join(base_cfg, p))
+
+        # Secondary base: current working directory.
+        #
+        # Many users keep configs under a repo-local ".config/" folder but still write
+        # paths relative to the repo root (cwd). If we only resolve relative to the
+        # config directory, common paths like "third-parties/..." become ".config/third-parties/..."
+        # and break builds.
+        base_cwd = os.getcwd()
+        cand_cwd = os.path.abspath(os.path.join(base_cwd, p))
+
+        if cand_cfg == cand_cwd:
+            return cand_cfg
+
+        def _exists(x: str) -> bool:
+            try:
+                return os.path.exists(x)
+            except Exception:
+                return False
+
+        cfg_exists = _exists(cand_cfg)
+        cwd_exists = _exists(cand_cwd)
+        if cfg_exists and not cwd_exists:
+            return cand_cfg
+        if cwd_exists and not cfg_exists:
+            return cand_cwd
+        if cfg_exists and cwd_exists:
+            # If both exist, keep legacy preference (config-dir).
+            return cand_cfg
+
+        # Neither exists: choose the candidate whose parent hierarchy matches the
+        # current filesystem better (i.e., fewer missing path segments).
+        def _missing_steps(x: str) -> int:
+            steps = 0
+            cur = x
+            # Hard cap to avoid pathological loops on strange paths.
+            while steps < 64:
+                if _exists(cur):
+                    break
+                parent = os.path.dirname(cur)
+                if not parent or parent == cur:
+                    break
+                cur = parent
+                steps += 1
+            return steps
+
+        ms_cfg = _missing_steps(cand_cfg)
+        ms_cwd = _missing_steps(cand_cwd)
+        if ms_cwd < ms_cfg:
+            return cand_cwd
+        if ms_cfg < ms_cwd:
+            return cand_cfg
+        # Tie-break: keep legacy behavior.
+        return cand_cfg
 
 
 def load_config(path: str) -> AurexConfig:

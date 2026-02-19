@@ -725,6 +725,10 @@ def plar_upload_sav(runtime: ToolRuntime, args: dict[str, Any]) -> dict[str, Any
     title = str(args.get("title") or "").strip()
     introduction = str(args.get("introduction") or "").strip()
     category = str(args.get("category") or "Discussion").strip() or "Discussion"
+    # Physics Lab "aurex2" auto-publish should land in the Discussion area.
+    # Keep accepting "Experiment" from legacy/agent outputs, but publish as "Discussion".
+    if category.casefold() == "experiment":
+        category = "Discussion"
     tags = args.get("tags")
     if tags is not None and not isinstance(tags, list):
         raise ToolError("plar_upload_sav: tags must be a list of strings")
