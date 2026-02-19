@@ -724,16 +724,14 @@ def plar_upload_sav(runtime: ToolRuntime, args: dict[str, Any]) -> dict[str, Any
         raise ToolError("plar_upload_sav: sav_path is required")
     title = str(args.get("title") or "").strip()
     introduction = str(args.get("introduction") or "").strip()
-    category = str(args.get("category") or "Discussion").strip() or "Discussion"
-    # Physics Lab "aurex2" auto-publish should land in the Discussion area.
-    # Keep accepting "Experiment" from legacy/agent outputs, but publish as "Discussion".
-    if category.casefold() == "experiment":
-        category = "Discussion"
+    # NOTE: In aurex2, auto-publish is forced to the Discussion area.
+    # Keep accepting `args.category` for backward compatibility, but ignore it.
+    category = "Discussion"
     tags = args.get("tags")
     if tags is not None and not isinstance(tags, list):
         raise ToolError("plar_upload_sav: tags must be a list of strings")
     tags_list = [str(x) for x in (tags or []) if str(x).strip()]
-    return plar.upload_sav_as_experiment(
+    info = plar.upload_sav_as_experiment(
         user=user,
         sav_path=sav_path,
         title=title,
@@ -742,6 +740,25 @@ def plar_upload_sav(runtime: ToolRuntime, args: dict[str, Any]) -> dict[str, Any
         category_value=category,
         tags=tags_list or None,
     )
+    if not isinstance(info, dict):
+        return {"published": True, "category": category}
+
+    summary_id = str(info.get("summary_id") or "").strip()
+    title_clean = " ".join(title.replace("\r", " ").replace("\n", " ").replace("\t", " ").split()).strip()
+    title_clean = re.sub(r"[<>]", "", title_clean).strip()
+    discussion_tag = f"<discussion={summary_id}>{title_clean}</discussion>" if (summary_id and title_clean) else ""
+
+    out = dict(info)
+    out["published"] = True
+    out["category"] = "Discussion"
+    if summary_id:
+        out["discussion_id"] = summary_id
+    if discussion_tag:
+        out["discussion_tag"] = discussion_tag
+        out["reply_suggestion_zh"] = f"您要的讨论 {discussion_tag} 已经发布！"
+    elif summary_id:
+        out["reply_suggestion_zh"] = f"已发布到讨论区（Discussion），ID：{summary_id}"
+    return out
 
 
 def plar_list_builtin_tags(_runtime: ToolRuntime, _args: dict[str, Any]) -> dict[str, Any]:
@@ -905,7 +922,7 @@ PLAR_STATUS_SAVE_TOOL = {
 
 PLAR_UPLOAD_SAV_TOOL = {
     "name": "plar_upload_sav",
-    "description": "Upload a local .sav as a PhysicsLab Experiment/Discussion and confirm it.",
+    "description": "Upload a local .sav to PhysicsLab and confirm it (forced to Discussion in aurex2).",
     "parameters": {
         "type": "object",
         "properties": {

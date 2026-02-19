@@ -15,6 +15,7 @@ from aurex.tools.plar_tools import (
     plar_get_oldest_comment,
     plar_oldest_by_user,
     plar_query_experiments,
+    plar_upload_sav,
 )  # noqa: E402
 from aurex.tools.registry import ToolRuntime  # noqa: E402
 
@@ -219,6 +220,58 @@ class TestPlarCheckFollowingTool(unittest.TestCase):
         self.assertEqual(out["followee"]["id"], "1" * 24)
         self.assertTrue(any(c["query"] == "MapMaths" for c in calls))
         self.assertTrue(any(c["query"] == "" for c in calls))
+
+
+class TestPlarUploadSavTool(unittest.TestCase):
+    def _rt(self) -> ToolRuntime:
+        return ToolRuntime(
+            task_id="T",
+            user_lang="zh",
+            config_path=os.path.join(ROOT, "dummy.json"),
+            config=AurexConfig(),
+            cache_dir=os.path.join(ROOT, ".tmp"),
+            user=object(),
+            planner_client=None,
+        )
+
+    def test_forces_discussion_and_returns_discussion_tag(self):
+        rt = self._rt()
+        calls: list[dict] = []
+
+        def fake_upload(*, user, sav_path: str, title: str, introduction: str, cache_dir: str, category_value: str, tags=None):
+            calls.append(
+                {
+                    "sav_path": sav_path,
+                    "title": title,
+                    "introduction": introduction,
+                    "cache_dir": cache_dir,
+                    "category_value": category_value,
+                    "tags": tags,
+                }
+            )
+            return {"summary_id": "a" * 24, "category": category_value}
+
+        with mock.patch("aurex.tools.plar_tools.plar.upload_sav_as_experiment", side_effect=fake_upload):
+            out = plar_upload_sav(
+                rt,
+                {
+                    "sav_path": "x.sav",
+                    "title": "RRR：为什么我们看到的天空是蓝色的",
+                    "introduction": "Intro",
+                    "category": "Experiment",
+                    "tags": ["物理"],
+                },
+            )
+
+        self.assertEqual(calls[0]["category_value"], "Discussion")
+        self.assertTrue(out.get("published"))
+        self.assertEqual(out.get("category"), "Discussion")
+        self.assertEqual(out.get("discussion_id"), "a" * 24)
+        self.assertEqual(
+            out.get("discussion_tag"),
+            f"<discussion={'a' * 24}>RRR：为什么我们看到的天空是蓝色的</discussion>",
+        )
+        self.assertTrue("<discussion=" in str(out.get("reply_suggestion_zh") or ""))
 
 
 class TestPlarGetOldestCommentTool(unittest.TestCase):
