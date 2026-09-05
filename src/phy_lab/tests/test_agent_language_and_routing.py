@@ -11,8 +11,12 @@ if PHY_LAB_DIR not in sys.path:
 
 from agent import (  # type: ignore
     _dominant_lang_is_zh,
+    _extract_content_ref_anywhere,
     _effective_system_prompt,
+    _looks_like_content_intro_request,
     _extract_user_work_list_target_name,
+    _looks_like_simulation_request,
+    _normalize_embedded_plar_refs,
     _looks_like_user_work_list_request,
 )
 
@@ -48,7 +52,25 @@ class TestAgentLanguageAndRouting(unittest.TestCase):
         self.assertTrue(_looks_like_user_work_list_request("MapMaths发布的实验结果有哪些？"))
         self.assertFalse(_looks_like_user_work_list_request("告诉我紫兰斋的第一个作品是什么"))
 
+    def test_looks_like_simulation_request(self):
+        # "模拟" alone is ambiguous; require circuit-ish hints.
+        self.assertFalse(_looks_like_simulation_request("电车实验模拟器，引发了我对电车难题的思考"))
+        self.assertTrue(_looks_like_simulation_request("帮我模拟一下这个电路，看看电压电流"))
+        self.assertTrue(_looks_like_simulation_request("请仿真一下这个电路"))
+
+    def test_extract_content_ref_anywhere(self):
+        sid = "0123456789abcdef01234567"
+        s = _normalize_embedded_plar_refs(f"总结一下这篇文章：<experiment={sid}>标题</experiment>")
+        self.assertIn(f"experiment:{sid}", s)
+        self.assertEqual(_extract_content_ref_anywhere(s), ("Experiment", sid))
+        self.assertEqual(_extract_content_ref_anywhere(f"discussion:{sid}"), ("Discussion", sid))
+        self.assertEqual(_extract_content_ref_anywhere(sid), (None, sid))
+        self.assertIsNone(_extract_content_ref_anywhere(f"uid:{sid} 的作品"))
+
+    def test_looks_like_content_intro_request_with_summary_words(self):
+        sid = "0123456789abcdef01234567"
+        self.assertTrue(_looks_like_content_intro_request(f"总结一下 experiment:{sid} 在说什么"))
+
 
 if __name__ == "__main__":
     unittest.main()
-

@@ -269,6 +269,176 @@ class TestAgentMode(unittest.TestCase):
                 stored_text = f.read()
             self.assertIn('"pad"', stored_text)
 
+    def test_list_plar_oldest_paginates_and_returns_oldest_item(self):
+        calls = []
+
+        def _fake_qe(
+            user,
+            *,
+            category,
+            take=20,
+            skip=0,
+            from_skip=None,
+            days=None,
+            sort=None,
+            user_id=None,
+            tags=None,
+            **_kw,
+        ):
+            calls.append({"category": category, "take": take, "skip": skip, "from": from_skip, "user_id": user_id})
+            # Simulate 2 pages for Experiment with take=2.
+            if category == "Experiment" and skip == 0:
+                return [
+                    {"ID": "n1", "Subject": "newest", "Category": "Experiment", "UserID": user_id, "CreationDate": 200},
+                    {"ID": "n0", "Subject": "newer", "Category": "Experiment", "UserID": user_id, "CreationDate": 150},
+                ]
+            if category == "Experiment" and skip == 2:
+                # Oldest page (len < take => stop)
+                return [
+                    {"ID": "o0", "Subject": "oldest", "Category": "Experiment", "UserID": user_id, "CreationDate": 100}
+                ]
+            return []
+
+        with tempfile.TemporaryDirectory() as d, mock.patch.object(agent_mod, "query_experiments", side_effect=_fake_qe):
+            out = agent_mod._agent_execute_tool(
+                tool="list_plar",
+                args={"kind": "oldest", "category": "Experiment", "user_id": "u", "take": 2, "max_pages": 10},
+                user=object(),
+                ollama=object(),
+                cfg=_Cfg(),
+                cache_dir=d,
+                config_base_dir=".",
+                dry_run=True,
+                context_json=None,
+                logger=agent_mod.logging.getLogger("t"),
+            )
+        obj = agent_mod.json.loads(out)
+        self.assertEqual(obj.get("kind"), "oldest")
+        self.assertEqual(obj.get("category"), "Experiment")
+        items = obj.get("items") or []
+        self.assertEqual(len(items), 1)
+        self.assertEqual(items[0].get("id"), "o0")
+        self.assertEqual(items[0].get("subject"), "oldest")
+        self.assertGreaterEqual(len(calls), 2)
+
+    def test_list_plar_oldest_both_includes_pick(self):
+        def _fake_qe(
+            user,
+            *,
+            category,
+            take=20,
+            skip=0,
+            from_skip=None,
+            days=None,
+            sort=None,
+            user_id=None,
+            tags=None,
+            **_kw,
+        ):
+            # Single-page lists (len < take => stop)
+            if category == "Experiment":
+                return [
+                    {"ID": "e0", "Subject": "exp-old", "Category": "Experiment", "UserID": user_id, "CreationDate": 50}
+                ]
+            if category == "Discussion":
+                return [
+                    {"ID": "d0", "Subject": "disc-older", "Category": "Discussion", "UserID": user_id, "CreationDate": 30}
+                ]
+            return []
+
+        with tempfile.TemporaryDirectory() as d, mock.patch.object(agent_mod, "query_experiments", side_effect=_fake_qe):
+            out = agent_mod._agent_execute_tool(
+                tool="list_plar",
+                args={"kind": "oldest", "category": "both", "user_id": "u", "take": 24, "max_pages": 5},
+                user=object(),
+                ollama=object(),
+                cfg=_Cfg(),
+                cache_dir=d,
+                config_base_dir=".",
+                dry_run=True,
+                context_json=None,
+                logger=agent_mod.logging.getLogger("t"),
+            )
+        obj = agent_mod.json.loads(out)
+        self.assertEqual(obj.get("category"), "both")
+        pick = obj.get("pick") or {}
+        self.assertEqual(pick.get("id"), "d0")
+        self.assertEqual(pick.get("subject"), "disc-older")
+
+    def test_agent_tool_simulate_does_not_fallback_to_series_demo_for_non_series_requests(self):
+        with (
+            tempfile.TemporaryDirectory() as d,
+            mock.patch.object(
+                agent_mod, "simulate_ai_script_circuit_with_phyengine", side_effect=RuntimeError("boom")
+            ),
+            mock.patch.object(agent_mod, "simulate_series_vdc_resistors") as demo,
+        ):
+            out = agent_mod._agent_execute_tool(
+                tool="simulate",
+                args={"text": "simulate an opamp circuit"},
+                user=object(),
+                ollama=object(),
+                cfg=_Cfg(),
+                cache_dir=d,
+                config_base_dir=".",
+                dry_run=True,
+                context_json=None,
+                logger=agent_mod.logging.getLogger("t"),
+            )
+        self.assertTrue(out.startswith("ERROR:"))
+        self.assertIn("boom", out)
+        demo.assert_not_called()
+
+    def test_agent_mode_rejects_missing_required_args_without_executing_tool(self):
+        # The model calls plar_get_user_by_name but forgets args.name. We should reject
+        # the call before executing any tool, and allow recovery.
+        replies = [
+            '{"tool":"plar_get_user_by_name","args":{}}',
+            '{"tool":"end","final":"OK"}',
+        ]
+        with mock.patch.object(agent_mod, "_agent_execute_tool") as exec_tool:
+            out = agent_mod.agent_mode_run(
+                ollama=_SeqOllama(replies),
+                user=object(),
+                cfg=_Cfg(),
+                cache_dir="cache",
+                config_base_dir=".",
+                dry_run=True,
+                logger=agent_mod.logging.getLogger("t"),
+                task="lookup user",
+                context_json=None,
+                history=[],
+                max_seconds=120,
+                max_steps=4,
+            )
+        self.assertEqual(out.strip(), "OK")
+        exec_tool.assert_not_called()
+
+    def test_agent_mode_strips_leaked_reasoning_in_final(self):
+        leaky = (
+            'We need to respond to user \"x\". The assistant should reply politely. '
+            'So we should respond accordingly.<user=698726c4fc064466378176b8>@aurex</user>\\n'
+            'aurex 是一个测试回复。'
+        )
+        replies = [agent_mod.json.dumps({"tool": "end", "final": leaky}, ensure_ascii=False)]
+        out = agent_mod.agent_mode_run(
+            ollama=_SeqOllama(replies),
+            user=object(),
+            cfg=_Cfg(),
+            cache_dir="cache",
+            config_base_dir=".",
+            dry_run=True,
+            logger=agent_mod.logging.getLogger("t"),
+            task="你好",
+            context_json=None,
+            history=[],
+            max_seconds=120,
+            max_steps=2,
+        )
+        self.assertIn("测试回复", out)
+        self.assertNotIn("We need to respond", out)
+        self.assertNotIn("<user=", out)
+
 
 if __name__ == "__main__":
     unittest.main()

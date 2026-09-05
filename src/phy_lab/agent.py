@@ -165,6 +165,8 @@ def _safe_at_mention(handle: str) -> str | None:
 _AT_HANDLE_RE = re.compile(r"(?:@|＠)\s*([^\s:：]{1,64})")
 _HEX24_RE = re.compile(r"^[0-9a-fA-F]{24}$")
 _PUBLIC_MENTION_RE = re.compile(r"(?<![A-Za-z0-9_])(?:@|＠)\s*([A-Za-z0-9_\u4e00-\u9fff-]{1,32})")
+_USER_TAG_OPEN_RE = re.compile(r"<\s*user\s*=\s*[^>]+>", re.IGNORECASE)
+_USER_TAG_CLOSE_RE = re.compile(r"</\s*user\s*>", re.IGNORECASE)
 
 
 def _extract_safe_mentions(text: str) -> list[str]:
@@ -196,9 +198,77 @@ def _strip_public_mentions(text: str) -> str:
     if not s:
         return s
     s2 = _PUBLIC_MENTION_RE.sub("", s)
+    # Also remove Physics Lab rich user tags to avoid leaving broken markup after @ removal.
+    s2 = _USER_TAG_OPEN_RE.sub("", s2)
+    s2 = _USER_TAG_CLOSE_RE.sub("", s2)
     # Clean up repeated whitespace created by removals.
     s2 = re.sub(r"[ \t]{2,}", " ", s2).strip()
     return s2
+
+
+_EMBEDDED_PLAR_REF_RE = re.compile(r"<\s*(experiment|discussion)\s*=\s*([0-9a-fA-F]{24})\s*>", re.IGNORECASE)
+_EMBEDDED_PLAR_CLOSE_RE = re.compile(r"</\s*(experiment|discussion)\s*>", re.IGNORECASE)
+_CONTENT_REF_TOKEN_RE = re.compile(
+    r"(experiment|discussion)\s*[:：]\s*([0-9a-fA-F]{24})(?![0-9a-fA-F])", re.IGNORECASE
+)
+_HEX24_ANYWHERE_RE = re.compile(r"(?<![0-9a-fA-F])[0-9a-fA-F]{24}(?![0-9a-fA-F])")
+
+
+def _normalize_embedded_plar_refs(text: str) -> str:
+    """Normalize Physics Lab rich tags like <experiment=...> into lookup-friendly tokens (experiment:...)."""
+    s = text or ""
+
+    def _repl(m: re.Match[str]) -> str:
+        kind = (m.group(1) or "").strip().lower()
+        sid = (m.group(2) or "").strip()
+        prefix = "experiment" if kind.startswith("exp") else "discussion"
+        return f"{prefix}:{sid}"
+
+    try:
+        s = _EMBEDDED_PLAR_REF_RE.sub(_repl, s)
+        # Closing tags are not needed once we have the ID token.
+        s = _EMBEDDED_PLAR_CLOSE_RE.sub("", s)
+    except Exception:
+        return text
+    return s
+
+
+def _extract_content_ref_anywhere(text: str) -> tuple[str | None, str] | None:
+    """Extract a referenced content ID from free-form text.
+
+    Returns (category_value_hint, summary_id). category_value_hint can be:
+      - "Experiment" | "Discussion" when explicit token is present
+      - None when only a bare 24-hex ID is found (category unknown)
+    """
+    s = (text or "").strip()
+    if not s:
+        return None
+    # Prefer explicit experiment:/discussion: tokens anywhere in the text.
+    m = _CONTENT_REF_TOKEN_RE.search(s)
+    if m:
+        kind = (m.group(1) or "").strip().casefold()
+        sid = (m.group(2) or "").strip()
+        if not sid:
+            return None
+        return ("Experiment" if kind.startswith("exp") else "Discussion", sid)
+
+    # Otherwise, accept a single bare 24-hex ID when it does not look like a user-id prefix.
+    ids: list[str] = []
+    seen: set[str] = set()
+    for m2 in _HEX24_ANYWHERE_RE.finditer(s):
+        sid2 = (m2.group(0) or "").strip()
+        if not sid2 or sid2 in seen:
+            continue
+        before = s[max(0, m2.start() - 16) : m2.start()].casefold()
+        if re.search(r"(?:uid|user_id|userid)\s*[:： ]\s*$", before):
+            continue
+        seen.add(sid2)
+        ids.append(sid2)
+        if len(ids) > 1:
+            break
+    if len(ids) == 1:
+        return (None, ids[0])
+    return None
 
 
 def _infer_publish_category(user_text: str, *, default_category: str) -> str:
@@ -332,6 +402,155 @@ def _dominant_lang_is_zh(text: str) -> bool:
     return cjk >= latin
 
 
+_MODEL_ARTIFACT_MARKERS = ("<|endoftext|>", "<|eot_id|>", "<|end|>", "</s>")
+
+
+def _strip_model_artifacts(text: str) -> str:
+    s = (text or "").strip()
+    if not s:
+        return s
+    for marker in _MODEL_ARTIFACT_MARKERS:
+        if marker in s:
+            s = s.split(marker, 1)[0].rstrip()
+    return s.strip()
+
+
+_LEAK_MARKERS_EN = (
+    "we need to respond",
+    "the assistant should",
+    "the conversation:",
+    "so we should respond",
+    "we should respond accordingly",
+)
+_LEAK_MARKERS_ZH = (
+    "我们需要回复",
+    "应该回复",
+    "需要回应用户",
+)
+
+
+def _strip_leaked_reasoning(text: str) -> str:
+    """Remove common 'analysis/planning' leakage when a model prepends meta text before the real reply."""
+    s = (text or "").strip()
+    if not s:
+        return s
+    low = s.casefold()
+    hit = any(m in low for m in _LEAK_MARKERS_EN) or any(m in s for m in _LEAK_MARKERS_ZH)
+    if not hit:
+        return s
+
+    # Only treat as leakage when it appears near the beginning; avoid clobbering legitimate mentions.
+    first_hit = min((low.find(m) for m in _LEAK_MARKERS_EN if low.find(m) >= 0), default=10**9)
+    if first_hit > 800 and not any(m in s[:800] for m in _LEAK_MARKERS_ZH):
+        return s
+
+    # Keep from the last explicit user-tag mention (common in Physics Lab markup).
+    idx_user = s.rfind("<user=")
+    if idx_user >= 0:
+        cand = s[idx_user:].strip()
+        return cand or s
+
+    # Keep from the last line starting with an @mention (common reply prefix).
+    try:
+        m = list(re.finditer(r"(?m)^[ \t]*[@＠][^\\s:：]{1,64}", s))
+    except Exception:
+        m = []
+    if m:
+        idx = m[-1].start()
+        cand = s[idx:].strip()
+        return cand or s
+
+    # Otherwise, keep the last paragraph that does not contain leak markers.
+    parts = [p.strip() for p in re.split(r"\n\s*\n+", s) if p.strip()]
+    for p in reversed(parts):
+        plow = p.casefold()
+        if any(m in plow for m in _LEAK_MARKERS_EN) or any(m in p for m in _LEAK_MARKERS_ZH):
+            continue
+        return p
+    return s
+
+
+def _reply_needs_zh_rewrite(text: str) -> bool:
+    s = text or ""
+    # Ignore hex IDs and code blocks and common math/LaTeX blocks when estimating language dominance.
+    try:
+        s = re.sub(r"\b[0-9a-fA-F]{24}\b", "", s)
+        s = re.sub(r"```.*?```", "", s, flags=re.DOTALL)
+        s = re.sub(r"\\[\\[].*?\\[\\]]", "", s, flags=re.DOTALL)  # \[...\]
+        s = re.sub(r"\\[\\(].*?\\[\\)]", "", s, flags=re.DOTALL)  # \(...\)
+        s = re.sub(r"\$[^$]{0,2000}\$", "", s, flags=re.DOTALL)  # $...$ (bounded)
+        s = re.sub(r"`[^`]{0,800}`", "", s)  # inline code
+    except Exception:
+        pass
+
+    cjk = 0
+    latin = 0
+    for ch in s:
+        if "\u4e00" <= ch <= "\u9fff":
+            cjk += 1
+        elif ("A" <= ch <= "Z") or ("a" <= ch <= "z"):
+            latin += 1
+    if latin == 0:
+        return False
+    # If the reply is mostly Latin letters (common drift: English labels/sentences), rewrite to Chinese.
+    if cjk == 0 and latin >= 10:
+        return True
+    if latin >= 30 and latin > (cjk * 2):
+        return True
+    if latin >= 20 and latin > cjk:
+        return True
+    return False
+
+
+def _rewrite_reply_to_zh(*, ollama: OllamaClient, text: str) -> str:
+    src = (text or "").strip()
+    if not src:
+        return src
+    prompt = (
+        "请把下面这段回复改写成中文，要求：\n"
+        "- 不要添加新信息，不要遗漏任何关键信息。\n"
+        "- 保留所有 24 位十六进制 ID、数字、专有名词、代码/命令/路径不变。\n"
+        "- 不要加入任何 @mention。\n"
+        "- 只输出改写后的正文，不要输出解释。\n\n"
+        f"原文：\n{src}"
+    )
+    try:
+        out = ollama.chat(
+            messages=[
+                {"role": "system", "content": "你是一个严谨的编辑，只做语言改写，不做内容改动。"},
+                {"role": "user", "content": prompt},
+            ]
+        )
+    except Exception:
+        return src
+    return (out or "").strip() or src
+
+
+def _finalize_public_reply_text(
+    text: str,
+    *,
+    ollama: OllamaClient,
+    user_text: str,
+    max_chars: int,
+    lang_zh: bool | None = None,
+) -> str:
+    lang_zh2 = _dominant_lang_is_zh(user_text or "") if lang_zh is None else bool(lang_zh)
+    out = _strip_leaked_reasoning(text or "")
+    out = safe_reply(out, max_chars=max_chars).strip()
+    out = _strip_model_artifacts(out)
+    if not out:
+        return "完成。" if lang_zh2 else "Done."
+    if lang_zh2 and _reply_needs_zh_rewrite(out):
+        out2 = _rewrite_reply_to_zh(ollama=ollama, text=out)
+        out2 = safe_reply(out2 or "", max_chars=max_chars).strip()
+        out2 = _strip_model_artifacts(out2)
+        if out2:
+            out = out2
+    # Ensure no stray @mentions (and strip rich user tags) even in oneshot output.
+    out = _strip_public_mentions(out)
+    return out
+
+
 def _political_refusal_message(user_text: str) -> str:
     if _dominant_lang_is_zh(user_text or ""):
         return "抱歉，我不能处理或搜索任何政治相关内容。我可以帮助你解决物理实验室社区相关问题。"
@@ -348,10 +567,14 @@ def _looks_like_content_intro_request(text: str) -> bool:
         for x in (
             "introduce",
             "introduction",
+            "summarize",
+            "summary",
             "介绍",
             "简介",
             "讲讲",
             "看看",
+            "总结",
+            "概括",
             "内容",
             "是什么",
         )
@@ -468,6 +691,7 @@ def _effective_system_prompt(*, cfg: Any, user_text: str) -> str:
             "语言（务必遵守）\n"
             "- 你的输出必须使用中文。\n"
             "- 除非用户明确要求/引用英文原文/必须保留的专有名词或代码，否则不要输出英文句子。\n"
+            "- 不要输出任何思考/分析/计划过程（例如“我需要先…/We need to…”），只输出最终答复。\n"
             "\n"
             "关键约束（务必遵守）\n"
             "- 只回复当前提问者（当前这条评论的作者），不要面向其他人说话。\n"
@@ -806,7 +1030,7 @@ def _agent_tool_prompt(*, max_seconds: int, lang_zh: bool) -> str:
         "- Keep args small (<~500 chars). Never paste large blobs into args. Never produce political content.\n"
         "\n"
         "Examples:\n"
-        "- (first work) {\"tool\":\"list_plar\",\"args\":{\"kind\":\"latest\",\"category\":\"both\",\"user_id\":\"<uid>\",\"take\":1}}\n"
+        "- (first work/oldest) {\"tool\":\"list_plar\",\"args\":{\"kind\":\"oldest\",\"category\":\"both\",\"user_id\":\"<uid>\",\"take\":24}}\n"
         "- (open) {\"tool\":\"plar_open_content_page\",\"args\":{\"summary_id\":\"<24hex>\",\"category\":\"Experiment\",\"take\":20,\"skip\":0}}\n"
     )
 
@@ -991,7 +1215,7 @@ def _agent_tool_result_message(*, tool: str, result: str, cache_dir: str) -> dic
             "tool": tool,
             "hint": (
                 "Use store_get {key, offset, limit} or store_json {key, path}. "
-                "For list_plar first item: experiment.items[0].subject / experiment.items[0].id"
+                "For list_plar: pick.subject / pick.id (when present), or experiment.items[0].subject / experiment.items[0].id"
             )
             if tool == "list_plar"
             else "Use store_get {key, offset, limit} or store_json {key, path}.",
@@ -1208,6 +1432,13 @@ def _agent_execute_tool(
                     sid = best_effort_extract_text(it.get("ID")) or best_effort_extract_text(it.get("Id"))
                     if sid:
                         last_id = sid
+                    creation_date: int | None = None
+                    try:
+                        cd = it.get("CreationDate")
+                        if cd is not None:
+                            creation_date = int(cd)
+                    except Exception:
+                        creation_date = None
                     compact.append(
                         {
                             "id": sid,
@@ -1217,6 +1448,7 @@ def _agent_execute_tool(
                             or None,
                             "user_id": best_effort_extract_text(it.get("UserID")) or None,
                             "tags": it.get("Tags") if isinstance(it.get("Tags"), list) else None,
+                            "creation_date": creation_date,
                         }
                     )
                 return {"items": compact, "next_from": last_id}
@@ -1297,6 +1529,103 @@ def _agent_execute_tool(
                     return json.dumps(out, ensure_ascii=False, indent=2)
 
                 out = {"kind": kind, **_query(category)}
+                return json.dumps(out, ensure_ascii=False, indent=2)
+
+            # Oldest item for a specific user/category (first/earliest work).
+            if kind in ("oldest", "first", "first_work", "earliest", "user_oldest", "oldest_by_user"):
+                category = str(args.get("category") or "").strip() or "Experiment"
+                user_id = str(args.get("user_id") or "").strip()
+                if not user_id:
+                    return "ERROR: missing args.user_id (required for kind=oldest)"
+                take = int(args.get("take") or 24)
+                if take < 1:
+                    take = 24
+                if take > 24:
+                    take = 24
+
+                max_pages = int(args.get("max_pages") or 200)
+                if max_pages < 1:
+                    max_pages = 1
+                if max_pages > 800:
+                    max_pages = 800
+
+                tags = _parse_tags(args.get("tags"))
+                if tags is None:
+                    tags = []
+
+                def _oldest_one(cat: str) -> dict[str, Any]:
+                    skip = 0
+                    from_id: str | None = None
+                    pages = 0
+                    last_item: dict[str, Any] | None = None
+                    hit_limit = False
+                    while pages < max_pages:
+                        items = query_experiments(
+                            user,
+                            category=cat,
+                            take=take,
+                            skip=skip,
+                            from_skip=from_id,
+                            days=None,
+                            sort="Default",
+                            user_id=user_id,
+                            tags=tags,
+                        )
+                        pages += 1
+                        if not items:
+                            break
+                        last_item = items[-1] if isinstance(items[-1], dict) else None
+                        skip += len(items)
+                        # plweb2 pagination: From = last.ID, Skip increases by returned count.
+                        if isinstance(last_item, dict):
+                            from_id = best_effort_extract_text(last_item.get("ID")) or best_effort_extract_text(
+                                last_item.get("Id")
+                            )
+                        if len(items) < take:
+                            break
+                        if pages >= max_pages:
+                            hit_limit = True
+                            break
+                    out = _compact([last_item] if isinstance(last_item, dict) else [])
+                    out.update({"category": cat, "take": take, "pages_scanned": pages, "user_id": user_id, "tags": tags})
+                    if hit_limit and last_item is not None:
+                        out["incomplete"] = True
+                    return out
+
+                if category.lower() in ("both", "all", "*"):
+                    exp = _oldest_one("Experiment")
+                    disc = _oldest_one("Discussion")
+                    pick: dict[str, Any] | None = None
+                    exp_it = (exp.get("items") or [None])[0] if isinstance(exp.get("items"), list) and exp.get("items") else None
+                    disc_it = (disc.get("items") or [None])[0] if isinstance(disc.get("items"), list) and disc.get("items") else None
+                    # Choose the earlier CreationDate when available; else prefer Experiment.
+                    def _cd(it: Any) -> int | None:
+                        try:
+                            v = it.get("creation_date") if isinstance(it, dict) else None
+                            return int(v) if v is not None else None
+                        except Exception:
+                            return None
+
+                    exp_cd = _cd(exp_it)
+                    disc_cd = _cd(disc_it)
+                    if isinstance(exp_it, dict) and isinstance(disc_it, dict):
+                        if exp_cd is not None and disc_cd is not None:
+                            pick = exp_it if exp_cd <= disc_cd else disc_it
+                        elif exp_cd is not None:
+                            pick = exp_it
+                        elif disc_cd is not None:
+                            pick = disc_it
+                        else:
+                            pick = exp_it
+                    elif isinstance(exp_it, dict):
+                        pick = exp_it
+                    elif isinstance(disc_it, dict):
+                        pick = disc_it
+
+                    out = {"kind": kind, "category": "both", "experiment": exp, "discussion": disc, "pick": pick}
+                    return json.dumps(out, ensure_ascii=False, indent=2)
+
+                out = {"kind": kind, **_oldest_one(category)}
                 return json.dumps(out, ensure_ascii=False, indent=2)
 
             # Relations lists.
@@ -1440,7 +1769,7 @@ def _agent_execute_tool(
                         )
                 return json.dumps(staff, ensure_ascii=False, indent=2)
 
-            return "ERROR: unknown list_plar kind (try: latest|hot|featured|random|following|followers|banned|volunteers|editors|retired|staff)"
+            return "ERROR: unknown list_plar kind (try: latest|hot|featured|random|oldest|following|followers|banned|volunteers|editors|retired|staff)"
 
         if tool == "plar_get_user_board":
             user_id = str(args.get("user_id") or "").strip()
@@ -1761,6 +2090,7 @@ def _agent_execute_tool(
                 text = json.dumps(context_json, ensure_ascii=False) if context_json else ""
             if not text:
                 return "ERROR: missing args.text"
+            sim_err: Exception | None = None
             if bool(getattr(cfg.agent, "simulation_ai_enabled", True)):
                 try:
                     reply = simulate_ai_script_circuit_with_phyengine(
@@ -1791,12 +2121,27 @@ def _agent_execute_tool(
                         )
                     return reply
                 except Exception as e:
-                    logger.info("Agent tool simulate failed; falling back to demo: %s", e)
-            return simulate_series_vdc_resistors(
-                text=text,
-                phy_engine_cfg=cfg.phy_engine,
-                config_base_dir=config_base_dir,
-            )
+                    sim_err = e
+                    logger.info("Agent tool simulate failed: %s", e)
+            else:
+                sim_err = RuntimeError("simulation_ai_disabled")
+
+            # Do NOT return unrelated demo results for arbitrary simulation prompts.
+            # Only allow the deterministic series-VDC-resistors demo when the user explicitly asked for a series circuit.
+            low = text.casefold()
+            wants_series_demo = ("串联" in text) or ("series" in low)
+            if wants_series_demo:
+                try:
+                    return simulate_series_vdc_resistors(
+                        text=text,
+                        phy_engine_cfg=cfg.phy_engine,
+                        config_base_dir=config_base_dir,
+                    )
+                except Exception as e:
+                    logger.info("Agent tool simulate series demo failed: %s", e)
+                    return f"ERROR: simulate failed: {_public_error_text(sim_err or e)}"
+
+            return f"ERROR: simulate failed: {_public_error_text(sim_err or RuntimeError('unknown_error'))}"
 
         if tool == "simulate_verilog":
             text = str(args.get("text") or "").strip()
@@ -2039,7 +2384,7 @@ def agent_mode_run(
                     "Goal: describe the requested work using ONLY opened Context JSON fields.\n"
                     "Required:\n"
                     "- If the user refers to a specific ID: plar_open_content_page(summary_id,...)\n"
-                    "- If the user refers to a user's first work: plar_get_user_by_name -> list_plar(take=1) -> plar_open_content_page\n"
+                    "- If the user refers to a user's first/earliest work: plar_get_user_by_name -> list_plar(kind:\"oldest\",category:\"both\",take:24) -> plar_open_content_page\n"
                     "Final answer must include:\n"
                     "- Category + SummaryID + Subject\n"
                     "- 1–3 sentences of introduction/summary from Context JSON (e.g., title/body_text/summary_text).\n"
@@ -2052,16 +2397,16 @@ def agent_mode_run(
                 "role": "system",
                 "content": (
                     "USER WORK LOOKUP DETECTED (first work / first item).\n"
-                    "Goal: answer with the FIRST item in the user's LATEST works list.\n"
+                    "Goal: answer with the user's FIRST/EARLIEST published work (oldest by CreationDate).\n"
                     "Required steps:\n"
                     "1) Lookup user -> plar_get_user_by_name {name:\"...\"} (get uid)\n"
-                    "2) List works -> list_plar {kind:\"latest\",category:\"both\",user_id:\"<uid>\",take:1}\n"
+                    "2) Find oldest work -> list_plar {kind:\"oldest\",category:\"both\",user_id:\"<uid>\",take:24}\n"
                     "3) End with {\"tool\":\"end\",\"final\":\"...\"} and include Category + SummaryID + Subject.\n"
                     "Notes:\n"
                     "- The target user is the one named in the CURRENT user request (not the system prompt / developer name).\n"
                     "- plar_get_user_board is留言板评论, NOT works. Do NOT use it for works listing.\n"
                     "- If list_plar result is stored (shows key), use store_json to extract fields like:\n"
-                    "  experiment.items[0].subject / experiment.items[0].id (or discussion.* if experiment is empty).\n"
+                    "  pick.subject / pick.id (or experiment.items[0].* / discussion.items[0].* when pick is null).\n"
                 ),
             }
         )
@@ -2112,8 +2457,53 @@ def agent_mode_run(
         )
         return any(a in low for a in anchors)
 
+    explicit_content_ref = _extract_content_ref_anywhere(task)
+    if wants_content_intro and explicit_content_ref is not None:
+        cat_hint, sid_hint = explicit_content_ref
+        if lang_zh:
+            messages.append(
+                {
+                    "role": "system",
+                    "content": (
+                        "检测到用户给出了明确的内容引用（优先处理该引用，而不是当前页面）。\n"
+                        f"- SummaryID: {sid_hint}\n"
+                        f"- Category hint: {cat_hint or 'both'}\n"
+                        "你必须先打开该内容页（plar_open_content_page），再总结/介绍；不要猜测其内容。\n"
+                        + (
+                            f"优先尝试：plar_open_content_page {{summary_id:\"{sid_hint}\", category:\"{cat_hint}\"}}"
+                            if cat_hint in ("Experiment", "Discussion")
+                            else (
+                                f"先尝试：plar_open_content_page {{summary_id:\"{sid_hint}\", category:\"Experiment\"}}；"
+                                f"若找不到再尝试 Discussion。"
+                            )
+                        )
+                    ),
+                }
+            )
+        else:
+            messages.append(
+                {
+                    "role": "system",
+                    "content": (
+                        "EXPLICIT CONTENT REFERENCE DETECTED (prioritize this reference, not the current page).\n"
+                        f"- SummaryID: {sid_hint}\n"
+                        f"- Category hint: {cat_hint or 'both'}\n"
+                        "You MUST open that content page (plar_open_content_page) before summarizing; do NOT guess.\n"
+                        + (
+                            f"Try: plar_open_content_page {{summary_id:\"{sid_hint}\", category:\"{cat_hint}\"}}"
+                            if cat_hint in ("Experiment", "Discussion")
+                            else (
+                                f"Try: plar_open_content_page {{summary_id:\"{sid_hint}\", category:\"Experiment\"}}; "
+                                "if not found, try Discussion."
+                            )
+                        )
+                    ),
+                }
+            )
+
     include_context = (
         context_json is not None
+        and explicit_content_ref is None
         and (wants_simulation or wants_content_intro or _looks_like_page_context_reference(task))
     )
     if include_context and context_json is not None:
@@ -2195,79 +2585,14 @@ def agent_mode_run(
                 final = "Sorry — the model returned an unusable empty/invalid response. Please retry or switch models."
             return json.dumps({"tool": "end", "final": final}, ensure_ascii=False)
 
-    def _reply_needs_zh_rewrite(text: str) -> bool:
-        if not lang_zh:
-            return False
-        s = text or ""
-        # Ignore hex IDs and code blocks when estimating language dominance.
-        try:
-            s = re.sub(r"\b[0-9a-fA-F]{24}\b", "", s)
-            s = re.sub(r"```.*?```", "", s, flags=re.DOTALL)
-        except Exception:
-            pass
-        cjk = 0
-        latin = 0
-        for ch in s:
-            if "\u4e00" <= ch <= "\u9fff":
-                cjk += 1
-            elif ("A" <= ch <= "Z") or ("a" <= ch <= "z"):
-                latin += 1
-        if latin == 0:
-            return False
-        # If the reply is mostly Latin letters (common drift: English labels/sentences), rewrite to Chinese.
-        if cjk == 0 and latin >= 10:
-            return True
-        if latin >= 30 and latin > (cjk * 2):
-            return True
-        if latin >= 20 and latin > cjk:
-            return True
-        return False
-
-    def _rewrite_reply_to_zh(text: str) -> str:
-        src = (text or "").strip()
-        if not src:
-            return src
-        prompt = (
-            "请把下面这段回复改写成中文，要求：\n"
-            "- 不要添加新信息，不要遗漏任何关键信息。\n"
-            "- 保留所有 24 位十六进制 ID、数字、专有名词、代码/命令/路径不变。\n"
-            "- 不要加入任何 @mention。\n"
-            "- 只输出改写后的正文，不要输出解释。\n\n"
-            f"原文：\n{src}"
-        )
-        try:
-            out = ollama.chat(
-                messages=[
-                    {"role": "system", "content": "你是一个严谨的编辑，只做语言改写，不做内容改动。"},
-                    {"role": "user", "content": prompt},
-                ]
-            )
-        except Exception:
-            return src
-        return (out or "").strip() or src
-
-    def _strip_model_artifacts(text: str) -> str:
-        s = (text or "").strip()
-        if not s:
-            return s
-        # Some models may leak training stop tokens and then continue with unrelated text.
-        for marker in ("<|endoftext|>", "<|eot_id|>", "<|end|>", "</s>"):
-            if marker in s:
-                s = s.split(marker, 1)[0].rstrip()
-        return s.strip()
-
     def _finalize_reply_text(text: str) -> str:
-        out = safe_reply(text or "", max_chars=cfg.agent.max_reply_chars).strip()
-        out = _strip_model_artifacts(out)
-        if not out:
-            return "完成。" if lang_zh else "Done."
-        if _reply_needs_zh_rewrite(out):
-            out2 = _rewrite_reply_to_zh(out)
-            out2 = safe_reply(out2 or "", max_chars=cfg.agent.max_reply_chars).strip()
-            out2 = _strip_model_artifacts(out2)
-            if out2:
-                return out2
-        return out
+        return _finalize_public_reply_text(
+            text or "",
+            ollama=ollama,
+            user_text=task,
+            max_chars=cfg.agent.max_reply_chars,
+            lang_zh=lang_zh,
+        )
 
     last_raw = ""
     last_non_tool_output = ""
@@ -2569,6 +2894,187 @@ def agent_mode_run(
             )
             continue
 
+        # Basic schema validation to avoid wasting steps on tool calls with missing required args.
+        # (The tools themselves also validate, but explicit REJECTED hints help the model recover faster.)
+        if tool == "plar_get_user_by_name":
+            name_v = args.get("name")
+            if not isinstance(name_v, str) or not name_v.strip():
+                messages.append(
+                    {
+                        "role": "system",
+                        "content": (
+                            "REJECTED: plar_get_user_by_name requires args.name (non-empty string).\n"
+                            "Example: {\"tool\":\"plar_get_user_by_name\",\"args\":{\"name\":\"紫兰斋\"}}"
+                        ),
+                    }
+                )
+                continue
+        if tool == "plar_get_user_by_id":
+            uid_v = args.get("user_id")
+            if not isinstance(uid_v, str) or not uid_v.strip():
+                messages.append(
+                    {
+                        "role": "system",
+                        "content": (
+                            "REJECTED: plar_get_user_by_id requires args.user_id (non-empty string).\n"
+                            "Example: {\"tool\":\"plar_get_user_by_id\",\"args\":{\"user_id\":\"<uid>\"}}"
+                        ),
+                    }
+                )
+                continue
+        if tool == "search_plar":
+            q_v = args.get("query")
+            if not isinstance(q_v, str) or not q_v.strip():
+                messages.append(
+                    {
+                        "role": "system",
+                        "content": (
+                            "REJECTED: search_plar requires args.query (non-empty string).\n"
+                            "Example: {\"tool\":\"search_plar\",\"args\":{\"query\":\"@紫兰斋\"}}"
+                        ),
+                    }
+                )
+                continue
+        if tool == "web_search":
+            q_v2 = args.get("query")
+            if not isinstance(q_v2, str) or not q_v2.strip():
+                messages.append(
+                    {
+                        "role": "system",
+                        "content": (
+                            "REJECTED: web_search requires args.query (non-empty string).\n"
+                            "Example: {\"tool\":\"web_search\",\"args\":{\"query\":\"...\"}}"
+                        ),
+                    }
+                )
+                continue
+        if tool == "list_plar":
+            kind_v = args.get("kind")
+            if not isinstance(kind_v, str) or not kind_v.strip():
+                messages.append(
+                    {
+                        "role": "system",
+                        "content": (
+                            "REJECTED: list_plar requires args.kind (non-empty string).\n"
+                            "Example: {\"tool\":\"list_plar\",\"args\":{\"kind\":\"latest\",\"category\":\"Experiment\",\"take\":5}}"
+                        ),
+                    }
+                )
+                continue
+        if tool == "plar_open_content_page":
+            sid_v = args.get("summary_id")
+            if not isinstance(sid_v, str) or not sid_v.strip():
+                messages.append(
+                    {
+                        "role": "system",
+                        "content": (
+                            "REJECTED: plar_open_content_page requires args.summary_id (non-empty string).\n"
+                            "Example: {\"tool\":\"plar_open_content_page\",\"args\":{\"summary_id\":\"<id>\",\"category\":\"Experiment\"}}"
+                        ),
+                    }
+                )
+                continue
+        if tool in ("plar_get_experiment_context", "plar_get_status_save"):
+            sid_v2 = args.get("summary_id")
+            cat_v = args.get("category")
+            if not isinstance(sid_v2, str) or not sid_v2.strip() or not isinstance(cat_v, str) or not cat_v.strip():
+                messages.append(
+                    {
+                        "role": "system",
+                        "content": (
+                            f"REJECTED: {tool} requires args.summary_id and args.category.\n"
+                            f"Example: {{\"tool\":\"{tool}\",\"args\":{{\"summary_id\":\"<id>\",\"category\":\"Experiment\"}}}}"
+                        ),
+                    }
+                )
+                continue
+        if tool == "plar_get_comments":
+            tt_v = args.get("target_type")
+            tid_v = args.get("target_id")
+            if not isinstance(tt_v, str) or not tt_v.strip() or not isinstance(tid_v, str) or not tid_v.strip():
+                messages.append(
+                    {
+                        "role": "system",
+                        "content": (
+                            "REJECTED: plar_get_comments requires args.target_type and args.target_id.\n"
+                            "Example: {\"tool\":\"plar_get_comments\",\"args\":{\"target_type\":\"Discussion\",\"target_id\":\"<id>\",\"take\":20}}"
+                        ),
+                    }
+                )
+                continue
+        if tool == "plar_get_user_board":
+            uid_v2 = args.get("user_id")
+            if not isinstance(uid_v2, str) or not uid_v2.strip():
+                messages.append(
+                    {
+                        "role": "system",
+                        "content": (
+                            "REJECTED: plar_get_user_board requires args.user_id.\n"
+                            "Example: {\"tool\":\"plar_get_user_board\",\"args\":{\"user_id\":\"<uid>\",\"take\":20}}"
+                        ),
+                    }
+                )
+                continue
+        if tool == "store_get":
+            key_v = args.get("key")
+            if not isinstance(key_v, str) or not key_v.strip():
+                messages.append(
+                    {
+                        "role": "system",
+                        "content": (
+                            "REJECTED: store_get requires args.key.\n"
+                            "Example: {\"tool\":\"store_get\",\"args\":{\"key\":\"<key>\",\"offset\":0,\"limit\":2000}}"
+                        ),
+                    }
+                )
+                continue
+        if tool == "store_json":
+            key_v2 = args.get("key")
+            path_v = args.get("path")
+            if (
+                not isinstance(key_v2, str)
+                or not key_v2.strip()
+                or not isinstance(path_v, str)
+                or not path_v.strip()
+            ):
+                messages.append(
+                    {
+                        "role": "system",
+                        "content": (
+                            "REJECTED: store_json requires args.key and args.path.\n"
+                            "Example: {\"tool\":\"store_json\",\"args\":{\"key\":\"<key>\",\"path\":\"experiment.items[0].id\"}}"
+                        ),
+                    }
+                )
+                continue
+        if tool in ("simulate", "simulate_verilog"):
+            txt_v = args.get("text")
+            if not isinstance(txt_v, str) or not txt_v.strip():
+                messages.append(
+                    {
+                        "role": "system",
+                        "content": (
+                            f"REJECTED: {tool} requires args.text.\n"
+                            f"Example: {{\"tool\":\"{tool}\",\"args\":{{\"text\":\"...\"}}}}"
+                        ),
+                    }
+                )
+                continue
+        if tool == "simulate_status_save":
+            sid_v3 = args.get("summary_id")
+            cat_v2 = args.get("category")
+            if not isinstance(sid_v3, str) or not sid_v3.strip() or not isinstance(cat_v2, str) or not cat_v2.strip():
+                messages.append(
+                    {
+                        "role": "system",
+                        "content": (
+                            "REJECTED: simulate_status_save requires args.summary_id and args.category.\n"
+                            "Example: {\"tool\":\"simulate_status_save\",\"args\":{\"summary_id\":\"<id>\",\"category\":\"Experiment\",\"question\":\"...\"}}"
+                        ),
+                    }
+                )
+                continue
+
         if wants_first_work and first_work_target_name:
             def _norm_name(x: str) -> str:
                 s = (x or "").strip()
@@ -2622,6 +3128,18 @@ def agent_mode_run(
                             "content": (
                                 "REJECTED: list_plar for 'first work' must include a specific user_id.\n"
                                 f"First lookup the user '{first_work_target_name}' using plar_get_user_by_name, then call list_plar with user_id."
+                            ),
+                        }
+                    )
+                    continue
+                kind_v2 = str(args.get("kind") or "").strip().lower()
+                if kind_v2 not in ("oldest", "first", "first_work", "earliest", "user_oldest", "oldest_by_user"):
+                    messages.append(
+                        {
+                            "role": "system",
+                            "content": (
+                                "REJECTED: for 'first work', list_plar must use kind=\"oldest\" (earliest by CreationDate).\n"
+                                "Call list_plar again with kind=\"oldest\" and category=\"both\"."
                             ),
                         }
                     )
@@ -3355,7 +3873,8 @@ def _looks_like_simulation_request(user_text: str) -> bool:
     t = (user_text or "").casefold()
     if not t:
         return False
-    return any(
+    # Strong indicators (unambiguous in this project context).
+    if any(
         x in t
         for x in (
             "simulate",
@@ -3366,13 +3885,36 @@ def _looks_like_simulation_request(user_text: str) -> bool:
             "time=",
             "t=",
             "仿真",
-            "模拟",
             "瞬态",
             "时域",
             "直流分析",
             "交流分析",
         )
-    )
+    ):
+        return True
+
+    # "模拟" is ambiguous in Chinese (can mean "simulator"/"emulate"); require circuit-ish hints.
+    if "模拟" in t:
+        circuit_hints = (
+            "电路",
+            "电阻",
+            "电压",
+            "电流",
+            "节点",
+            "vdc",
+            "ohm",
+            "ω",
+            "Ω",
+            "verilog",
+            "plsav",
+            "sav",
+            "逻辑门",
+            "门电路",
+        )
+        if any(x in t for x in circuit_hints):
+            return True
+
+    return False
 
 
 def _looks_like_first_work_request(user_text: str) -> bool:
@@ -3947,11 +4489,13 @@ def _handle_comment(
         logger.debug("Skip comment: empty content")
         return None
     system_prompt = _effective_system_prompt(cfg=cfg, user_text=content)
+    lang_zh = _dominant_lang_is_zh(content or "")
     author_id, nickname = _comment_author(comment)
     if getattr(cfg.agent, "log_include_comment_content", False):
         logger.debug("Incoming comment content: %r", truncate(content, max_chars=400))
 
     text = strip_leading_mention(content, mention_tag=cfg.agent.mention_tag)
+    text = _normalize_embedded_plar_refs(text)
     if logger.isEnabledFor(logging.DEBUG) and not getattr(
         cfg.agent, "log_include_comment_content", False
     ):
@@ -4073,6 +4617,81 @@ def _handle_comment(
                         action = "chat"
 
                 if action == "summarize":
+                    ref = _extract_content_ref_anywhere(routed_arg)
+                    if ref is not None and not _is_generic_summarize_arg(routed_arg):
+                        cat_hint, sid = ref
+                        tried: list[str] = []
+                        last_err: BaseException | None = None
+
+                        def _try(cat: str) -> dict[str, Any] | None:
+                            nonlocal last_err
+                            tried.append(cat)
+                            try:
+                                ctx2 = get_experiment_context(
+                                    user,
+                                    summary_id=sid,
+                                    category_value=cat,
+                                    cache_dir=cache_dir,
+                                    ttl_sec=300,
+                                    max_json_chars=20_000,
+                                )
+                            except Exception as e:
+                                last_err = e
+                                return None
+                            return ctx2 if isinstance(ctx2, dict) else None
+
+                        ctx = None
+                        if cat_hint in ("Experiment", "Discussion"):
+                            ctx = _try(cat_hint)
+                            # If hint was wrong, try the other side once.
+                            if ctx is None and last_err is not None and _is_probable_content_not_found_error(last_err):
+                                ctx = _try("Discussion" if cat_hint == "Experiment" else "Experiment")
+                        else:
+                            ctx = _try("Experiment") or _try("Discussion")
+
+                        if ctx is None:
+                            if last_err is not None and _is_probable_content_not_found_error(last_err):
+                                return "No content found." if not lang_zh else "未找到该内容。"
+                            return (
+                                f"Lookup failed: {_format_exception_brief(last_err) if last_err is not None else 'unknown error'}"
+                            )
+
+                        blob = (
+                            str(ctx.get("title") or "")
+                            + "\n"
+                            + str(ctx.get("body_text") or "")
+                            + "\n"
+                            + str(ctx.get("content_text") or "")
+                        )
+                        if _looks_political_sensitive(blob):
+                            return _political_refusal_message(routed_arg)
+
+                        messages: list[dict[str, str]] = [{"role": "system", "content": system_prompt}]
+                        messages.append(
+                            {
+                                "role": "system",
+                                "content": "Context JSON (opened content page):\n"
+                                + json.dumps(_shrink_context_json_for_llm(ctx), ensure_ascii=False, indent=2),
+                            }
+                        )
+                        subj = str(ctx.get("title") or ctx.get("subject") or "").strip() or "(no subject)"
+                        cat_final = str(ctx.get("category") or cat_hint or "").strip() or "Unknown"
+                        messages.append(
+                            {
+                                "role": "user",
+                                "content": (
+                                    "Summarize the referenced content using ONLY the Context JSON above.\n"
+                                    f"- Include: Category + SummaryID + Subject\n"
+                                    f"- Category: {cat_final}\n"
+                                    f"- SummaryID: {sid}\n"
+                                    f"- Subject: {subj}\n"
+                                    "- Keep it under 6 bullets.\n"
+                                ),
+                            }
+                        )
+                        reply = ollama.chat(messages=messages)
+                        return safe_reply(reply, max_chars=cfg.agent.max_reply_chars)
+
                     if experiment_context is not None and _is_generic_summarize_arg(routed_arg):
                         messages: list[dict[str, str]] = [{"role": "system", "content": system_prompt}]
                         messages.append(
@@ -4406,7 +5025,7 @@ def _handle_comment(
                     if not routed_arg:
                         routed_arg = arg
                     if not routed_arg:
-                        return "Provide a circuit specification."
+                        return "请提供电路规格/需求描述。" if lang_zh else "Provide a circuit specification."
                     publish_wanted = bool(publish_intent) or bool(
                         getattr(cfg.agent, "publish_by_default", False)
                     )
@@ -4449,16 +5068,30 @@ def _handle_comment(
                             _public_error_text(e, max_chars=2000),
                         )
                         return safe_reply(
-                            "Sorry, I couldn't compile the circuit after multiple attempts.\n"
-                            f"Error: {_public_error_text(e)}",
+                            (
+                                "抱歉，我多次尝试后仍未能编译这个电路。\n"
+                                f"错误：{_public_error_text(e)}"
+                                if lang_zh
+                                else (
+                                    "Sorry, I couldn't compile the circuit after multiple attempts.\n"
+                                    f"Error: {_public_error_text(e)}"
+                                )
+                            ),
                             max_chars=cfg.agent.max_reply_chars,
                         )
 
                     if enable_publish and not res.published and res.publish_block_reason == "too_large":
                         limit = int(getattr(cfg.agent, "publish_max_elements", 5000) or 5000)
                         return safe_reply(
-                            f"I generated the circuit, but I cannot publish it because the .sav is too large for Physics Lab (elements={res.plsav_elements}, limit={limit}). "
-                            "Please simplify the design and try again.",
+                            (
+                                f"我已生成电路，但无法发布：.sav 过大（elements={res.plsav_elements}，limit={limit}）。"
+                                "请简化设计后再试。"
+                                if lang_zh
+                                else (
+                                    f"I generated the circuit, but I cannot publish it because the .sav is too large for Physics Lab (elements={res.plsav_elements}, limit={limit}). "
+                                    "Please simplify the design and try again."
+                                )
+                            ),
                             max_chars=cfg.agent.max_reply_chars,
                         )
 
@@ -4468,19 +5101,41 @@ def _handle_comment(
                         if isinstance(res.summary_id, str) and res.summary_id.strip():
                             open_hint = f"discussion:{res.summary_id.strip()}"
                         return safe_reply(
-                            "Done. I generated Verilog, compiled to .sav with -O4 and '--layout hier', and published it.\n"
-                            f"Category: {cat}\nSummaryID: {res.summary_id}\nOpen hint: {open_hint or ''}".rstrip(),
+                            (
+                                "完成：已生成 Verilog，并用 -O4 和 '--layout hier' 编译为 .sav，且已发布。\n"
+                                f"Category: {cat}\nSummaryID: {res.summary_id}\nOpen hint: {open_hint or ''}".rstrip()
+                                if lang_zh
+                                else (
+                                    "Done. I generated Verilog, compiled to .sav with -O4 and '--layout hier', and published it.\n"
+                                    f"Category: {cat}\nSummaryID: {res.summary_id}\nOpen hint: {open_hint or ''}".rstrip()
+                                )
+                            ),
                             max_chars=cfg.agent.max_reply_chars,
                         )
                     return safe_reply(
-                        "Done. I generated Verilog and compiled a .sav with -O4 and '--layout hier'.\n"
-                        + (
-                            "Publishing is disabled (or dry-run). Enable publishing in config."
-                            if not bool(cfg.agent.enable_publish)
+                        (
+                            "完成：已生成 Verilog，并用 -O4 和 '--layout hier' 编译为 .sav。\n"
+                            + (
+                                "发布功能已关闭（或处于 dry-run）。请在配置中启用发布。"
+                                if not bool(cfg.agent.enable_publish)
+                                else (
+                                    "未检测到发布请求；请明确要求“发布/投稿”，或设置 agent.publish_by_default=true。"
+                                    if not publish_wanted
+                                    else "由于配置原因，未执行发布。"
+                                )
+                            )
+                            if lang_zh
                             else (
-                                "Publishing was not requested. Ask to publish explicitly, or set agent.publish_by_default=true."
-                                if not publish_wanted
-                                else "Publishing did not run due to configuration."
+                                "Done. I generated Verilog and compiled a .sav with -O4 and '--layout hier'.\n"
+                                + (
+                                    "Publishing is disabled (or dry-run). Enable publishing in config."
+                                    if not bool(cfg.agent.enable_publish)
+                                    else (
+                                        "Publishing was not requested. Ask to publish explicitly, or set agent.publish_by_default=true."
+                                        if not publish_wanted
+                                        else "Publishing did not run due to configuration."
+                                    )
+                                )
                             )
                         ),
                         max_chars=cfg.agent.max_reply_chars,
@@ -4612,16 +5267,30 @@ def _handle_comment(
                             _public_error_text(e, max_chars=2000),
                         )
                         return safe_reply(
-                            "Sorry, I couldn't compile the circuit after multiple attempts.\n"
-                            f"Error: {_public_error_text(e)}",
+                            (
+                                "抱歉，我多次尝试后仍未能编译这个电路。\n"
+                                f"错误：{_public_error_text(e)}"
+                                if lang_zh
+                                else (
+                                    "Sorry, I couldn't compile the circuit after multiple attempts.\n"
+                                    f"Error: {_public_error_text(e)}"
+                                )
+                            ),
                             max_chars=cfg.agent.max_reply_chars,
                         )
 
                     if enable_publish and not res.published and res.publish_block_reason == "too_large":
                         limit = int(getattr(cfg.agent, "publish_max_elements", 5000) or 5000)
                         return safe_reply(
-                            f"I generated the circuit, but I cannot publish it because the .sav is too large for Physics Lab (elements={res.plsav_elements}, limit={limit}). "
-                            "Please simplify the design and try again.",
+                            (
+                                f"我已生成电路，但无法发布：.sav 过大（elements={res.plsav_elements}，limit={limit}）。"
+                                "请简化设计后再试。"
+                                if lang_zh
+                                else (
+                                    f"I generated the circuit, but I cannot publish it because the .sav is too large for Physics Lab (elements={res.plsav_elements}, limit={limit}). "
+                                    "Please simplify the design and try again."
+                                )
+                            ),
                             max_chars=cfg.agent.max_reply_chars,
                         )
 
@@ -4631,19 +5300,41 @@ def _handle_comment(
                         if isinstance(res.summary_id, str) and res.summary_id.strip():
                             open_hint = f"discussion:{res.summary_id.strip()}"
                         return safe_reply(
-                            "Done. I generated Verilog, compiled to .sav with -O4 and '--layout hier', and published it.\n"
-                            f"Category: {cat}\nSummaryID: {res.summary_id}\nOpen hint: {open_hint or ''}".rstrip(),
+                            (
+                                "完成：已生成 Verilog，并用 -O4 和 '--layout hier' 编译为 .sav，且已发布。\n"
+                                f"Category: {cat}\nSummaryID: {res.summary_id}\nOpen hint: {open_hint or ''}".rstrip()
+                                if lang_zh
+                                else (
+                                    "Done. I generated Verilog, compiled to .sav with -O4 and '--layout hier', and published it.\n"
+                                    f"Category: {cat}\nSummaryID: {res.summary_id}\nOpen hint: {open_hint or ''}".rstrip()
+                                )
+                            ),
                             max_chars=cfg.agent.max_reply_chars,
                         )
                     return safe_reply(
-                        "Done. I generated Verilog and compiled a .sav with -O4 and '--layout hier'.\n"
-                        + (
-                            "Publishing is disabled (or dry-run). Enable publishing in config."
-                            if not bool(cfg.agent.enable_publish)
+                        (
+                            "完成：已生成 Verilog，并用 -O4 和 '--layout hier' 编译为 .sav。\n"
+                            + (
+                                "发布功能已关闭（或处于 dry-run）。请在配置中启用发布。"
+                                if not bool(cfg.agent.enable_publish)
+                                else (
+                                    "未检测到发布请求；请明确要求“发布/投稿”，或设置 agent.publish_by_default=true。"
+                                    if not publish_wanted
+                                    else "由于配置原因，未执行发布。"
+                                )
+                            )
+                            if lang_zh
                             else (
-                                "Publishing was not requested. Ask to publish explicitly, or set agent.publish_by_default=true."
-                                if not publish_wanted
-                                else "Publishing did not run due to configuration."
+                                "Done. I generated Verilog and compiled a .sav with -O4 and '--layout hier'.\n"
+                                + (
+                                    "Publishing is disabled (or dry-run). Enable publishing in config."
+                                    if not bool(cfg.agent.enable_publish)
+                                    else (
+                                        "Publishing was not requested. Ask to publish explicitly, or set agent.publish_by_default=true."
+                                        if not publish_wanted
+                                        else "Publishing did not run due to configuration."
+                                    )
+                                )
                             )
                         ),
                         max_chars=cfg.agent.max_reply_chars,
@@ -4799,6 +5490,80 @@ def _handle_comment(
                 return safe_reply(reply, max_chars=cfg.agent.max_reply_chars)
             except Exception as e:
                 return f"Failed to summarize user board: {e}"
+
+        ref = _extract_content_ref_anywhere(arg)
+        if ref is not None and not _is_generic_summarize_arg(arg):
+            cat_hint, sid = ref
+            tried: list[str] = []
+            last_err: BaseException | None = None
+
+            def _try(cat: str) -> dict[str, Any] | None:
+                nonlocal last_err
+                tried.append(cat)
+                try:
+                    ctx2 = get_experiment_context(
+                        user,
+                        summary_id=sid,
+                        category_value=cat,
+                        cache_dir=cache_dir,
+                        ttl_sec=300,
+                        max_json_chars=20_000,
+                    )
+                except Exception as e:
+                    last_err = e
+                    return None
+                return ctx2 if isinstance(ctx2, dict) else None
+
+            ctx = None
+            if cat_hint in ("Experiment", "Discussion"):
+                ctx = _try(cat_hint)
+                if ctx is None and last_err is not None and _is_probable_content_not_found_error(last_err):
+                    ctx = _try("Discussion" if cat_hint == "Experiment" else "Experiment")
+            else:
+                ctx = _try("Experiment") or _try("Discussion")
+
+            if ctx is None:
+                if last_err is not None and _is_probable_content_not_found_error(last_err):
+                    return "未找到该内容。" if lang_zh else "No content found."
+                return (
+                    f"Lookup failed: {_format_exception_brief(last_err) if last_err is not None else 'unknown error'}"
+                )
+
+            blob = (
+                str(ctx.get("title") or "")
+                + "\n"
+                + str(ctx.get("body_text") or "")
+                + "\n"
+                + str(ctx.get("content_text") or "")
+            )
+            if _looks_political_sensitive(blob):
+                return _political_refusal_message(arg)
+
+            messages: list[dict[str, str]] = [{"role": "system", "content": system_prompt}]
+            messages.append(
+                {
+                    "role": "system",
+                    "content": "Context JSON (opened content page):\n"
+                    + json.dumps(_shrink_context_json_for_llm(ctx), ensure_ascii=False, indent=2),
+                }
+            )
+            subj = str(ctx.get("title") or ctx.get("subject") or "").strip() or "(no subject)"
+            cat_final = str(ctx.get("category") or cat_hint or "").strip() or "Unknown"
+            messages.append(
+                {
+                    "role": "user",
+                    "content": (
+                        "Summarize the referenced content using ONLY the Context JSON above.\n"
+                        f"- Include: Category + SummaryID + Subject\n"
+                        f"- Category: {cat_final}\n"
+                        f"- SummaryID: {sid}\n"
+                        f"- Subject: {subj}\n"
+                        "- Keep it under 6 bullets.\n"
+                    ),
+                }
+            )
+            reply = ollama.chat(messages=messages)
+            return safe_reply(reply, max_chars=cfg.agent.max_reply_chars)
 
         use_page_context = experiment_context is not None and _is_generic_summarize_arg(arg)
 
@@ -4987,7 +5752,7 @@ def _handle_comment(
 
     if cmd in ("circuit", "verilog"):
         if not arg:
-            return "Provide a circuit specification after the command."
+            return "请在命令后提供电路规格/需求描述。" if lang_zh else "Provide a circuit specification after the command."
 
         publish_category_value = "Discussion"
         publish_tags = getattr(cfg.agent, "publish_tags", None)
@@ -5032,13 +5797,24 @@ def _handle_comment(
                 publish_tags=publish_tags_list,
             )
         except Exception as e:
-            return f"Circuit generation failed: {e}"
+            return (
+                f"电路生成失败：{_public_error_text(e)}"
+                if lang_zh
+                else f"Circuit generation failed: {_public_error_text(e)}"
+            )
 
         if bool(cfg.agent.enable_publish) and not res.published and res.publish_block_reason == "too_large":
             limit = int(getattr(cfg.agent, "publish_max_elements", 5000) or 5000)
             return safe_reply(
-                f"I generated the circuit, but I cannot publish it because the .sav is too large for Physics Lab (elements={res.plsav_elements}, limit={limit}). "
-                "Please simplify the design and try again.",
+                (
+                    f"我已生成电路，但无法发布：.sav 过大（elements={res.plsav_elements}，limit={limit}）。"
+                    "请简化设计后再试。"
+                    if lang_zh
+                    else (
+                        f"I generated the circuit, but I cannot publish it because the .sav is too large for Physics Lab (elements={res.plsav_elements}, limit={limit}). "
+                        "Please simplify the design and try again."
+                    )
+                ),
                 max_chars=cfg.agent.max_reply_chars,
             )
 
@@ -5048,16 +5824,32 @@ def _handle_comment(
             if isinstance(res.summary_id, str) and res.summary_id.strip():
                 open_hint = f"discussion:{res.summary_id.strip()}"
             return safe_reply(
-                f"Your circuit has been generated and published.\n"
-                f"Category: {cat}\nSummaryID: {res.summary_id}\nOpen hint: {open_hint or ''}".rstrip()
-                + "\n"
-                f"Introduction: {introduction}",
+                (
+                    f"已生成并发布电路。\n"
+                    f"Category: {cat}\nSummaryID: {res.summary_id}\nOpen hint: {open_hint or ''}".rstrip()
+                    + "\n"
+                    f"Introduction: {introduction}"
+                    if lang_zh
+                    else (
+                        f"Your circuit has been generated and published.\n"
+                        f"Category: {cat}\nSummaryID: {res.summary_id}\nOpen hint: {open_hint or ''}".rstrip()
+                        + "\n"
+                        f"Introduction: {introduction}"
+                    )
+                ),
                 max_chars=cfg.agent.max_reply_chars,
             )
 
         return safe_reply(
-            "Circuit generated, but not published (publish disabled or dry-run). "
-            "Ask an admin to enable publishing, or re-run the agent with publish enabled.",
+            (
+                "电路已生成，但未发布（发布功能关闭或 dry-run）。"
+                "请联系管理员启用发布，或在启用发布的配置下重新运行。"
+                if lang_zh
+                else (
+                    "Circuit generated, but not published (publish disabled or dry-run). "
+                    "Ask an admin to enable publishing, or re-run the agent with publish enabled."
+                )
+            ),
             max_chars=cfg.agent.max_reply_chars,
         )
 
@@ -6208,6 +7000,12 @@ def _process_work_item(
 
     posted_ok = False
     if reply:
+        reply = _finalize_public_reply_text(
+            reply,
+            ollama=ollama,
+            user_text=content,
+            max_chars=int(getattr(cfg.agent, "max_reply_chars", 2000) or 2000),
+        )
         prefix = safe_mention_prefix(nickname) if nickname else None
         post_body = f"{prefix or ''}{_strip_public_mentions(reply)}".strip()
         if dry_run:
@@ -6882,6 +7680,10 @@ def _public_error_text(err: Exception, *, max_chars: int = 600) -> str:
     msg = str(err).strip()
     if not msg:
         msg = err.__class__.__name__
+    # Avoid leaking large internal response dumps (common in Ollama errors).
+    for sep in ("Response preview:", "Response preview：", "response preview:", "details=", "Details="):
+        if sep in msg:
+            msg = msg.split(sep, 1)[0].rstrip()
     msg = _ABS_PATH_RE.sub("<path>", msg)
     return truncate(msg, max_chars=max_chars)
 
