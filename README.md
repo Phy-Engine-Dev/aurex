@@ -53,8 +53,7 @@ curl --noproxy '*' http://127.0.0.1:8000/health
 网页默认监听 `0.0.0.0:4097`；访问码仅在部署机器上通过 `cat .config/web-token` 查看。持有访问码的人可以访问此工作台的会话与文件，因此只应经可信的内网或 Tailscale 使用，不能把端口和访问码公开到互联网。
 
 ```bash
-bash scripts/aurex-web.sh start          # 启动网页与本地队列
-bash scripts/aurex-web.sh start --poll   # 额外轮询明确 @aurex 的社区消息
+bash scripts/aurex-web.sh start          # 启动网页、队列与持续社区轮询
 bash scripts/aurex-web.sh status         # 健康检查
 bash scripts/aurex-web.sh stop           # 停止服务，不删数据库、缓存或模型
 ```
@@ -167,7 +166,7 @@ bash scripts/aurex-web.sh start
 
 ```bash
 # 首先在配置中选择 agent.dry_run；true只检查，不发社区评论。
-bash scripts/aurex-web.sh start --poll
+bash scripts/aurex-web.sh start
 bash scripts/aurex-web.sh status
 bash scripts/aurex-web.sh stop
 

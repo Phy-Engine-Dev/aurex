@@ -226,7 +226,7 @@ class TaskControlHTTPTests(unittest.TestCase):
             mock.patch.dict(os.environ,{self.cfg.tracking.token_env:"test-task-control"})]
         for patch in self.patches:patch.start()
         def launch():
-            try:web.serve(cfg=self.cfg,config_path=str(Path(self.temp.name)/"config.json"),agent=self.agent)
+            try:web.serve(cfg=self.cfg,config_path=str(Path(self.temp.name)/"config.json"),agent=self.agent,poll=False)
             except Exception as error:self.error.append(error);self.started.set()
         self.thread=threading.Thread(target=launch)
         self.thread.start()

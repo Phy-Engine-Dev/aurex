@@ -57,33 +57,6 @@ class CLIQueueTests(unittest.TestCase):
             code = args.func(args)
         return code, output.getvalue(), errors.getvalue()
 
-    def test_run_v3_uses_one_durable_queue_and_once_waits_for_completion(self):
-        enqueues = []
-        def poll(**kwargs):
-            self.assertTrue(callable(kwargs['enqueue']))
-            for index in range(2):
-                enqueues.append(kwargs['enqueue']('community', 'Comment ' + str(index), task_id='comment-' + str(index),
-                    source='community', requester_user_id='trusted-author', reply_id='reply-' + str(index),
-                    target={'type': 'Experiment', 'id': 'post'}, metadata={'dry_run': True}))
-        with mock.patch.object(cli, 'run_forever', side_effect=poll) as run:
-            code, _, _ = self.invoke('run', '--once', '--dry-run')
-        self.assertEqual(code, 0)
-        self.assertEqual(self.calls, enqueues)
-        self.assertTrue(run.call_args.kwargs['once'])
-        self.assertTrue(run.call_args.kwargs['dry_run'])
-        self.assertTrue(all(self.db.get_task(rid)['status'] == 'completed' for rid in enqueues))
-        self.assertTrue(all(self.db.get_task(rid)['metadata']['dry_run'] for rid in enqueues))
-
-    def test_run_fails_without_polling_if_web_worker_owns_database(self):
-        owner = PersistentTaskQueue(self.db, self.agent)
-        owner.start()
-        self.addCleanup(lambda: owner.close(wait=True, timeout=5))
-        with mock.patch.object(cli, 'run_forever') as run:
-            with self.assertRaisesRegex(ConfigError, 'already owns this database'):
-                self.invoke('run', '--once')
-        run.assert_not_called()
-        self.agent.handle.assert_not_called()
-
     def test_chat_joins_existing_worker_without_executing_another_agent(self):
         owner_agent = mock.Mock()
         owner_agent.handle.side_effect = self.handle
@@ -99,6 +72,17 @@ class CLIQueueTests(unittest.TestCase):
         self.assertEqual(task['source'], 'admin')
         self.assertIsNone(task['requester_user_id'])
         self.assertFalse(task['explicit_publish_requested'])
+
+    def test_web_is_the_only_community_entrypoint_and_polls_by_default(self):
+        with mock.patch('aurex.web.serve') as serve:
+            code, _, _ = self.invoke('web')
+        self.assertEqual(code, 0)
+        self.assertTrue(cli._login_if_needed.call_args.kwargs['enabled'])
+        self.assertNotIn('poll', serve.call_args.kwargs)
+        with self.assertRaises(SystemExit):
+            self.args('run', '--once')
+        with self.assertRaises(SystemExit):
+            self.args('web', '--poll')
 
     def test_standalone_chat_executes_older_fifo_task_before_own_request(self):
         older = self.db.enqueue_task('older', 'Previously queued task', task_id='older-task', source='web')
@@ -153,13 +137,6 @@ class CLIQueueTests(unittest.TestCase):
         self.assertEqual(own['status'], 'cancelled')
         self.agent.handle.assert_not_called()
         queue.close.assert_called_once_with(wait=False)
-
-    def test_legacy_run_does_not_change_protocol(self):
-        self.cfg = replace(self.cfg, llm=LLMConfig(enabled=False))
-        with mock.patch.object(cli, 'run_forever') as run:
-            self.assertEqual(self.invoke('run', '--once')[0], 0)
-        self.assertNotIn('enqueue', run.call_args.kwargs)
-        self.agent.handle.assert_not_called()
 
 
 if __name__ == '__main__':

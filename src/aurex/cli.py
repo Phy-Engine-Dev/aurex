@@ -13,7 +13,6 @@ import plar
 from .agent import AurexAgent
 from .config import AurexConfig, ConfigError, load_config, save_config
 from .logutil import setup_logger
-from .runloop import default_state_path, normalize_targets, parse_target, run_forever
 from .tools import create_registry
 
 
@@ -160,40 +159,6 @@ def cmd_console(args: argparse.Namespace) -> int:
     return 0
 
 
-def cmd_run(args: argparse.Namespace) -> int:
-    cfg = load_config(args.config)
-    cache_dir = cfg.resolve_path(cfg.storage.cache_dir, config_path=args.config)
-    logger = setup_logger(cache_dir=cache_dir, level=str(getattr(cfg.agent, "log_level", "INFO") or "INFO"))
-    tools = create_registry()
-    agent = AurexAgent(cfg=cfg, config_path=args.config, tools=tools, logger=logger)
-
-    user = _login_if_needed(cfg, args.config, enabled=True)
-    targets_cli = [parse_target(x) for x in (args.target or [])]
-    targets_cfg = normalize_targets(getattr(cfg.agent, "targets", []) or [])
-    targets = normalize_targets(list(targets_cli) + list(targets_cfg))
-
-    state_path = args.state or default_state_path(args.config)
-    options = dict(cfg=cfg, config_path=args.config, agent=agent, user=user, targets=targets,
-                   state_path=state_path, once=bool(args.once),
-                   dry_run=(bool(args.dry_run) if args.dry_run is not None else None), logger=logger)
-    if cfg.llm.enabled:
-        from .web import PersistentTaskQueue
-        queue = PersistentTaskQueue(_task_database(cfg, args.config), agent, user=user, logger=logger)
-        try:
-            try:
-                queue.start()
-            except BlockingIOError as exc:
-                raise ConfigError('A task worker already owns this database. Use the running Web service with --poll; a second polling worker will not bypass its FIFO queue.') from exc
-            run_forever(**options, enqueue=queue.enqueue)
-            if args.once:
-                queue.wait_idle()
-        finally:
-            queue.close(wait=True)
-    else:
-        run_forever(**options)
-    return 0
-
-
 def cmd_web(args: argparse.Namespace) -> int:
     from .web import serve
     cfg = load_config(args.config)
@@ -202,9 +167,10 @@ def cmd_web(args: argparse.Namespace) -> int:
     cache_dir = cfg.resolve_path(cfg.storage.cache_dir, config_path=args.config)
     logger = setup_logger(cache_dir=cache_dir, level=cfg.agent.log_level)
     agent = AurexAgent(cfg=cfg, config_path=args.config, tools=create_registry(), logger=logger)
-    user = _login_if_needed(cfg, args.config, enabled=bool(args.login or args.poll))
+    # The Web service always owns the persistent community polling loop.
+    user = _login_if_needed(cfg, args.config, enabled=True)
     serve(cfg=cfg, config_path=args.config, agent=agent, user=user,
-          hostname=args.hostname, port=args.port, poll=args.poll, logger=logger)
+          hostname=args.hostname, port=args.port, logger=logger)
     return 0
 
 
@@ -231,25 +197,10 @@ def build_parser() -> argparse.ArgumentParser:
     p_console.add_argument("--publish", action="store_true", help="explicitly request reviewed experiment publication for this administrator task")
     p_console.set_defaults(func=cmd_console)
 
-    p_run = sub.add_parser("run", help="poll targets and auto-reply in a loop (like v1)")
-    p_run.add_argument("--config", required=True, help="config path to read")
-    p_run.add_argument("--state", default="", help="state path (default: <config_stem>.state.json)")
-    p_run.add_argument("--target", action="append", default=[], help="override/add target (e.g. Experiment:<id>)")
-    p_run.add_argument("--once", action="store_true", help="poll once then exit")
-    p_run.add_argument(
-        "--dry-run",
-        action="store_true",
-        default=None,
-        help="do not post comments (print actions only); overrides config.agent.dry_run",
-    )
-    p_run.set_defaults(func=cmd_run)
-
     p_web = sub.add_parser('web', help='start the vLLM vision agent and durable per-session Web tracker')
     p_web.add_argument('--config', required=True)
     p_web.add_argument('--hostname', default=None)
     p_web.add_argument('--port', type=int, default=None)
-    p_web.add_argument('--login', action='store_true', help='enable authenticated PhysicsLab read tools')
-    p_web.add_argument('--poll', action='store_true', help='also poll and reply to explicitly addressed community mentions')
     p_web.set_defaults(func=cmd_web)
 
     return p

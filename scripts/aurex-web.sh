@@ -16,8 +16,11 @@ case "${1:-status}" in
       echo "Aurex already running"; exit 0
     fi
     [[ -f "$config" ]] || { echo "Run scripts/configure-aurex3.py first" >&2; exit 1; }
-    shift || true
-    nohup setsid "$root/.venv/bin/python" -m aurex web --config "$config" --login "$@" >"$root/.aurex/web.log" 2>&1 </dev/null &
+    if (($# != 1)); then
+      echo "Usage: $0 start | stop | status" >&2
+      exit 2
+    fi
+    nohup setsid "$root/.venv/bin/python" -m aurex web --config "$config" >"$root/.aurex/web.log" 2>&1 </dev/null &
     printf '%s\n' "$!" > "$pidfile"
     echo "Aurex starting; log: $root/.aurex/web.log"
     ;;
@@ -46,5 +49,5 @@ case "${1:-status}" in
     curl --noproxy '*' --fail --silent http://127.0.0.1:4097/health
     echo
     ;;
-  *) echo "Usage: $0 start [--poll] | stop | status" >&2; exit 2 ;;
+  *) echo "Usage: $0 start | stop | status" >&2; exit 2 ;;
 esac

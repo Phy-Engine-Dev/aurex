@@ -129,7 +129,7 @@ class PersistentTaskQueue:
                 self.lock_file = None
 
 
-def serve(*, cfg, config_path, agent, user=None, hostname=None, port=None, poll=False, logger=None,
+def serve(*, cfg, config_path, agent, user=None, hostname=None, port=None, poll=True, logger=None,
           on_task_result=None, enqueue_ready=None):
     database = SessionDB(cfg.resolve_path(cfg.tracking.database_path, config_path=config_path))
     cache = Path(cfg.resolve_path(cfg.storage.cache_dir, config_path=config_path)).resolve()
