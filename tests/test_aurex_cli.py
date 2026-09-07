@@ -1,9 +1,8 @@
+from __future__ import annotations
+
 import os
 import sys
-import tempfile
 import unittest
-import io
-import contextlib
 from unittest import mock
 
 
@@ -12,44 +11,55 @@ SRC = os.path.join(ROOT, "src")
 if SRC not in sys.path:
     sys.path.insert(0, SRC)
 
-
-from aurex.cli import main  # noqa: E402
-from aurex.config import AurexConfig, save_config  # noqa: E402
+from aurex import cli  # noqa: E402
 
 
-class _FakeAgent:
-    def __init__(self, **_kwargs):
-        pass
+class TestCliEntrypoints(unittest.TestCase):
+    def test_only_v3_entrypoints_are_public(self):
+        parser = cli.build_parser()
+        self.assertEqual(parser.parse_args(["cli"]).cmd, "cli")
+        self.assertEqual(parser.parse_args(["web", "--config", "x.json"]).cmd, "web")
+        for removed in ("chat", "console", "run"):
+            with self.assertRaises(SystemExit):
+                parser.parse_args([removed])
 
-    def handle(self, *, user_text: str, user=None, task_id=None):
-        return {"answer": f"echo:{user_text}"}
+    def test_web_has_no_manual_poll_switch(self):
+        with self.assertRaises(SystemExit):
+            cli.build_parser().parse_args(["web", "--config", "x.json", "--poll"])
 
+    def test_web_always_logs_in_and_uses_default_polling(self):
+        cfg = mock.Mock()
+        cfg.llm.enabled = True
+        cfg.storage.cache_dir = ".cache"
+        cfg.agent.log_level = "INFO"
+        cfg.resolve_path.return_value = ".cache"
+        args = cli.build_parser().parse_args(["web", "--config", "x.json"])
+        with mock.patch.object(cli, "load_config", return_value=cfg), \
+             mock.patch.object(cli, "_access_token", return_value=""), \
+             mock.patch.object(cli.AurexWebClient, "healthy", return_value=False), \
+             mock.patch.object(cli, "setup_logger", return_value=mock.Mock()), \
+             mock.patch.object(cli, "AurexAgent", return_value=mock.Mock()), \
+             mock.patch.object(cli, "create_registry", return_value=mock.Mock()), \
+             mock.patch.object(cli, "_login", return_value=object()) as login, \
+             mock.patch("aurex.web.serve") as serve:
+            self.assertEqual(args.func(args), 0)
+        login.assert_called_once()
+        self.assertNotIn("poll", serve.call_args.kwargs)
 
-class TestCliConsole(unittest.TestCase):
-    def test_console_prompts_input(self):
-        with tempfile.TemporaryDirectory() as td:
-            cfg_path = os.path.join(td, "cfg.json")
-            save_config(AurexConfig(), cfg_path)
-
-            buf = io.StringIO()
-            with (
-                contextlib.redirect_stdout(buf),
-                mock.patch("aurex.cli.AurexAgent", _FakeAgent),
-                mock.patch.object(sys.stdin, "isatty", return_value=True),
-                mock.patch("builtins.input", return_value="hi"),
-            ):
-                rc = main(["console", "--config", cfg_path])
-            self.assertEqual(rc, 0)
-
-    def test_console_accepts_text_arg(self):
-        with tempfile.TemporaryDirectory() as td:
-            cfg_path = os.path.join(td, "cfg.json")
-            save_config(AurexConfig(), cfg_path)
-
-            buf = io.StringIO()
-            with contextlib.redirect_stdout(buf), mock.patch("aurex.cli.AurexAgent", _FakeAgent):
-                rc = main(["console", "--config", cfg_path, "--text", "hello"])
-            self.assertEqual(rc, 0)
+    def test_web_started_second_reuses_cli_started_server(self):
+        cfg = mock.Mock()
+        cfg.llm.enabled = True
+        cfg.tracking.port = 4097
+        cfg.tracking.token_env = "AUREX_WEB_TOKEN"
+        args = cli.build_parser().parse_args(["web", "--config", "x.json"])
+        with mock.patch.object(cli, "load_config", return_value=cfg), \
+             mock.patch.object(cli, "_access_token", return_value="token"), \
+             mock.patch.object(cli.AurexWebClient, "healthy", return_value=True), \
+             mock.patch.object(cli, "_login") as login, \
+             mock.patch("aurex.web.serve") as serve:
+            self.assertEqual(args.func(args), 0)
+        login.assert_not_called()
+        serve.assert_not_called()
 
 
 if __name__ == "__main__":

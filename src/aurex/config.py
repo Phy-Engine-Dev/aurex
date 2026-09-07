@@ -260,8 +260,6 @@ class AgentConfig:
     comment_take: int = 20
     comment_scan_pages: int = 3
     bootstrap_lookback_sec: int = 600
-    reply_once: bool = False
-    reply_once_ttl_sec: int = 0
     notifications_enabled: bool = True
     notification_category_ids: list[int] = field(default_factory=lambda: [3])
     notification_take: int = 20
@@ -519,12 +517,6 @@ def load_config(path: str) -> AurexConfig:
             if "bootstrap_lookback_sec" in agent_raw
             else agent_defaults.bootstrap_lookback_sec
         ),
-        reply_once=bool(
-            agent_raw.get("reply_once")
-            if "reply_once" in agent_raw
-            else AurexConfig().agent.reply_once
-        ),
-        reply_once_ttl_sec=int(agent_raw.get("reply_once_ttl_sec") or 0),
         notifications_enabled=bool(
             agent_raw.get("notifications_enabled")
             if "notifications_enabled" in agent_raw

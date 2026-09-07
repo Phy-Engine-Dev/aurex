@@ -374,7 +374,7 @@ class AurexAgent:
         self.cfg = cfg
         self.config_path = config_path
         self.tools = tools
-        self.logger = logger or logging.getLogger("aurex2")
+        self.logger = logger or logging.getLogger("aurex3")
 
         self.planner_client = OllamaClient(
             base_url=cfg.planner.base_url,

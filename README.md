@@ -160,7 +160,7 @@ cd /home/macromodel/Documents/src/aurex3
 bash scripts/aurex-web.sh start
 ```
 
-配置脚本从 `aurex3.config.example.json` 生成 `.config/aurex3.json`，可读取既有 `.config/aurex2.json` 中的测试账号；配置及访问码权限为0600，均被 Git 忽略。不要把账号密码或访问码放进公开配置。已有文件不会被覆盖。
+配置脚本从 `aurex3.config.example.json` 生成 `.config/aurex3.json`；配置及访问码权限为0600，均被 Git 忽略。请在私有配置中填写社区账号，不要把账号密码或访问码放进公开配置。已有文件不会被覆盖。
 
 工作台默认绑定 `0.0.0.0:4097`，本机及 Tailscale 可访问 `http://100.123.133.75:4097`。访问码在 `.config/web-token`。这是单用户工作台：持有访问码者可以查看所有会话及文件，并非多租户隔离服务；不要将HTTP端口暴露到不可信网络。网页支持带图片提问、选择 Experiment/Discussion/User 目标、逐步查看工具结果和图片、下载本地实验文件。
 
@@ -170,11 +170,16 @@ bash scripts/aurex-web.sh start
 bash scripts/aurex-web.sh status
 bash scripts/aurex-web.sh stop
 
-# 单次请求，不向社区发评论
-PYTHONPATH=src .venv/bin/python -m aurex chat --config .config/aurex3.json --login --text '介绍这个实验'
+# 分区式终端界面；Web已经运行时直接连接同一数据库、队列和社区轮询器
+PYTHONPATH=src .venv/bin/python -m aurex cli --config .config/aurex3.json
+
+# 也可以直接运行（默认进入cli，默认配置为.config/aurex3.json）
+PYTHONPATH=src .venv/bin/python -m aurex
 ```
 
-通知轮询只响应显式 `@aurex`，默认新部署 `bootstrap_lookback_sec=0`，避免重答历史消息。Web、通知机器人和管理员API共用持久化FIFO；同一目标/提问者可归入同一会话，但每次用户提交都是独立task（`runs.id`），同一会话也不会把新问题合并成旧任务。一次只运行一个TP2推理链，其它任务保留排队记录。
+CLI与Web是同一个Aurex v3前端：都连接唯一的常驻server、同一个持久化FIFO和社区轮询器。Web已运行时CLI直接附着；CLI先启动时会先拉起同一个后台Web server再附着，随后启动Web只会识别并复用它。因此两种启动顺序都不会创建第二个worker，退出CLI也不会中断server或当前队列。终端按服务、任务队列、会话、当前任务时间线、输入区分区，`Tab`切换区域、方向键选择、`Enter`进入；输入`/help`可查看新会话、切换会话/任务、取消、显式发布和退出命令。旧版`chat`、`console`、`run --once`以及手动`--poll`入口均不存在。
+
+通知轮询只响应显式 `@aurex`，默认新部署 `bootstrap_lookback_sec=0`，避免重答历史消息。Web、CLI、通知机器人和管理员API共用持久化FIFO；同一目标/提问者可归入同一会话，但每次用户提交都是独立task（`runs.id`），同一会话也不会把新问题合并成旧任务。一次只运行一个TP2推理链，其它任务保留排队记录。
 
 管理员使用 `POST /api/tasks` 提交原始请求，可指定已有 `session_id`；不指定则建立新会话。`GET /api/tasks`、`GET /api/tasks/:id` 查询队列和独立状态；`POST /api/tasks/:id/cancel` 只请求安全边界取消。HTTP客户端不能传 `source`、`purpose`、`metadata` 或自定task ID；`source=admin` 由端点确定。访问码是单管理员权限，不是对外公开的匿名提问接口。
 

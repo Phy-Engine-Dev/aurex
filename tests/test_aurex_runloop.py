@@ -152,12 +152,5 @@ class TestNotificationsScan(unittest.TestCase):
         self.assertGreater(int(state.comments_last_seen_ms.get("User:0123456789abcdef01234567") or 0), 0)
         self.assertLessEqual(int(state.comments_last_seen_ms.get("User:0123456789abcdef01234567") or 0), 1770000002000)
 
-
-class TestReplyOnceRemoved(unittest.TestCase):
-    def test_reply_once_is_disabled_by_default(self):
-        cfg = AurexConfig()
-        self.assertFalse(bool(cfg.agent.reply_once))
-
-
 if __name__ == "__main__":
     unittest.main()

@@ -8,16 +8,12 @@ import secrets
 
 root = Path(__file__).resolve().parents[1]
 parser = argparse.ArgumentParser()
-parser.add_argument('--account-from', default='.config/aurex2.json')
 parser.add_argument('--output', default='.config/aurex3.json')
 args = parser.parse_args()
 output = root / args.output
 if output.exists():
     raise SystemExit('Configuration already exists; refusing to overwrite it')
 cfg = json.loads((root / 'aurex3.config.example.json').read_text())
-source = root / args.account_from
-if source.is_file():
-    cfg['account'] = json.loads(source.read_text()).get('account', {})
 for section, keys in [('storage', ['cache_dir', 'context_db_path']), ('tracking', ['database_path']),
                       ('phy_engine', ['cmake_source_dir', 'cmake_build_dir'])]:
     for key in keys:
@@ -34,4 +30,3 @@ if not token_file.exists():
         file.write(secrets.token_urlsafe(32) + '\n')
 print('Created private config:', output)
 print('Web access token is stored in:', token_file)
-

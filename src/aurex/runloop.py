@@ -186,7 +186,7 @@ def _has_explicit_mention(*, text: str, mention_tag: str) -> bool:
     mt_cf = mt.casefold()
     s = _extract_trigger_text(text).casefold()
 
-    # Prefer a robust @mention match (allow optional whitespace after '@' and avoid matching '@aurex2').
+    # Prefer a robust @mention match and reject longer names that only share its prefix.
     if mt_cf.startswith("@") or mt_cf.startswith("＠"):
         name = mt_cf[1:].strip()
         if not name:
@@ -513,7 +513,7 @@ def _discover_targets_from_notifications(
     if logger is None:
         import logging
 
-        logger = logging.getLogger("aurex2")
+        logger = logging.getLogger("aurex3")
 
     take = int(getattr(cfg.agent, "notification_take", 20) or 20)
     if take <= 0:
@@ -640,7 +640,7 @@ def run_forever(
     if logger is None:
         import logging
 
-        logger = logging.getLogger("aurex2")
+        logger = logging.getLogger("aurex3")
     notifications_enabled = bool(getattr(cfg.agent, "notifications_enabled", True))
     if not targets and not notifications_enabled:
         raise RunLoopError("No targets configured. Add agent.targets in config or pass --target.")

@@ -1054,7 +1054,7 @@ def plar_upload_sav(runtime: ToolRuntime, args: dict[str, Any]) -> dict[str, Any
         pass
     title = str(args.get("title") or "").strip()
     introduction = str(args.get("introduction") or "").strip()
-    # NOTE: In aurex2, auto-publish is forced to the Discussion area.
+    # Community experiment publication is always placed in Discussion.
     # Keep accepting `args.category` for backward compatibility, but ignore it.
     category = "Discussion"
     tags = args.get("tags")
@@ -1308,7 +1308,7 @@ PLAR_EXPERIMENT_FILE_TOOL = {
 
 PLAR_UPLOAD_SAV_TOOL = {
     "name": "plar_upload_sav",
-    "description": "Upload the task-staged cached .sav to PhysicsLab and confirm it (forced to Discussion in aurex2).",
+    "description": "Upload the task-staged cached .sav to PhysicsLab and confirm it in Discussion.",
     "parameters": {
         "type": "object",
         "properties": {

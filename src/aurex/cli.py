@@ -2,8 +2,9 @@ from __future__ import annotations
 
 import argparse
 import getpass
-import json
 import os
+from pathlib import Path
+import subprocess
 import sys
 import time
 from typing import Any
@@ -13,206 +14,177 @@ import plar
 from .agent import AurexAgent
 from .config import AurexConfig, ConfigError, load_config, save_config
 from .logutil import setup_logger
+from .terminal import AurexWebClient, DashboardState, TerminalApp, WebAPIError
 from .tools import create_registry
 
 
-def _read_stdin_text() -> str:
-    try:
-        return sys.stdin.read()
-    except Exception:
-        return ""
-
-
 def _env_password() -> str:
-    for k in ("AUREX_PASSWORD", "PHYSICSLAB_PASSWORD", "PHY_LAB_PASSWORD"):
-        v = os.environ.get(k)
-        if isinstance(v, str) and v.strip():
-            return v
+    for key in ("AUREX_PASSWORD", "PHYSICSLAB_PASSWORD", "PHY_LAB_PASSWORD"):
+        value = os.environ.get(key)
+        if isinstance(value, str) and value.strip():
+            return value
     return ""
 
 
-def _login_if_needed(cfg: AurexConfig, config_path: str, enabled: bool) -> Any | None:
-    if not enabled:
-        return None
+def _login(cfg: AurexConfig, config_path: str) -> Any:
     email = (cfg.account.email or "").strip()
     if not email:
         raise SystemExit("config.account.email is empty; cannot login")
-    pw = _env_password()
-    if not pw:
-        pw = str(getattr(cfg.account, "password", "") or "").strip()
-    if not pw:
-        pw = getpass.getpass("PhysicsLab password: ")
+    password = _env_password() or str(getattr(cfg.account, "password", "") or "").strip()
+    if not password:
+        password = getpass.getpass("PhysicsLab password: ")
     cache_dir = cfg.resolve_path(cfg.storage.cache_dir, config_path=config_path)
-    return plar.email_login(email=email, password=pw, cache_dir=cache_dir)
+    return plar.email_login(email=email, password=password, cache_dir=cache_dir)
+
+
+def _access_token(cfg: AurexConfig, config_path: str) -> str:
+    token = os.environ.get(cfg.tracking.token_env, "").strip()
+    if token:
+        return token
+    candidate = Path(config_path).resolve().with_name("web-token")
+    try:
+        return candidate.read_text(encoding="utf-8").strip()
+    except OSError:
+        return ""
+
+
+def _local_url(cfg: AurexConfig, port: int | None = None) -> str:
+    return f"http://127.0.0.1:{port or cfg.tracking.port}"
 
 
 def cmd_init(args: argparse.Namespace) -> int:
-    path = args.config
     cfg = AurexConfig()
     if args.email:
         cfg = AurexConfig(account=cfg.account.__class__(email=str(args.email).strip()))
-    save_config(cfg, path)
-    print(path)
+    save_config(cfg, args.config)
+    print(args.config)
     return 0
 
 
-def _task_database(cfg: AurexConfig, config_path: str):
-    from .sessiondb import SessionDB
-    return SessionDB(cfg.resolve_path(cfg.tracking.database_path, config_path=config_path))
-
-
-def _queued_local_task(*, cfg, config_path, agent, user, logger, text, publish=False) -> int:
-    """Submit one administrator task; attach to the existing worker if it owns the DB.
-
-    A CLI request never bypasses FIFO through agent.handle. The existing Web worker
-    retains its own login/configuration; --login here cannot change that worker.
-    """
-    from .web import PersistentTaskQueue
-    db = _task_database(cfg, config_path)
-    queue = PersistentTaskQueue(db, agent, user=user, logger=logger)
-    owns_worker, rid = False, None
+def _spawn_shared_web(cfg: AurexConfig, config_path: str, *, hostname: str | None,
+                      port: int | None, token: str) -> subprocess.Popen:
+    """Start the canonical detached server used by both terminal and browser UIs."""
+    config = str(Path(config_path).resolve())
+    database = Path(cfg.resolve_path(cfg.tracking.database_path, config_path=config)).resolve()
+    runtime = database.parent
+    runtime.mkdir(parents=True, exist_ok=True)
+    pidfile = runtime / "web.pid"
     try:
-        try:
-            queue.start()
-            owns_worker = True
-        except BlockingIOError:
-            # Producer-only attachment: never recover/steal a live worker's task.
-            print('Using the existing worker queue; its configuration and login remain in effect.', file=sys.stderr)
-        rid = queue.enqueue(None, text, source='admin', explicit_publish_requested=bool(publish),
-                            metadata={'entrypoint': 'cli'})
-        task = db.get_task(rid)
-        sid = task['session_id']
-        print('Queued task ' + rid + ' (session ' + sid + ')', file=sys.stderr, flush=True)
-        while task['status'] in {'queued', 'running', 'cancelling'}:
+        old_pid = int(pidfile.read_text(encoding="utf-8").strip())
+        os.kill(old_pid, 0)
+    except (FileNotFoundError, ValueError, ProcessLookupError):
+        pidfile.unlink(missing_ok=True)
+    except PermissionError as exc:
+        raise SystemExit("现有Aurex服务进程不可检查：" + str(exc)) from exc
+    else:
+        raise SystemExit(f"Aurex服务进程 {old_pid} 已存在但健康检查失败；拒绝启动第二个server")
+
+    command = [sys.executable, "-m", "aurex", "web", "--config", config]
+    if hostname:
+        command.extend(["--hostname", hostname])
+    if port:
+        command.extend(["--port", str(port)])
+    environment = os.environ.copy()
+    if token:
+        environment[cfg.tracking.token_env] = token
+    log_path = runtime / "web.log"
+    with log_path.open("ab", buffering=0) as log:
+        process = subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT,
+                                   cwd=str(Path(config).parent.parent), env=environment, start_new_session=True)
+    pidfile.write_text(str(process.pid) + "\n", encoding="utf-8")
+    return process
+
+
+def cmd_cli(args: argparse.Namespace) -> int:
+    cfg = load_config(args.config)
+    if not cfg.llm.enabled:
+        raise ConfigError("CLI agent requires llm.enabled=true with a vLLM endpoint")
+    token = _access_token(cfg, args.config)
+    url = (args.url or _local_url(cfg, args.port)).rstrip("/")
+    api = AurexWebClient(url, token)
+    spawned: subprocess.Popen | None = None
+
+    if not api.healthy():
+        if args.url:
+            raise SystemExit("指定的 Aurex Web 不可用；--url 模式不会另起服务")
+        spawned = _spawn_shared_web(
+            cfg, args.config, hostname=args.hostname, port=args.port, token=token)
+        deadline = time.monotonic() + 20.0
+        while time.monotonic() < deadline and not api.healthy():
+            if spawned.poll() is not None:
+                raise SystemExit(f"Aurex后端启动失败，退出码 {spawned.returncode}；请检查 .aurex/web.log")
             time.sleep(0.1)
-            task = db.get_task(rid)
-        # Read the persisted final event, not an in-memory callback that is lost on restart.
-        with db.connect() as conn:
-            answer = conn.execute("SELECT data FROM events WHERE run_id=? AND session_id=? AND kind='answer' ORDER BY id DESC LIMIT 1", (rid, sid)).fetchone()
-            reviewed = conn.execute('''SELECT m.data FROM final_answers f JOIN messages m ON m.id=f.message_id
-                AND m.session_id=f.session_id WHERE f.run_id=? AND f.session_id=?''', (rid, sid)).fetchone()
-        if answer:
-            print(str(json.loads(answer['data']).get('text', '')))
-        elif reviewed:
-            print(str(json.loads(reviewed['data']).get('content', '')))
-        else:
-            print('Task ' + rid + ': ' + task['status'] + '. Details remain in the task journal.')
-        return 0 if task['status'] == 'completed' else 130 if task['status'] == 'cancelled' else 1
+        if not api.healthy():
+            raise SystemExit("Aurex 后端在 20 秒内未就绪")
+
+    state = DashboardState(api)
+    try:
+        if not sys.stdin.isatty() or not sys.stdout.isatty():
+            state.refresh()
+            print(state.plain_text())
+            return 0
+        import curses
+        curses.wrapper(TerminalApp(state).run)
+        return 0
     except KeyboardInterrupt:
-        if rid:
-            db.request_cancel(db.get_task(rid)['session_id'], rid)
-            print('Stop requested for task ' + rid + '; waiting for a safe boundary. Existing external receipts remain authoritative.', file=sys.stderr)
-        raise
-    finally:
-        # A producer-only CLI does not close the other process's worker or lock.
-        queue.close(wait=owns_worker)
-
-
-def cmd_chat(args: argparse.Namespace) -> int:
-    cfg = load_config(args.config)
-    cache_dir = cfg.resolve_path(cfg.storage.cache_dir, config_path=args.config)
-    logger = setup_logger(cache_dir=cache_dir, level=str(getattr(cfg.agent, "log_level", "INFO") or "INFO"))
-    tools = create_registry()
-    agent = AurexAgent(cfg=cfg, config_path=args.config, tools=tools, logger=logger)
-    user = _login_if_needed(cfg, args.config, enabled=bool(args.login))
-
-    text = (args.text or "").strip()
-    if not text:
-        text = _read_stdin_text().strip()
-    if not text:
-        raise SystemExit("No input text provided (use --text or pipe stdin).")
-
-    if cfg.llm.enabled:
-        return _queued_local_task(cfg=cfg, config_path=args.config, agent=agent, user=user, logger=logger,
-                                  text=text, publish=getattr(args, 'publish', False))
-    out = agent.handle(user_text=text, user=user)
-    print(out["answer"])
-    return 0
-
-
-def cmd_console(args: argparse.Namespace) -> int:
-    """Interactive one-shot console chat for quick local testing."""
-    cfg = load_config(args.config)
-    cache_dir = cfg.resolve_path(cfg.storage.cache_dir, config_path=args.config)
-    logger = setup_logger(cache_dir=cache_dir, level=str(getattr(cfg.agent, "log_level", "INFO") or "INFO"))
-    tools = create_registry()
-    agent = AurexAgent(cfg=cfg, config_path=args.config, tools=tools, logger=logger)
-    user = _login_if_needed(cfg, args.config, enabled=bool(args.login))
-
-    text = (args.text or "").strip()
-    if not text:
-        if hasattr(sys.stdin, "isatty") and not sys.stdin.isatty():
-            text = _read_stdin_text().strip()
-        else:
-            try:
-                text = input("You> ").strip()
-            except EOFError:
-                text = ""
-    if not text:
-        raise SystemExit("No input text provided.")
-
-    if cfg.llm.enabled:
-        return _queued_local_task(cfg=cfg, config_path=args.config, agent=agent, user=user, logger=logger,
-                                  text=text, publish=getattr(args, 'publish', False))
-    out = agent.handle(user_text=text, user=user)
-    print(out["answer"])
-    return 0
+        return 130
+    except WebAPIError as exc:
+        print("Aurex CLI error: " + str(exc), file=sys.stderr)
+        return 1
 
 
 def cmd_web(args: argparse.Namespace) -> int:
     from .web import serve
     cfg = load_config(args.config)
     if not cfg.llm.enabled:
-        raise ConfigError('Web agent requires llm.enabled=true with a vLLM endpoint')
+        raise ConfigError("Web agent requires llm.enabled=true with a vLLM endpoint")
+    existing = AurexWebClient(_local_url(cfg, args.port), _access_token(cfg, args.config))
+    if existing.healthy():
+        print("Aurex统一server已经运行；Web和CLI将使用同一服务。")
+        return 0
     cache_dir = cfg.resolve_path(cfg.storage.cache_dir, config_path=args.config)
     logger = setup_logger(cache_dir=cache_dir, level=cfg.agent.log_level)
     agent = AurexAgent(cfg=cfg, config_path=args.config, tools=create_registry(), logger=logger)
-    # The Web service always owns the persistent community polling loop.
-    user = _login_if_needed(cfg, args.config, enabled=True)
+    user = _login(cfg, args.config)
     serve(cfg=cfg, config_path=args.config, agent=agent, user=user,
           hostname=args.hostname, port=args.port, logger=logger)
     return 0
 
 
 def build_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(prog="aurex", description="Aurex physical laboratory agent and conversation tracker")
-    sub = p.add_subparsers(dest="cmd", required=True)
+    parser = argparse.ArgumentParser(prog="aurex", description="Aurex physical laboratory agent")
+    sub = parser.add_subparsers(dest="cmd", required=True)
 
-    p_init = sub.add_parser("init", help="write a fresh config file")
-    p_init.add_argument("--config", required=True, help="config path to write")
-    p_init.add_argument("--email", default="", help="PhysicsLab account email")
-    p_init.set_defaults(func=cmd_init)
+    init = sub.add_parser("init", help="write a fresh config file")
+    init.add_argument("--config", required=True, help="config path to write")
+    init.add_argument("--email", default="", help="PhysicsLab account email")
+    init.set_defaults(func=cmd_init)
 
-    p_chat = sub.add_parser("chat", help="run a single agent task from stdin or --text")
-    p_chat.add_argument("--config", required=True, help="config path to read")
-    p_chat.add_argument("--text", default="", help="input text (if empty, read stdin)")
-    p_chat.add_argument("--login", action="store_true", help="login to PhysicsLab (enables plar tools)")
-    p_chat.add_argument("--publish", action="store_true", help="explicitly request reviewed experiment publication for this administrator task")
-    p_chat.set_defaults(func=cmd_chat)
+    cli = sub.add_parser("cli", help="open the sectioned terminal UI and continuous community agent")
+    cli.add_argument("--config", default=os.environ.get("AUREX_CONFIG", ".config/aurex3.json"))
+    cli.add_argument("--url", default="", help="attach to an existing Aurex Web URL")
+    cli.add_argument("--hostname", default=None, help="embedded backend listen address")
+    cli.add_argument("--port", type=int, default=None, help="embedded backend/attachment port")
+    cli.set_defaults(func=cmd_cli)
 
-    p_console = sub.add_parser("console", help="interactive one-shot console chat (for testing)")
-    p_console.add_argument("--config", required=True, help="config path to read")
-    p_console.add_argument("--text", default="", help="input text (if empty, prompt in console; if piped, read stdin)")
-    p_console.add_argument("--login", action="store_true", help="login to PhysicsLab (enables plar tools)")
-    p_console.add_argument("--publish", action="store_true", help="explicitly request reviewed experiment publication for this administrator task")
-    p_console.set_defaults(func=cmd_console)
-
-    p_web = sub.add_parser('web', help='start the vLLM vision agent and durable per-session Web tracker')
-    p_web.add_argument('--config', required=True)
-    p_web.add_argument('--hostname', default=None)
-    p_web.add_argument('--port', type=int, default=None)
-    p_web.set_defaults(func=cmd_web)
-
-    return p
+    web = sub.add_parser("web", help="start Web UI, durable queue and continuous community polling")
+    web.add_argument("--config", required=True)
+    web.add_argument("--hostname", default=None)
+    web.add_argument("--port", type=int, default=None)
+    web.set_defaults(func=cmd_web)
+    return parser
 
 
 def main(argv: list[str] | None = None) -> int:
+    arguments = list(sys.argv[1:] if argv is None else argv)
+    if not arguments:
+        arguments = ["cli"]
     parser = build_parser()
-    ns = parser.parse_args(argv)
+    ns = parser.parse_args(arguments)
     try:
         return int(ns.func(ns))
-    except ConfigError as e:
-        print(f"Config error: {e}", file=sys.stderr)
+    except ConfigError as exc:
+        print(f"Config error: {exc}", file=sys.stderr)
         return 2
 
 
