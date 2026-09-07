@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import shutil
 import subprocess
 from dataclasses import dataclass
 
@@ -14,6 +15,7 @@ class PhyEngineArtifacts:
     build_dir: str
     verilog2plsav_path: str
     phyengine_lib_path: str
+    circuit_view_path: str = ""
 
 
 def _find_verilog2plsav(build_dir: str) -> str:
@@ -48,6 +50,11 @@ def ensure_built(
     os.makedirs(build_dir, exist_ok=True)
 
     cfg_cmd = ["cmake", "-S", source_dir, "-B", build_dir, f"-DCMAKE_BUILD_TYPE={build_type}"]
+    if not os.path.exists(os.path.join(build_dir, "CMakeCache.txt")):
+        compiler = next((name for name in ("clang++-22", "clang++-21", "g++-15", "g++-16") if shutil.which(name)), None)
+        if compiler:
+            cfg_cmd.append(f"-DCMAKE_CXX_COMPILER={compiler}")
+        cfg_cmd.append("-DPHY_ENGINE_USE_LEVELDB=OFF")
     try:
         subprocess.run(cfg_cmd, check=True, capture_output=True, text=True, timeout=timeout_sec)
     except subprocess.TimeoutExpired as e:
@@ -55,7 +62,7 @@ def ensure_built(
     except subprocess.CalledProcessError as e:
         raise PhyEngineBuildError(f"CMake configure failed: {e.stderr or e.stdout}") from e
 
-    build_cmd = ["cmake", "--build", build_dir, "--target", "verilog2plsav", "phyengine"]
+    build_cmd = ["cmake", "--build", build_dir, "--target", "verilog2plsav", "phyengine", "circuit_view", "--parallel", "2"]
     try:
         subprocess.run(build_cmd, check=True, capture_output=True, text=True, timeout=timeout_sec)
     except subprocess.TimeoutExpired as e:
@@ -70,5 +77,7 @@ def ensure_built(
     if not lib:
         raise PhyEngineBuildError("Build succeeded but phyengine shared library not found in build_dir")
 
-    return PhyEngineArtifacts(build_dir=build_dir, verilog2plsav_path=v2p, phyengine_lib_path=lib)
-
+    renderer = os.path.join(build_dir, "circuit_view.exe" if os.name == "nt" else "circuit_view")
+    if not os.path.isfile(renderer):
+        raise PhyEngineBuildError("Build succeeded but circuit_view not found in build_dir")
+    return PhyEngineArtifacts(build_dir=build_dir, verilog2plsav_path=v2p, phyengine_lib_path=lib, circuit_view_path=renderer)

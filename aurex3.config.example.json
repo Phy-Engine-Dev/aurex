@@ -1,0 +1,66 @@
+{
+  "schema_version": 3,
+  "account": {"email": "", "password": ""},
+  "llm": {
+    "enabled": true,
+    "base_url": "http://127.0.0.1:8000/v1",
+    "model": "qwen38-27b",
+    "context_length": 90112,
+    "max_output_tokens": null,
+    "enable_thinking": true,
+    "reasoning_effort": null,
+    "max_images": 2,
+    "image_max_side": 1024,
+    "compact_at_ratio": 0.8,
+    "timeout_sec": 900,
+    "temperature": 0.2
+  },
+  "context": {
+    "auto_compact": true,
+    "prune": false,
+    "reserved_output_tokens": null,
+    "safety_tokens": 2048,
+    "compact_at_ratio": null,
+    "document_budget_ratio": 0.4,
+    "tool_output_tokens": null,
+    "retain_recent_turns": 1,
+    "retain_recent_tokens": null,
+    "summary_max_tokens": 4096,
+    "summary_thinking": false,
+    "prune_keep_tool_results": 4,
+    "prune_images": true,
+    "community_recent_hours": 24,
+    "community_max_comments": 100,
+    "community_recent_comments": 20,
+    "profile": null,
+    "profiles": {
+      "long_tool_session": {"prune": true, "retain_recent_turns": 2},
+      "verbatim": {"auto_compact": false, "prune": false, "prune_images": false}
+    }
+  },
+  "storage": {"cache_dir": ".aurex/cache", "context_db_path": ".aurex/community-context.json"},
+  "tracking": {"database_path": ".aurex/aurex.sqlite3", "hostname": "0.0.0.0", "port": 4097, "token_env": "AUREX_WEB_TOKEN"},
+  "web_search": {"provider": "auto", "max_results": 5, "region": "cn-zh", "base_url": "", "api_key_env": "BRAVE_SEARCH_API_KEY", "timeout_sec": 20},
+  "phy_engine": {
+    "auto_build": true,
+    "cmake_source_dir": "third-parties/Phy-Engine/src",
+    "cmake_build_dir": ".aurex/cache/phy-engine-build",
+    "cmake_build_type": "Release",
+    "build_timeout_sec": 900,
+    "run_timeout_sec": 120,
+    "digital_component_limit": 4096,
+    "verilog2plsav_args": ["-O4", "--layout", "hier"]
+  },
+  "agent": {
+    "require_mention": true,
+    "mention_tag": "@aurex",
+    "max_final_chars": 4000,
+    "task_timeout_sec": 1800,
+    "dry_run": true,
+    "bootstrap_lookback_sec": 0,
+    "poll_interval_sec": 15,
+    "notifications_enabled": true,
+    "context_db_enabled": true,
+    "targets": []
+  }
+}

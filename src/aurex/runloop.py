@@ -15,6 +15,7 @@ from .config import AurexConfig
 from .contextdb import ContextDB
 from .logutil import truncate
 from .replyfmt import prefix_user_mention
+from .publishing import conservative_publish_request
 from .shutdown import GracefulShutdown
 
 
@@ -634,6 +635,7 @@ def run_forever(
     once: bool,
     dry_run: bool | None = None,
     logger: Any | None = None,
+    enqueue=None,
 ) -> None:
     if logger is None:
         import logging
@@ -704,7 +706,9 @@ def run_forever(
     )
 
     shutdown = GracefulShutdown(logger=logger)
-    shutdown.install()
+    import threading
+    if threading.current_thread() is threading.main_thread():
+        shutdown.install()
     try:
         def _sleep_with_shutdown(seconds: float) -> None:
             end_at = time.time() + float(max(0.0, seconds))
@@ -931,9 +935,34 @@ def run_forever(
 
                     ctx = {
                         "target": {"type": tgt.type, "id": tgt.id},
-                        "comment": {"id": cid, "author_id": author_id or None, "author_nickname": author_nick or None},
+                        "comment": {"id": cid, "author_id": author_id or None, "author_nickname": author_nick or None,
+                                    "ts_ms": ts_ms, "text": text, "reply_user_id": reply_user_id, "raw": c},
                     }
                     user_text = "CONTEXT_JSON:\n" + _safe_json(ctx) + "\n\n" + text
+                    if cfg.llm.enabled:
+                        if enqueue is None:
+                            raise RunLoopError("The v3 community agent requires the persistent FIFO task queue")
+                        tid = hashlib.sha256(_safe_json([tgt.type, tgt.id, key]).encode()).hexdigest()[:32]
+                        # Different mentions never share an agent conversation,
+                        # even for the same author and experiment. The comment
+                        # identity still makes retrying ingestion idempotent.
+                        sid = "community-" + tid
+                        # The durable task ID deduplicates ingestion even if the
+                        # older polling cursor is lost after enqueue succeeds.
+                        enqueue(sid, text, prompt=user_text, task_id=tid, source="community",
+                                title=truncate(text, max_chars=100), requester_user_id=author_id or None,
+                                requester_nickname=author_nick or None,
+                                target={"type": tgt.type, "id": tgt.id}, reply_id=cid or None,
+                                explicit_publish_requested=conservative_publish_request(
+                                    text, bot_user_id=self_id, mention_tag=mention_tag),
+                                metadata={"dry_run": bool(dry_run)})
+                        if cid:
+                            state.seen_comment_ids[cid] = cycle_now
+                        enqueued += 1
+                        processed_list.append(key)
+                        processed.add(key)
+                        last_seen_ms = max(last_seen_ms, ts_ms)
+                        continue
                     try:
                         out = agent.handle(user_text=user_text, user=user)
                         reply = str(out.get("answer") or "").strip()
@@ -979,12 +1008,16 @@ def run_forever(
                         )
                     else:
                         try:
+                            if not author_id:
+                                raise RunLoopError("Cannot reply without the original comment author's user ID")
                             plar.post_comment(
                                 user,
                                 target_id=tgt.id,
                                 target_type=tgt.type,
                                 content=reply,
-                                reply_id=cid,
+                                # API ReplyID addresses the replied-to USER.
+                                # cid stays in local ingestion/deduplication only.
+                                reply_id=author_id,
                             )
                             logger.info("[%s] replied comment=%s author=%s", tgt.key, cid, author_nick or author_id)
                         except Exception as e:

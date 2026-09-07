@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 import json
+import math
 import os
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from typing import Any
 
 
@@ -107,6 +108,123 @@ class WebSearchConfig:
     region: str = "cn-zh"
     safesearch: str = "moderate"
     time_range: str = "y"
+    base_url: str = ""
+    api_key_env: str = "BRAVE_SEARCH_API_KEY"
+    timeout_sec: int = 15
+
+
+@dataclass(frozen=True)
+class LLMConfig:
+    enabled: bool = False
+    base_url: str = "http://127.0.0.1:8000/v1"
+    model: str = "qwen38-27b"
+    timeout_sec: int = 600
+    context_length: int = 65536
+    max_output_tokens: int | None = None
+    enable_thinking: bool = True
+    # Explicit opt-in: bounded generated-token diagnostics for no-thinking tool
+    # requests only. No raw IDs/decoded text, task limits, or automatic cancellation.
+    stream_token_progress: bool = False
+    reasoning_effort: str | None = None
+    temperature: float = 0.2
+    max_images: int = 2
+    image_max_side: int = 1024
+    compact_at_ratio: float = 0.80
+    api_key_env: str = "AUREX_LLM_API_KEY"
+
+
+@dataclass(frozen=True)
+class ContextPolicyConfig:
+    """Input management, independent of generation/thinking and durable storage.
+
+    Profiles are administrator-selected flat overrides, not model instructions.
+    None keeps the corresponding legacy/model-derived default.
+    """
+    auto_compact: bool = True
+    prune: bool = False
+    reserved_output_tokens: int | None = None
+    safety_tokens: int = 2048
+    compact_at_ratio: float | None = None
+    document_budget_ratio: float = 0.40
+    tool_output_tokens: int | None = None
+    retain_recent_turns: int = 1
+    retain_recent_tokens: int | None = None
+    summary_max_tokens: int = 4096
+    summary_thinking: bool = False
+    prune_keep_tool_results: int = 4
+    prune_images: bool = True
+    # Retrieval/selection policy, not task/token budgets. Full fetched sources
+    # remain archived even when only a related subset enters active context.
+    community_recent_hours: float = 24.0
+    community_max_comments: int = 100
+    community_recent_comments: int = 20
+    profile: str | None = None
+    profiles: dict[str, dict[str, Any]] = field(default_factory=dict)
+
+    def resolved(self) -> "ContextPolicyConfig":
+        _validate_context_values(asdict(self), where="context")
+        if self.profile is None:
+            return self
+        if self.profile not in self.profiles:
+            raise ConfigError(f"Unknown context.profile: {self.profile}")
+        return replace(self, **self.profiles[self.profile], profile=None, profiles={})
+
+
+def _validate_context_values(raw: dict, *, where: str, overrides: bool = False) -> None:
+    fields = ContextPolicyConfig.__dataclass_fields__
+    for key, value in raw.items():
+        location = f"{where}.{key}"
+        if key not in fields or (overrides and key in {"profile", "profiles"}):
+            raise ConfigError(f"Unknown context policy field: {location}")
+        if key in {"auto_compact", "prune", "summary_thinking", "prune_images"}:
+            _as_bool(value, where=location)
+        elif key in {"reserved_output_tokens", "tool_output_tokens", "retain_recent_tokens"}:
+            if value is not None and (type(value) is not int or value < 0):
+                raise ConfigError(f"{location} must be null or a non-negative integer")
+            if key == "tool_output_tokens" and value == 0:
+                raise ConfigError(f"{location} must be positive when configured")
+        elif key in {"safety_tokens", "retain_recent_turns", "summary_max_tokens", "prune_keep_tool_results"}:
+            minimum = 256 if key == "summary_max_tokens" else 0
+            if type(value) is not int or value < minimum:
+                raise ConfigError(f"{location} must be an integer >= {minimum}")
+        elif key in {"compact_at_ratio", "document_budget_ratio"}:
+            if key == "compact_at_ratio" and value is None:
+                continue
+            if type(value) not in {int, float} or not math.isfinite(value) or not 0 < value <= 1:
+                raise ConfigError(f"{location} must be a finite ratio in (0, 1]")
+        elif key == 'community_recent_hours':
+            if type(value) not in {int, float} or not math.isfinite(value) or value < 0:
+                raise ConfigError(f'{location} must be a finite number >= 0')
+        elif key in {'community_max_comments', 'community_recent_comments'}:
+            maximum = 500 if key == 'community_max_comments' else 100
+            if type(value) is not int or not 1 <= value <= maximum:
+                raise ConfigError(f'{location} must be an integer in 1..{maximum}')
+        elif key == "profile":
+            if value is not None and (not isinstance(value, str) or not value.strip()):
+                raise ConfigError(f"{location} must be null or a non-empty profile name")
+        elif key == "profiles":
+            profiles = _as_dict(value, where=location)
+            for name, policy in profiles.items():
+                if not isinstance(name, str) or not name.strip():
+                    raise ConfigError(f"{location} keys must be non-empty strings")
+                _validate_context_values(_as_dict(policy, where=f"{location}.{name}"),
+                                         where=f"{location}.{name}", overrides=True)
+
+
+def parse_context_policy(raw: Any) -> ContextPolicyConfig:
+    data = _as_dict(raw, where="context")
+    _validate_context_values(data, where="context")
+    policy = ContextPolicyConfig(**data)
+    policy.resolved()  # Validate selected profile without discarding administrator configuration.
+    return policy
+
+
+@dataclass(frozen=True)
+class TrackingConfig:
+    database_path: str = ".aurex/aurex.sqlite3"
+    hostname: str = "0.0.0.0"
+    port: int = 4097
+    token_env: str = "AUREX_WEB_TOKEN"
 
 
 @dataclass(frozen=True)
@@ -117,6 +235,7 @@ class PhyEngineConfig:
     cmake_build_type: str = "Release"
     build_timeout_sec: int = 900
     run_timeout_sec: int = 300
+    digital_component_limit: int = 4096
     verilog2plsav_path: str = ""
     phyengine_lib_path: str = ""
     verilog2plsav_args: list[str] = field(default_factory=lambda: ["-O4", "--layout", "hier"])
@@ -133,6 +252,9 @@ class AgentConfig:
     max_plan_steps: int = 10
     max_tool_loops: int = 20
     max_final_chars: int = 2000
+    # Per-task execution ceiling.  Administrators may lower it, but a single
+    # request must never occupy the worker for more than 30 minutes.
+    task_timeout_sec: int = 1800
     dry_run: bool = False
     poll_interval_sec: float = 15.0
     comment_take: int = 20
@@ -179,6 +301,9 @@ class AurexConfig:
     web_search: WebSearchConfig = field(default_factory=WebSearchConfig)
     phy_engine: PhyEngineConfig = field(default_factory=PhyEngineConfig)
     agent: AgentConfig = field(default_factory=AgentConfig)
+    llm: LLMConfig = field(default_factory=LLMConfig)
+    context: ContextPolicyConfig = field(default_factory=ContextPolicyConfig)
+    tracking: TrackingConfig = field(default_factory=TrackingConfig)
 
     def resolve_path(self, path: str, *, config_path: str) -> str:
         p = (path or "").strip()
@@ -299,9 +424,33 @@ def load_config(path: str) -> AurexConfig:
         region=str(web_raw.get("region") or "cn-zh"),
         safesearch=str(web_raw.get("safesearch") or "moderate"),
         time_range=str(web_raw.get("time_range") or "y"),
+        base_url=str(web_raw.get("base_url") or ""),
+        api_key_env=str(web_raw.get("api_key_env") or "BRAVE_SEARCH_API_KEY"),
+        timeout_sec=int(web_raw.get("timeout_sec") or 15),
     )
-    if web.provider != "duckduckgo":
-        raise ConfigError("Only web_search.provider=duckduckgo is supported")
+    if web.provider not in {"auto", "brave", "searxng", "bing", "duckduckgo", "crossref"}:
+        raise ConfigError("Unsupported web_search.provider")
+
+    llm_raw = _as_dict(root.get("llm") or {}, where="llm")
+    llm = LLMConfig(**{k: v for k, v in llm_raw.items() if k in LLMConfig.__dataclass_fields__})
+    _as_bool(llm.stream_token_progress, where="llm.stream_token_progress")
+    if not 4096 <= llm.context_length <= 1048576:
+        raise ConfigError("llm.context_length must be between 4096 and 1048576")
+    if llm.max_output_tokens is not None and (type(llm.max_output_tokens) is not int or not 256 <= llm.max_output_tokens < llm.context_length):
+        raise ConfigError("llm.max_output_tokens must be null or an integer below llm.context_length")
+    if llm.reasoning_effort not in {None, "low", "medium", "xhigh"}:
+        raise ConfigError("llm.reasoning_effort must be null, low, medium, or xhigh for the Qwen template")
+    if not 0.5 <= llm.compact_at_ratio <= 0.95:
+        raise ConfigError("llm.compact_at_ratio must be between 0.5 and 0.95")
+    if not 1 <= llm.max_images <= 8 or not 224 <= llm.image_max_side <= 1536:
+        raise ConfigError("Invalid llm image budget")
+    context = parse_context_policy(root.get("context", {}))
+    policy = context.resolved()
+    reserve = max(llm.max_output_tokens or 0, policy.reserved_output_tokens or 0)
+    if reserve + policy.safety_tokens >= llm.context_length:
+        raise ConfigError("context output reserve and safety_tokens must leave input space within llm.context_length")
+    tracking_raw = _as_dict(root.get("tracking") or {}, where="tracking")
+    tracking = TrackingConfig(**{k: v for k, v in tracking_raw.items() if k in TrackingConfig.__dataclass_fields__})
 
     pe_raw = _as_dict(root.get("phy_engine") or {}, where="phy_engine")
     verilog2plsav_args = pe_raw.get("verilog2plsav_args")
@@ -309,6 +458,11 @@ def load_config(path: str) -> AurexConfig:
         verilog2plsav_args_list = AurexConfig().phy_engine.verilog2plsav_args
     else:
         verilog2plsav_args_list = [str(x) for x in _as_list(verilog2plsav_args, where="phy_engine.verilog2plsav_args")]
+    from .phy_engine.limits import configured_digital_limit
+    try:
+        digital_component_limit = configured_digital_limit(pe_raw.get("digital_component_limit", 4096))
+    except ValueError as error:
+        raise ConfigError(str(error)) from error
     phy_engine = PhyEngineConfig(
         auto_build=bool(pe_raw.get("auto_build") or False),
         cmake_source_dir=str(pe_raw.get("cmake_source_dir") or AurexConfig().phy_engine.cmake_source_dir),
@@ -316,6 +470,7 @@ def load_config(path: str) -> AurexConfig:
         cmake_build_type=str(pe_raw.get("cmake_build_type") or AurexConfig().phy_engine.cmake_build_type),
         build_timeout_sec=int(pe_raw.get("build_timeout_sec") or AurexConfig().phy_engine.build_timeout_sec),
         run_timeout_sec=int(pe_raw.get("run_timeout_sec") or AurexConfig().phy_engine.run_timeout_sec),
+        digital_component_limit=digital_component_limit,
         verilog2plsav_path=str(pe_raw.get("verilog2plsav_path") or ""),
         phyengine_lib_path=str(pe_raw.get("phyengine_lib_path") or ""),
         verilog2plsav_args=verilog2plsav_args_list,
@@ -323,6 +478,9 @@ def load_config(path: str) -> AurexConfig:
 
     agent_raw = _as_dict(root.get("agent") or {}, where="agent")
     agent_defaults = AurexConfig().agent
+    task_timeout_sec = agent_raw.get("task_timeout_sec", agent_defaults.task_timeout_sec)
+    if type(task_timeout_sec) is not int or not 1 <= task_timeout_sec <= 1800:
+        raise ConfigError("agent.task_timeout_sec must be an integer in 1..1800")
     agent = AgentConfig(
         mention_tag=str(agent_raw.get("mention_tag") or agent_defaults.mention_tag),
         require_mention=bool(
@@ -351,6 +509,7 @@ def load_config(path: str) -> AurexConfig:
         max_plan_steps=int(agent_raw.get("max_plan_steps") or 10),
         max_tool_loops=int(agent_raw.get("max_tool_loops") or 20),
         max_final_chars=int(agent_raw.get("max_final_chars") or 2000),
+        task_timeout_sec=task_timeout_sec,
         dry_run=bool(agent_raw.get("dry_run") or False),
         poll_interval_sec=float(agent_raw.get("poll_interval_sec") or 15.0),
         comment_take=int(agent_raw.get("comment_take") or 20),
@@ -418,6 +577,9 @@ def load_config(path: str) -> AurexConfig:
         web_search=web,
         phy_engine=phy_engine,
         agent=agent,
+        llm=llm,
+        context=context,
+        tracking=tracking,
     )
 
 

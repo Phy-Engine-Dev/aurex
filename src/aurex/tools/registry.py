@@ -34,6 +34,9 @@ class ToolRuntime:
     cache_dir: str
     user: Any | None = None
     planner_client: Any | None = None
+    session_id: str | None = None
+    check_cancel: Callable[[], None] | None = None
+    task_metadata: dict[str, Any] | None = None
 
 
 class ToolRegistry:
@@ -64,4 +67,3 @@ class ToolRegistry:
         for t in self.list():
             out.append(tool_schema(name=t.name, description=t.description, parameters=t.parameters))
         return out
-

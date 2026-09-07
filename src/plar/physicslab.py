@@ -25,27 +25,32 @@ def _vendored_physicslab_dir() -> str:
 
 
 def ensure_physicslab_importable(*, cache_dir: str, http_timeout_sec: float | None = None) -> None:
-    """Make `physicsLab` importable and force its local save dir under `cache_dir`."""
+    """Use the repository's pinned PhysicsLab SDK and set its save directory.
+
+    The SDK is vendored because the community API and PLSAV compatibility
+    surface must not drift with an arbitrary PyPI installation.  A process
+    which imported another SDK before Aurex starts is intentionally left alone
+    rather than replacing live classes underneath it; normal Aurex startup
+    reaches this function before importing ``physicsLab``.
+    """
     cache_dir_abs = os.path.abspath(cache_dir)
     os.makedirs(cache_dir_abs, exist_ok=True)
 
     os.environ["PHYSICSLAB_HOME_PATH"] = os.path.join(cache_dir_abs, "physicsLabSav")
     configure_requests_default_timeout(_DEFAULT_TIMEOUT_SEC if http_timeout_sec is None else float(http_timeout_sec))
 
-    try:
-        import physicsLab  # noqa: F401
-
-        return
-    except ImportError:
-        vendored = _vendored_physicslab_dir()
-        if os.path.isdir(vendored) and vendored not in sys.path:
-            sys.path.insert(0, vendored)
+    vendored = _vendored_physicslab_dir()
+    package = os.path.join(vendored, "physicsLab")
+    if os.path.isdir(package) and vendored not in sys.path:
+        # Put the repository copy ahead of site-packages.  This is deliberately
+        # done before the import, not merely as a fallback after PyPI.
+        sys.path.insert(0, vendored)
 
     try:
         import physicsLab  # noqa: F401
     except ImportError as e:
         raise PLARError(
-            "Could not import `physicsLab`. Install it or vendor it at "
-            "`third-parties/physicsLab`."
+            "The vendored `physicsLab` SDK is missing at "
+            "`third-parties/physicsLab/physicsLab`. Restore the repository "
+            "dependency instead of installing an unpinned PyPI SDK."
         ) from e
-

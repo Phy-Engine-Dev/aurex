@@ -1,4 +1,7 @@
 requests>=2.0.0
+httpx>=0.28.1,<0.29
 duckduckgo-search>=6.0.0
 lxml>=4.9.0
-physicsLab
+Pillow>=10.0
+jsonschema>=4.20
+cairosvg>=2.7

@@ -1,0 +1,2284 @@
+diff --git a/include/phy_engine/model/models/non-linear/BJT_NPN.h b/include/phy_engine/model/models/non-linear/BJT_NPN.h
+index 0ea04ed..9d463c7 100644
+--- a/include/phy_engine/model/models/non-linear/BJT_NPN.h
++++ b/include/phy_engine/model/models/non-linear/BJT_NPN.h
+@@ -1,204 +1,34 @@
+ #pragma once
+ #include <fast_io/fast_io_dsal/string_view.h>
+-#include "../../model_refs/base.h"
++#include "bjt_ebers_moll.h"
+ 
+ namespace phy_engine::model
+ {
+-    struct BJT_NPN
++    struct BJT_NPN : details::bjt_ebers_moll_state
+     {
+-        inline static constexpr ::fast_io::u8string_view model_name{u8"NPN BJT"};
+-
+-        inline static constexpr ::phy_engine::model::model_device_type device_type{::phy_engine::model::model_device_type::non_linear};
+-        inline static constexpr ::fast_io::u8string_view identification_name{u8"QNP"};
+-
+-        // Parameters
+-        double Is{1e-16};
+-        double N{1.0};
+-        double BetaF{100.0};
+-        double Temp{27.0};
+-        double Area{1.0};
+-
+-        // Pins: B, C, E
+-        ::phy_engine::model::pin pins[3]{{{u8"B"}}, {{u8"C"}}, {{u8"E"}}};
+-
+-        // Private state
+-        double Ut{};  // thermal voltage
+-        double Vbe_last{};
+-        double geq_be{};  // diode conductance between B and E
+-        double Ieq_be{};  // diode current source equivalent
+-        double gm{};      // transconductance Ic ≈ gm * Vbe
+-        double Ieq_c{};   // collector current source equivalent
++        inline static constexpr fast_io::u8string_view model_name{u8"NPN BJT"};
++        inline static constexpr model_device_type device_type{model_device_type::non_linear};
++        inline static constexpr fast_io::u8string_view identification_name{u8"QNP"};
++        inline static constexpr double polarity{1};
++        pin pins[3]{{{u8"B"}},{{u8"C"}},{{u8"E"}}};
+     };
+-
+-    static_assert(::phy_engine::model::model<BJT_NPN>);
+-
+-    inline constexpr bool
+-        set_attribute_define(::phy_engine::model::model_reserve_type_t<BJT_NPN>, BJT_NPN& q, ::std::size_t n, ::phy_engine::model::variant vi) noexcept
+-    {
+-        switch(n)
+-        {
+-            case 0:
+-                if(vi.type != ::phy_engine::model::variant_type::d) [[unlikely]] { return false; }
+-                q.Is = vi.d;
+-                return true;
+-            case 1:
+-                if(vi.type != ::phy_engine::model::variant_type::d) [[unlikely]] { return false; }
+-                q.N = vi.d;
+-                return true;
+-            case 2:
+-                if(vi.type != ::phy_engine::model::variant_type::d) [[unlikely]] { return false; }
+-                q.BetaF = vi.d;
+-                return true;
+-            case 3:
+-                if(vi.type != ::phy_engine::model::variant_type::d) [[unlikely]] { return false; }
+-                q.Temp = vi.d;
+-                return true;
+-            case 4:
+-                if(vi.type != ::phy_engine::model::variant_type::d) [[unlikely]] { return false; }
+-                q.Area = vi.d;
+-                return true;
+-            default: return false;
+-        }
+-        return false;
+-    }
+-
+-    static_assert(::phy_engine::model::defines::has_set_attribute<BJT_NPN>);
+-
+-    inline constexpr ::phy_engine::model::variant
+-        get_attribute_define(::phy_engine::model::model_reserve_type_t<BJT_NPN>, BJT_NPN const& q, ::std::size_t n) noexcept
+-    {
+-        switch(n)
+-        {
+-            case 0: return {.d{q.Is}, .type{::phy_engine::model::variant_type::d}};
+-            case 1: return {.d{q.N}, .type{::phy_engine::model::variant_type::d}};
+-            case 2: return {.d{q.BetaF}, .type{::phy_engine::model::variant_type::d}};
+-            case 3: return {.d{q.Temp}, .type{::phy_engine::model::variant_type::d}};
+-            case 4: return {.d{q.Area}, .type{::phy_engine::model::variant_type::d}};
+-            default: return {};
+-        }
+-        return {};
+-    }
+-
+-    static_assert(::phy_engine::model::defines::has_get_attribute<BJT_NPN>);
+-
+-    inline constexpr ::fast_io::u8string_view get_attribute_name_define(::phy_engine::model::model_reserve_type_t<BJT_NPN>, ::std::size_t n) noexcept
+-    {
+-        switch(n)
+-        {
+-            case 0: return u8"Is";
+-            case 1: return u8"N";
+-            case 2: return u8"BetaF";
+-            case 3: return u8"Temp";
+-            case 4: return u8"Area";
+-            default: return {};
+-        }
+-        return {};
+-    }
+-
+-    static_assert(::phy_engine::model::defines::has_get_attribute_name<BJT_NPN>);
+-
+-    inline bool prepare_foundation_define(::phy_engine::model::model_reserve_type_t<BJT_NPN>, BJT_NPN& q) noexcept
+-    {
+-        constexpr double kKelvin{-273.15};
+-        constexpr double qElement{1.6021765314e-19};
+-        constexpr double kBoltzmann{1.380650524e-23};
+-        q.Ut = kBoltzmann * (q.Temp - kKelvin) / qElement;
+-
+-        auto const node_B{q.pins[0].nodes};
+-        auto const node_C{q.pins[1].nodes};
+-        auto const node_E{q.pins[2].nodes};
+-        if(node_B && node_C && node_E) [[likely]] { q.Vbe_last = node_B->node_information.an.voltage.real() - node_E->node_information.an.voltage.real(); }
+-        return true;
+-    }
+-
+-    static_assert(::phy_engine::model::defines::can_prepare_foundation<BJT_NPN>);
+-
+-    inline constexpr bool iterate_dc_define(::phy_engine::model::model_reserve_type_t<BJT_NPN>, BJT_NPN& q, ::phy_engine::MNA::MNA& mna) noexcept
+-    {
+-        auto const node_B{q.pins[0].nodes};
+-        auto const node_C{q.pins[1].nodes};
+-        auto const node_E{q.pins[2].nodes};
+-        if(node_B && node_C && node_E) [[likely]]
+-        {
+-            double const Is_eff{q.Is * q.Area};
+-            double const Vbe{node_B->node_information.an.voltage.real() - node_E->node_information.an.voltage.real()};
+-            q.Vbe_last = Vbe;
+-
+-            double const Ute{q.N * q.Ut};
+-            double e{::std::exp(Vbe / Ute)};
+-
+-            // Base-emitter diode linearization
+-            q.geq_be = Is_eff * e / Ute;
+-            double const Ibe{Is_eff * (e - 1.0)};
+-            q.Ieq_be = Ibe - Vbe * q.geq_be;
+-
+-            // Stamp BE diode between B and E
+-            mna.G_ref(node_B->node_index, node_B->node_index) += q.geq_be;
+-            mna.G_ref(node_B->node_index, node_E->node_index) -= q.geq_be;
+-            mna.G_ref(node_E->node_index, node_B->node_index) -= q.geq_be;
+-            mna.G_ref(node_E->node_index, node_E->node_index) += q.geq_be;
+-            mna.I_ref(node_B->node_index) -= q.Ieq_be;
+-            mna.I_ref(node_E->node_index) += q.Ieq_be;
+-
+-            // Collector current linearization Ic ≈ gm*Vbe + Ieq_c
+-            q.gm = q.BetaF * q.geq_be;
+-            double const Ic{q.BetaF * Ibe};
+-            q.Ieq_c = Ic - q.gm * Vbe;
+-
+-            // Stamp VCCS from C to E controlled by Vb - Ve with transconductance gm
+-            mna.G_ref(node_C->node_index, node_B->node_index) += q.gm;
+-            mna.G_ref(node_C->node_index, node_E->node_index) -= q.gm;
+-            mna.G_ref(node_E->node_index, node_B->node_index) -= q.gm;
+-            mna.G_ref(node_E->node_index, node_E->node_index) += q.gm;
+-
+-            // Stamp collector current source equivalent oriented C -> E
+-            mna.I_ref(node_C->node_index) -= q.Ieq_c;
+-            mna.I_ref(node_E->node_index) += q.Ieq_c;
+-        }
+-        return true;
+-    }
+-
+-    static_assert(::phy_engine::model::defines::can_iterate_dc<BJT_NPN>);
+-
+-    inline constexpr bool
+-        iterate_ac_define(::phy_engine::model::model_reserve_type_t<BJT_NPN>, BJT_NPN& q, ::phy_engine::MNA::MNA& mna, [[maybe_unused]] double omega) noexcept
+-    {
+-        auto const node_B{q.pins[0].nodes};
+-        auto const node_C{q.pins[1].nodes};
+-        auto const node_E{q.pins[2].nodes};
+-        if(node_B && node_C && node_E) [[likely]]
+-        {
+-            // Small-signal: diode conductance and gm only
+-            mna.G_ref(node_B->node_index, node_B->node_index) += q.geq_be;
+-            mna.G_ref(node_B->node_index, node_E->node_index) -= q.geq_be;
+-            mna.G_ref(node_E->node_index, node_B->node_index) -= q.geq_be;
+-            mna.G_ref(node_E->node_index, node_E->node_index) += q.geq_be;
+-
+-            mna.G_ref(node_C->node_index, node_B->node_index) += q.gm;
+-            mna.G_ref(node_C->node_index, node_E->node_index) -= q.gm;
+-            mna.G_ref(node_E->node_index, node_B->node_index) -= q.gm;
+-            mna.G_ref(node_E->node_index, node_E->node_index) += q.gm;
+-        }
+-        return true;
+-    }
+-
+-    static_assert(::phy_engine::model::defines::can_iterate_ac<BJT_NPN>);
+-
+-    inline constexpr bool step_changed_tr_define(::phy_engine::model::model_reserve_type_t<BJT_NPN>,
+-                                                 BJT_NPN& q,
+-                                                 [[maybe_unused]] double nlaststep,
+-                                                 [[maybe_unused]] double nstep) noexcept
+-    {
+-        auto const node_B{q.pins[0].nodes};
+-        auto const node_E{q.pins[2].nodes};
+-        if(node_B && node_E) [[likely]] { q.Vbe_last = node_B->node_information.an.voltage.real() - node_E->node_information.an.voltage.real(); }
+-        return true;
+-    }
+-
+-    inline constexpr ::phy_engine::model::pin_view generate_pin_view_define(::phy_engine::model::model_reserve_type_t<BJT_NPN>, BJT_NPN& q) noexcept
+-    {
+-        return {q.pins, 3};
+-    }
+-
+-    static_assert(::phy_engine::model::defines::can_generate_pin_view<BJT_NPN>);
+-}  // namespace phy_engine::model
++    static_assert(model<BJT_NPN>);
++    inline bool set_attribute_define(model_reserve_type_t<BJT_NPN>,BJT_NPN& q,std::size_t n,variant value) noexcept
++    { return details::bjt_set(q,n,value); }
++    inline variant get_attribute_define(model_reserve_type_t<BJT_NPN>,BJT_NPN const& q,std::size_t n) noexcept
++    { return details::bjt_get(q,n); }
++    inline constexpr fast_io::u8string_view get_attribute_name_define(model_reserve_type_t<BJT_NPN>,std::size_t n) noexcept
++    { return details::bjt_attribute_name(n); }
++    inline bool prepare_foundation_define(model_reserve_type_t<BJT_NPN>,BJT_NPN& q) noexcept
++    { return details::bjt_prepare(q); }
++    inline bool iterate_dc_define(model_reserve_type_t<BJT_NPN>,BJT_NPN& q,MNA::MNA& mna) noexcept
++    { return details::bjt_stamp(q,mna); }
++    inline bool iterate_tr_define(model_reserve_type_t<BJT_NPN>,BJT_NPN& q,MNA::MNA& mna,[[maybe_unused]] double time) noexcept
++    { return details::bjt_stamp(q,mna); }
++    inline bool iterate_ac_define(model_reserve_type_t<BJT_NPN>,BJT_NPN& q,MNA::MNA& mna,[[maybe_unused]] double omega) noexcept
++    { return details::bjt_ac(q,mna); }
++    inline bool check_convergence_define(model_reserve_type_t<BJT_NPN>,BJT_NPN const& q) noexcept
++    { return details::bjt_converged(q); }
++    inline constexpr pin_view generate_pin_view_define(model_reserve_type_t<BJT_NPN>,BJT_NPN& q) noexcept
++    { return {q.pins,3}; }
++}
+diff --git a/include/phy_engine/model/models/non-linear/BJT_PNP.h b/include/phy_engine/model/models/non-linear/BJT_PNP.h
+index bca9fc4..d89217a 100644
+--- a/include/phy_engine/model/models/non-linear/BJT_PNP.h
++++ b/include/phy_engine/model/models/non-linear/BJT_PNP.h
+@@ -1,193 +1,34 @@
+ #pragma once
+ #include <fast_io/fast_io_dsal/string_view.h>
+-#include "../../model_refs/base.h"
++#include "bjt_ebers_moll.h"
+ 
+ namespace phy_engine::model
+ {
+-    struct BJT_PNP
++    struct BJT_PNP : details::bjt_ebers_moll_state
+     {
+-        inline static constexpr ::fast_io::u8string_view model_name{u8"PNP BJT"};
+-
+-        inline static constexpr ::phy_engine::model::model_device_type device_type{::phy_engine::model::model_device_type::non_linear};
+-        inline static constexpr ::fast_io::u8string_view identification_name{u8"QPN"};
+-
+-        // Parameters
+-        double Is{1e-16};
+-        double N{1.0};
+-        double BetaF{100.0};
+-        double Temp{27.0};
+-        double Area{1.0};
+-
+-        // Pins: B, C, E
+-        ::phy_engine::model::pin pins[3]{{{u8"B"}}, {{u8"C"}}, {{u8"E"}}};
+-
+-        // Private state
+-        double Ut{};  // thermal voltage
+-        double Veb_last{};
+-        double geq_eb{};  // diode conductance between E and B (emitter-base, opposite polarity of NPN)
+-        double Ieq_eb{};  // diode current source equivalent
+-        double gm{};      // transconductance Ic ≈ gm * Veb (PNP sign handled in stamps)
+-        double Ieq_c{};   // collector current source equivalent
++        inline static constexpr fast_io::u8string_view model_name{u8"PNP BJT"};
++        inline static constexpr model_device_type device_type{model_device_type::non_linear};
++        inline static constexpr fast_io::u8string_view identification_name{u8"QPN"};
++        inline static constexpr double polarity{-1};
++        pin pins[3]{{{u8"B"}},{{u8"C"}},{{u8"E"}}};
+     };
+-
+-    static_assert(::phy_engine::model::model<BJT_PNP>);
+-
+-    inline constexpr bool
+-        set_attribute_define(::phy_engine::model::model_reserve_type_t<BJT_PNP>, BJT_PNP& q, ::std::size_t n, ::phy_engine::model::variant vi) noexcept
+-    {
+-        switch(n)
+-        {
+-            case 0:
+-                if(vi.type != ::phy_engine::model::variant_type::d) [[unlikely]] { return false; }
+-                q.Is = vi.d;
+-                return true;
+-            case 1:
+-                if(vi.type != ::phy_engine::model::variant_type::d) [[unlikely]] { return false; }
+-                q.N = vi.d;
+-                return true;
+-            case 2:
+-                if(vi.type != ::phy_engine::model::variant_type::d) [[unlikely]] { return false; }
+-                q.BetaF = vi.d;
+-                return true;
+-            case 3:
+-                if(vi.type != ::phy_engine::model::variant_type::d) [[unlikely]] { return false; }
+-                q.Temp = vi.d;
+-                return true;
+-            case 4:
+-                if(vi.type != ::phy_engine::model::variant_type::d) [[unlikely]] { return false; }
+-                q.Area = vi.d;
+-                return true;
+-            default: return false;
+-        }
+-        return false;
+-    }
+-
+-    static_assert(::phy_engine::model::defines::has_set_attribute<BJT_PNP>);
+-
+-    inline constexpr ::phy_engine::model::variant
+-        get_attribute_define(::phy_engine::model::model_reserve_type_t<BJT_PNP>, BJT_PNP const& q, ::std::size_t n) noexcept
+-    {
+-        switch(n)
+-        {
+-            case 0: return {.d{q.Is}, .type{::phy_engine::model::variant_type::d}};
+-            case 1: return {.d{q.N}, .type{::phy_engine::model::variant_type::d}};
+-            case 2: return {.d{q.BetaF}, .type{::phy_engine::model::variant_type::d}};
+-            case 3: return {.d{q.Temp}, .type{::phy_engine::model::variant_type::d}};
+-            case 4: return {.d{q.Area}, .type{::phy_engine::model::variant_type::d}};
+-            default: return {};
+-        }
+-        return {};
+-    }
+-
+-    static_assert(::phy_engine::model::defines::has_get_attribute<BJT_PNP>);
+-
+-    inline constexpr ::fast_io::u8string_view get_attribute_name_define(::phy_engine::model::model_reserve_type_t<BJT_PNP>, ::std::size_t n) noexcept
+-    {
+-        switch(n)
+-        {
+-            case 0: return u8"Is";
+-            case 1: return u8"N";
+-            case 2: return u8"BetaF";
+-            case 3: return u8"Temp";
+-            case 4: return u8"Area";
+-            default: return {};
+-        }
+-        return {};
+-    }
+-
+-    static_assert(::phy_engine::model::defines::has_get_attribute_name<BJT_PNP>);
+-
+-    inline bool prepare_foundation_define(::phy_engine::model::model_reserve_type_t<BJT_PNP>, BJT_PNP& q) noexcept
+-    {
+-        constexpr double kKelvin{-273.15};
+-        constexpr double qElement{1.6021765314e-19};
+-        constexpr double kBoltzmann{1.380650524e-23};
+-        q.Ut = kBoltzmann * (q.Temp - kKelvin) / qElement;
+-
+-        auto const node_B{q.pins[0].nodes};
+-        auto const node_C{q.pins[1].nodes};
+-        auto const node_E{q.pins[2].nodes};
+-        if(node_B && node_C && node_E) [[likely]] { q.Veb_last = node_E->node_information.an.voltage.real() - node_B->node_information.an.voltage.real(); }
+-        return true;
+-    }
+-
+-    static_assert(::phy_engine::model::defines::can_prepare_foundation<BJT_PNP>);
+-
+-    inline constexpr bool iterate_dc_define(::phy_engine::model::model_reserve_type_t<BJT_PNP>, BJT_PNP& q, ::phy_engine::MNA::MNA& mna) noexcept
+-    {
+-        auto const node_B{q.pins[0].nodes};
+-        auto const node_C{q.pins[1].nodes};
+-        auto const node_E{q.pins[2].nodes};
+-        if(node_B && node_C && node_E) [[likely]]
+-        {
+-            double const Is_eff{q.Is * q.Area};
+-            double const Veb{node_E->node_information.an.voltage.real() - node_B->node_information.an.voltage.real()};
+-            q.Veb_last = Veb;
+-
+-            double const Ute{q.N * q.Ut};
+-            double e{::std::exp(Veb / Ute)};
+-
+-            // Emitter-base diode
+-            q.geq_eb = Is_eff * e / Ute;
+-            double const Ieb{Is_eff * (e - 1.0)};
+-            q.Ieq_eb = Ieb - Veb * q.geq_eb;
+-
+-            // Stamp EB diode between E and B (current from E->B)
+-            mna.G_ref(node_E->node_index, node_E->node_index) += q.geq_eb;
+-            mna.G_ref(node_E->node_index, node_B->node_index) -= q.geq_eb;
+-            mna.G_ref(node_B->node_index, node_E->node_index) -= q.geq_eb;
+-            mna.G_ref(node_B->node_index, node_B->node_index) += q.geq_eb;
+-            mna.I_ref(node_E->node_index) -= q.Ieq_eb;
+-            mna.I_ref(node_B->node_index) += q.Ieq_eb;
+-
+-            // Collector current (flows from E to C in PNP when forward active)
+-            q.gm = q.BetaF * q.geq_eb;
+-            double const Ic{q.BetaF * Ieb};
+-            q.Ieq_c = Ic - q.gm * Veb;
+-
+-            // VCCS from E to C controlled by Veb with transconductance gm
+-            mna.G_ref(node_E->node_index, node_E->node_index) += q.gm;
+-            mna.G_ref(node_E->node_index, node_B->node_index) -= q.gm;
+-            mna.G_ref(node_C->node_index, node_E->node_index) -= q.gm;
+-            mna.G_ref(node_C->node_index, node_B->node_index) += q.gm;
+-
+-            // Current source equivalent oriented E -> C
+-            mna.I_ref(node_E->node_index) -= q.Ieq_c;
+-            mna.I_ref(node_C->node_index) += q.Ieq_c;
+-        }
+-        return true;
+-    }
+-
+-    static_assert(::phy_engine::model::defines::can_iterate_dc<BJT_PNP>);
+-
+-    inline constexpr bool
+-        iterate_ac_define(::phy_engine::model::model_reserve_type_t<BJT_PNP>, BJT_PNP& q, ::phy_engine::MNA::MNA& mna, [[maybe_unused]] double omega) noexcept
+-    {
+-        auto const node_B{q.pins[0].nodes};
+-        auto const node_C{q.pins[1].nodes};
+-        auto const node_E{q.pins[2].nodes};
+-        if(node_B && node_C && node_E) [[likely]]
+-        {
+-            // EB small-signal and gm only
+-            mna.G_ref(node_E->node_index, node_E->node_index) += q.geq_eb;
+-            mna.G_ref(node_E->node_index, node_B->node_index) -= q.geq_eb;
+-            mna.G_ref(node_B->node_index, node_E->node_index) -= q.geq_eb;
+-            mna.G_ref(node_B->node_index, node_B->node_index) += q.geq_eb;
+-
+-            mna.G_ref(node_E->node_index, node_E->node_index) += q.gm;
+-            mna.G_ref(node_E->node_index, node_B->node_index) -= q.gm;
+-            mna.G_ref(node_C->node_index, node_E->node_index) -= q.gm;
+-            mna.G_ref(node_C->node_index, node_B->node_index) += q.gm;
+-        }
+-        return true;
+-    }
+-
+-    static_assert(::phy_engine::model::defines::can_iterate_ac<BJT_PNP>);
+-
+-    inline constexpr ::phy_engine::model::pin_view generate_pin_view_define(::phy_engine::model::model_reserve_type_t<BJT_PNP>, BJT_PNP& q) noexcept
+-    {
+-        return {q.pins, 3};
+-    }
+-
+-    static_assert(::phy_engine::model::defines::can_generate_pin_view<BJT_PNP>);
+-}  // namespace phy_engine::model
++    static_assert(model<BJT_PNP>);
++    inline bool set_attribute_define(model_reserve_type_t<BJT_PNP>,BJT_PNP& q,std::size_t n,variant value) noexcept
++    { return details::bjt_set(q,n,value); }
++    inline variant get_attribute_define(model_reserve_type_t<BJT_PNP>,BJT_PNP const& q,std::size_t n) noexcept
++    { return details::bjt_get(q,n); }
++    inline constexpr fast_io::u8string_view get_attribute_name_define(model_reserve_type_t<BJT_PNP>,std::size_t n) noexcept
++    { return details::bjt_attribute_name(n); }
++    inline bool prepare_foundation_define(model_reserve_type_t<BJT_PNP>,BJT_PNP& q) noexcept
++    { return details::bjt_prepare(q); }
++    inline bool iterate_dc_define(model_reserve_type_t<BJT_PNP>,BJT_PNP& q,MNA::MNA& mna) noexcept
++    { return details::bjt_stamp(q,mna); }
++    inline bool iterate_tr_define(model_reserve_type_t<BJT_PNP>,BJT_PNP& q,MNA::MNA& mna,[[maybe_unused]] double time) noexcept
++    { return details::bjt_stamp(q,mna); }
++    inline bool iterate_ac_define(model_reserve_type_t<BJT_PNP>,BJT_PNP& q,MNA::MNA& mna,[[maybe_unused]] double omega) noexcept
++    { return details::bjt_ac(q,mna); }
++    inline bool check_convergence_define(model_reserve_type_t<BJT_PNP>,BJT_PNP const& q) noexcept
++    { return details::bjt_converged(q); }
++    inline constexpr pin_view generate_pin_view_define(model_reserve_type_t<BJT_PNP>,BJT_PNP& q) noexcept
++    { return {q.pins,3}; }
++}
+diff --git a/src/CMakeLists.txt b/src/CMakeLists.txt
+index 5b4f464..fe6c887 100644
+--- a/src/CMakeLists.txt
++++ b/src/CMakeLists.txt
+@@ -53,7 +53,7 @@ if (WIN32)
+ endif()
+ 
+ # 添加这一行来编译phyengine.dll
+-add_library(phyengine SHARED dll_main.cpp)
++add_library(phyengine SHARED dll_main.cpp circuit_observe.cpp)
+ if(PHY_ENGINE_USE_LEVELDB)
+     # Allow linking LevelDB into shared libs on platforms that require PIC.
+     set_property(TARGET leveldb PROPERTY POSITION_INDEPENDENT_CODE ON)
+@@ -63,6 +63,9 @@ endif()
+ # verilog -> PE netlist -> PhysicsLab .sav (with IO auto-placement)
+ add_executable(verilog2plsav verilog2plsav.cpp)
+ 
++# Compact, paginated schematic plus authoritative netlist for vision agents.
++add_executable(circuit_view circuit_view.cpp)
++
+ # verilog -> PENL (LevelDB-backed) export
+ if(PHY_ENGINE_USE_LEVELDB)
+     add_executable(verilog2penl verilog2penl.cpp)
+diff --git a/src/dll_main.cpp b/src/dll_main.cpp
+index 41d9aa1..09e8270 100644
+--- a/src/dll_main.cpp
++++ b/src/dll_main.cpp
+@@ -891,8 +891,13 @@ extern "C" int
+ 
+     ::std::size_t idx{};
+     if(!find_attribute_index_by_name(model, name, name_size, idx)) { return 3; }
+-    set_property(model, idx, value);
+-    return 0;
++    if(!::std::isfinite(value)) { return 4; }
++    if(model->ptr->set_attribute(idx, {.d{value}, .type{::phy_engine::model::variant_type::d}})) { return 0; }
++    if(model->ptr->set_attribute(idx, {.boolean{value != 0.0}, .type{::phy_engine::model::variant_type::boolean}})) { return 0; }
++    auto digital = value == 0.0 ? ::phy_engine::model::digital_node_statement_t::false_state
++                 : value == 1.0 ? ::phy_engine::model::digital_node_statement_t::true_state
++                                : ::phy_engine::model::digital_node_statement_t::indeterminate_state;
++    return model->ptr->set_attribute(idx, {.digital{digital}, .type{::phy_engine::model::variant_type::digital}}) ? 0 : 4;
+ }
+ 
+ extern "C" int circuit_analyze(void* circuit_ptr)
+diff --git a/src/verilog2plsav.cpp b/src/verilog2plsav.cpp
+index c4610e0..8865fc8 100644
+--- a/src/verilog2plsav.cpp
++++ b/src/verilog2plsav.cpp
+@@ -336,6 +336,7 @@ static void usage(char const* argv0)
+                         "  - Compiles Verilog (subset), synthesizes to PE netlist with optimizations,\n"
+                         "    then exports PhysicsLab .sav with IO auto-placement and auto-layout.\n"
+                         "options:\n"
++                        "  --strict-export                           Reject lossy PhysicsLab mappings (recommended for agents)\n"
+                         "  -O0|-O1|-O2|-O3|-O4|-O5|-Omax|-Ocuda       PE synth optimization level (default: O0)\n"
+                         "  --opt-level N                             PE synth optimization level (0..5)\n"
+                         "  --opt-timeout-ms MS                        Omax: wall-clock budget (0 disables; default: 0)\n"
+@@ -1218,6 +1219,16 @@ int main(int argc, char** argv)
+         return ::phy_engine::phy_lab_wrapper::pe_to_pl::convert(nl, popt);
+     }();
+ 
++    for (auto const& warning : r.warnings)
++    {
++        ::fast_io::io::perr(::fast_io::err(), "[verilog2plsav] warning: ", ::fast_io::mnp::os_c_str(warning.c_str()), "\n");
++    }
++    if (has_flag(argc, argv, "--strict-export") && !r.warnings.empty())
++    {
++        ::fast_io::io::perr(::fast_io::err(), "error: strict export refuses an experiment with changed digital semantics\n");
++        return 1;
++    }
++
+     // Keep IO elements fixed for layout.
+     for(auto const& e : r.ex.elements())
+     {
+diff --git a/src/circuit_view.cpp b/src/circuit_view.cpp
+new file mode 100644
+index 0000000..ed74ab5
+--- /dev/null
++++ b/src/circuit_view.cpp
+@@ -0,0 +1,1349 @@
++#include <phy_engine/phy_lab_wrapper/physicslab.h>
++
++#include <algorithm>
++#include <cmath>
++#include <array>
++#include <fstream>
++#include <iostream>
++#include <map>
++#include <numeric>
++#include <set>
++#include <sstream>
++
++// A deliberately schematic view: component cards -> numbered ports -> named
++// net buses. Crossings are not junctions; only filled circles are junctions.
++// The adjacent JSON keeps full identifiers/properties (never OCR-derived).
++namespace pl = phy_engine::phy_lab_wrapper;
++using json = pl::json;
++
++std::string escaped(std::string const& s)
++{
++    std::string out;
++    for (char c : s)
++        switch (c)
++        {
++            case '&': out += "&amp;"; break;
++            case '<': out += "&lt;"; break;
++            case '>': out += "&gt;"; break;
++            case '"': out += "&quot;"; break;
++            default: if (static_cast<unsigned char>(c) >= 32 || c == '\n' || c == '\t') out += c;
++        }
++    return out;
++}
++
++json read_json(char const* path)
++{
++    if (std::filesystem::file_size(path) > 32 * 1024 * 1024) throw std::runtime_error("input exceeds 32 MiB");
++    std::ifstream in(path);
++    if (!in) throw std::runtime_error("cannot read input");
++    return json::parse(in, nullptr, true, true);
++}
++
++std::size_t known_pins(std::string const& type)
++{
++    static std::map<std::string, std::size_t> const pins{
++        {"Ground Component", 1}, {"Logic Input", 1}, {"Logic Output", 1},
++        {"Resistor", 2}, {"Basic Capacitor", 2}, {"Basic Inductor", 2}, {"Battery Source", 2},
++        {"Current Source", 2}, {"Sinewave Source", 2}, {"Basic Diode", 2}, {"Light-Emitting Diode", 2},
++        {"Simple Switch", 2}, {"Push Switch", 2}, {"Air Switch", 2}, {"Yes Gate", 2}, {"No Gate", 2},
++        {"And Gate", 3}, {"Or Gate", 3}, {"Xor Gate", 3}, {"Xnor Gate", 3}, {"Nand Gate", 3}, {"Nor Gate", 3},
++        {"Imp Gate", 3}, {"Nimp Gate", 3}, {"Transistor", 3}, {"N-MOSFET", 3}, {"P-MOSFET", 3},
++        {"Half Adder", 4}, {"Full Adder", 5}, {"Half Subtractor", 4}, {"Full Subtractor", 5},
++        {"D Flipflop", 4}, {"T Flipflop", 4}, {"Real-T Flipflop", 4}, {"JK Flipflop", 5},
++        {"Counter", 6}, {"Random Generator", 6}, {"8bit Input", 8}, {"8bit Display", 8},
++        {"Transformer", 4}, {"Mutual Inductor", 4}, {"Rectifier", 4}, {"Multiplier", 8}};
++    auto it = pins.find(type);
++    return it == pins.end() ? 0 : it->second;
++}
++
++json inspect(pl::experiment const& ex)
++{
++    if (ex.type() != pl::experiment_type::circuit) throw std::runtime_error("only electrical experiments are supported");
++    if (ex.elements().size() > 20000 || ex.wires().size() > 80000) throw std::runtime_error("circuit exceeds inspect limits");
++    json result{{"schema", "aurex.circuit-view.v1"}, {"components", json::array()}, {"nodes", json::array()},
++                {"wires", json::array()}, {"warnings", json::array()},
++                {"statistics_source", "saved values, not fresh simulation measurements"}};
++    std::map<std::string, std::size_t> index;
++    std::map<std::pair<std::string, int>, std::size_t> terminals;
++    std::vector<std::size_t> parent;
++    auto terminal = [&](std::string const& id, int pin) {
++        if (!index.contains(id) || pin < 0 || pin > 255) throw std::runtime_error("invalid wire endpoint: " + id);
++        auto key = std::make_pair(id, pin);
++        if (!terminals.contains(key)) { terminals[key] = parent.size(); parent.push_back(parent.size()); }
++        return terminals.at(key);
++    };
++    auto root = [&](std::size_t n) {
++        while (parent[n] != n) { parent[n] = parent[parent[n]]; n = parent[n]; }
++        return n;
++    };
++    for (auto const& e : ex.elements())
++    {
++        auto d = e.data();
++        auto id = e.identifier();
++        index[id] = result["components"].size();
++        auto model = d.value("ModelID", "");
++        std::size_t count = known_pins(model);
++        if (d.contains("Aurex") && d["Aurex"].is_object()) count = d["Aurex"].value("pin_count", count);
++        if (count > 256) throw std::runtime_error("too many component pins");
++        auto label = d.contains("Label") && d["Label"].is_string() ? d["Label"].get<std::string>() : "";
++        auto pos = e.element_position();
++        bool has_position = d.contains("Position") && d["Position"].is_string() && !d["Position"].get<std::string>().empty();
++        if (!has_position) pos = {static_cast<double>(index[id] % 4) * .18, static_cast<double>(index[id] / 4) * .14, 0};
++        auto rot = d.contains("Rotation") && d["Rotation"].is_string() ? pl::detail::parse_xyz(d["Rotation"].get<std::string>()) : pl::position{};
++        if (!std::isfinite(pos.x) || !std::isfinite(pos.y) || !std::isfinite(pos.z) || !std::isfinite(rot.x) || !std::isfinite(rot.y) || !std::isfinite(rot.z)) throw std::runtime_error("nonfinite position/rotation: " + id);
++        result["components"].push_back(json{{"id", id}, {"ref", "C" + std::to_string(index[id] + 1)},
++            {"label", label}, {"type", model}, {"properties", d.value("Properties", json::object())},
++            {"statistics", d.value("Statistics", json::object())}, {"pins", json::array()},
++            {"native", d.value("Aurex", json::object())}, {"pin_count_known", count != 0},
++            {"position", {pos.x, pos.y, pos.z}}, {"rotation", {rot.x, rot.y, rot.z}},
++            {"position_source", has_position ? d.value("Aurex", json::object()).value("position_source", "saved") : "generated"}});
++        for (std::size_t p = 0; p < count; ++p) terminal(id, static_cast<int>(p));
++        if (!count) result["warnings"].push_back("Unknown pin schema: " + id + " (" + model + "); only wired pins shown");
++    }
++    for (auto const& w : ex.wires())
++    {
++        auto a = terminal(w.source.element_identifier, w.source.pin);
++        auto b = terminal(w.target.element_identifier, w.target.pin);
++        parent[root(a)] = root(b);
++        result["wires"].push_back(w.to_json());
++    }
++    std::map<std::size_t, std::string> net_names;
++    for (auto const& [key, n] : terminals)
++    {
++        auto& c = result["components"][index.at(key.first)];
++        if (c["type"] == "Ground Component") net_names[root(n)] = "gnd";
++    }
++    std::map<std::string, json> nets;
++    for (auto const& [key, n] : terminals)
++    {
++        auto r = root(n);
++        if (!net_names.contains(r)) net_names[r] = "N" + std::to_string(net_names.size() + 1);
++        auto name = net_names[r];
++        auto& c = result["components"][index.at(key.first)];
++        c["pins"].push_back({{"pin", key.second}, {"node", name}});
++        if (!nets.contains(name)) nets[name] = json::array();
++        nets[name].push_back({{"component", key.first}, {"ref", c["ref"]}, {"pin", key.second}});
++    }
++    for (auto const& [name, ends] : nets) result["nodes"].push_back({{"id", name}, {"connections", ends}});
++    return result;
++}
++
++// A solver snapshot is not a PhysicsLab document. Geometry is supplied by the
++// native spec sidecar; topology comes directly from the sampled solver spec.
++std::string component_label(json const& component)
++{
++    if (!component.contains("label") || component["label"].is_null()) return {};
++    if (!component["label"].is_string()) throw std::runtime_error("component label must be a string or null");
++    return component["label"].get<std::string>();
++}
++
++json inspect_state(json const& state)
++{
++    if (state.value("schema", "") != "aurex.pe-state.v1") throw std::runtime_error("state mode requires aurex.pe-state.v1");
++    auto const& spec = state.at("spec");
++    auto const& components = spec.at("components");
++    // Rendering an immutable snapshot does not execute the solver. Its scene
++    // budget must accommodate supported digital jobs; analog/mixed simulation
++    // remains limited independently in both the tool and isolated worker.
++    if (!components.is_array() || components.empty() || components.size() > 16384) throw std::runtime_error("native state render must contain 1..16384 components");
++    std::map<std::string, json> scene, measurements;
++    for (auto const& c : state.at("scene").at("components")) scene.emplace(c.at("id").get<std::string>(), c);
++    for (auto const& c : state.at("measurements").at("components")) measurements.emplace(c.at("id").get<std::string>(), c);
++    json out{{"schema", "aurex.circuit-view.v1"}, {"components", json::array()}, {"nodes", json::array()}, {"wires", json::array()},
++        {"warnings", json::array()}, {"statistics_source", "immutable snapshot sampled from a native Phy-Engine handle; not saved PL statistics"},
++        {"state_origin", state.value("origin", json::object())}, {"state_schema", "aurex.pe-state.v1"}};
++    std::map<std::string, json> nodes;
++    std::set<std::string> ids;
++    for (auto const& c : components)
++    {
++        auto id = c.at("id").get<std::string>();
++        if (id.empty() || !ids.insert(id).second || !scene.contains(id) || !measurements.contains(id)) throw std::runtime_error("snapshot IDs must be unique and have matching scene/measurement entries");
++        auto const& s = scene.at(id);
++        if (s.at("nodes") != c.at("nodes") || s.at("position") != c.at("position") || s.at("rotation") != c.at("rotation")) throw std::runtime_error("snapshot scene must preserve native spec nodes/position/rotation");
++        auto label = component_label(c);
++        if (s.contains("label") && component_label(s) != label) throw std::runtime_error("snapshot scene label must match native spec label");
++        if (!c.at("nodes").is_array() || c.at("nodes").empty() || c.at("nodes").size() > 256) throw std::runtime_error("invalid native snapshot pins");
++        for (auto name : {"position", "rotation"})
++        {
++            if (!c.at(name).is_array() || c.at(name).size() != 3) throw std::runtime_error("snapshot position/rotation must be xyz triples");
++            for (auto const& v : c.at(name)) if (!v.is_number() || !std::isfinite(v.get<double>())) throw std::runtime_error("snapshot contains nonfinite geometry");
++        }
++        auto native = s.value("native", json::object());
++        native["type"] = c.at("type");
++        native["measurements"] = measurements.at(id);
++        auto ref = "C" + std::to_string(out["components"].size() + 1);
++        json pins = json::array();
++        int pin = 0;
++        for (auto const& n : c.at("nodes"))
++        {
++            auto node = n.get<std::string>();
++            if (node.empty()) throw std::runtime_error("snapshot node names must not be empty");
++            if (!nodes.contains(node)) nodes[node] = json::array();
++            pins.push_back({{"node", node}, {"pin", pin}});
++            nodes[node].push_back({{"component", id}, {"ref", ref}, {"pin", pin++}});
++        }
++        out["components"].push_back({{"id", id}, {"ref", ref}, {"label", label}, {"type", s.at("model_id")}, {"properties", s.value("properties", json::object())},
++            {"statistics", json::object()}, {"pins", pins}, {"native", native}, {"pin_count_known", true}, {"position", c.at("position")}, {"rotation", c.at("rotation")},
++            {"position_source", c.value("position_source", "native-spec-sidecar")}});
++    }
++    for (auto const& [node, pins] : nodes)
++    {
++        out["nodes"].push_back({{"id", node}, {"connections", pins}});
++        for (std::size_t i = 1; i < pins.size(); ++i) out["wires"].push_back({{"Source", pins[0]["component"]}, {"SourcePin", pins[0]["pin"]},
++            {"Target", pins[i]["component"]}, {"TargetPin", pins[i]["pin"]}, {"ColorName", "native-node"}});
++    }
++    return out;
++}
++
++pl::experiment from_spec(json const& spec)
++{
++    auto ex = pl::experiment::create(pl::experiment_type::circuit);
++    ex.entitle(spec.value("title", "Aurex circuit"));
++    auto const& components = spec.at("components");
++    if (!components.is_array() || components.empty() || components.size() > 16384) throw std::runtime_error("render/export scene must contain 1..16384 entries");
++    std::map<std::string, std::vector<std::pair<std::string, int>>> nodes;
++    std::size_t i = 0;
++    for (auto const& c : components)
++    {
++        pl::position position{static_cast<double>(i % 4) * .18, static_cast<double>(i / 4) * .14, 0};
++        if (c.contains("position")) position = {c["position"][0], c["position"][1], c["position"][2]};
++        auto e = pl::element::circuit(c.at("model_id"), position);
++        e.write_native_position(position);
++        if (c.contains("rotation")) e.set_rotation({c["rotation"][0], c["rotation"][1], c["rotation"][2]});
++        auto id = c.at("id").get<std::string>();
++        e.data()["Identifier"] = id;
++        // Identifier owns connectivity. Label is optional user-facing metadata
++        // and must never be silently invented or substituted for Identifier.
++        static_cast<void>(component_label(c));
++        e.data()["Label"] = c.value("label", json(nullptr));
++        e.data()["Properties"].update(c.value("properties", json::object()));
++        e.data()["Aurex"] = c.value("native", json::object());
++        e.data()["Aurex"]["pin_count"] = c.at("nodes").size();
++        e.data()["Aurex"]["position_source"] = c.value("native", json::object()).value("position_source", c.contains("position") ? "provided" : "generated");
++        static_cast<void>(ex.add_element(std::move(e)));
++        int p = 0;
++        for (auto const& n : c.at("nodes")) nodes[n.get<std::string>()].push_back({id, p++});
++        ++i;
++    }
++    for (auto const& [name, ends] : nodes)
++    {
++        if (name == "gnd")
++        {
++            auto ground = ex.add_circuit_element("Ground Component", {0, -.1, 0});
++            ex.get_element(ground).write_native_position({0, -.1, 0});
++            ex.get_element(ground).data()["Aurex"] = {{"position_source", "generated"}};
++            for (auto const& [id, p] : ends) ex.connect(ground, 0, id, p);
++        }
++        else for (std::size_t k = 1; k < ends.size(); ++k) ex.connect(ends[0].first, ends[0].second, ends[k].first, ends[k].second);
++    }
++    return ex;
++}
++
++void render_topology(json const& data, std::ostream& out, std::size_t offset, std::size_t limit)
++{
++    auto const& components = data.at("components");
++    std::size_t end = std::min(components.size(), offset + limit);
++    if (offset >= components.size()) throw std::runtime_error("page offset exceeds component count");
++    std::map<std::string, std::size_t> nets;
++    std::vector<int> tops;
++    int height = 116;
++    for (std::size_t i = offset; i < end; ++i)
++    {
++        tops.push_back(height);
++        height += std::max(137, 56 + static_cast<int>(components[i]["pins"].size()) * 23);
++        for (auto const& p : components[i]["pins"]) nets.try_emplace(p["node"].get<std::string>(), nets.size());
++    }
++    if (nets.size() > 64) throw std::runtime_error("view contains more than 64 nets; decrease page limit");
++    int width = std::max(900, 560 + static_cast<int>(nets.size()) * 52);
++    out << "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"" << width << "\" height=\"" << height + 35 << "\" viewBox=\"0 0 " << width << ' ' << height + 35 << "\">\n";
++    out << "<rect width=\"100%\" height=\"100%\" fill=\"#f8fafc\"/><g font-family=\"DejaVu Sans, sans-serif\" fill=\"#0f172a\">";
++    auto text = [&](int x, int y, std::string const& s, int size = 15) {
++        out << "<text x=\"" << x << "\" y=\"" << y << "\" font-size=\"" << size << "\">" << escaped(s) << "</text>\n";
++    };
++    text(24, 30, "Aurex | electrical netlist", 23);
++    text(24, 56, "Ports are zero-based. Filled dots = junctions; crossings without dots are not connected.", 14);
++    text(24, 78, (data.value("focused", false) ? "Focused components " : "Components ") + std::to_string(offset + 1) + "-" + std::to_string(end) + "/" + std::to_string(data.value("total_components", components.size())) + "; full IDs and all values in netlist JSON.", 13);
++    char const* colors[]{"#2563eb", "#b45309", "#047857", "#9333ea", "#be123c", "#0e7490", "#4d7c0f", "#9a3412"};
++    for (auto const& [name, n] : nets)
++    {
++        int x = 520 + static_cast<int>(n) * 52;
++        out << "<path d=\"M " << x << " 105 V " << height << "\" stroke=\"" << colors[n % 8] << "\" stroke-width=\"2\" opacity=\".55\"/>";
++        text(x - 12, 100, name, 13);
++    }
++    for (std::size_t i = offset; i < end; ++i)
++    {
++        auto const& c = components[i];
++        int y = tops[i - offset];
++        int h = std::max(119, 38 + static_cast<int>(c["pins"].size()) * 23);
++        out << "<rect x=\"24\" y=\"" << y << "\" width=\"350\" height=\"" << h << "\" rx=\"8\" fill=\"white\" stroke=\"#94a3b8\"/>";
++        auto label = c.value("label", "");
++        text(38, y + 24, c["ref"].get<std::string>() + "  " + (label.empty() ? c["type"].get<std::string>() : label), 17);
++        text(38, y + 46, c["type"].get<std::string>(), 14);
++        std::string values;
++        auto const& props = c["properties"];
++        std::map<std::string, std::string> names{{"电阻", "R (ohm)"}, {"电容", "C (F)"}, {"电感", "L (H)"}, {"电压", "V (V)"}, {"电流", "I (A)"}, {"开关", "state"},
++            {"内阻", "R_internal (ohm)"}, {"理想模式", "ideal"}, {"十进制", "value"}, {"状态", "state"},
++            {"放大系数", "beta"}, {"最大功率", "max power (W)"}};
++        for (auto const& [k, v] : props.items())
++        {
++            if (k == "锁定" || k == "高电平" || k == "低电平" || k == "最大电流") continue;
++            auto key = names.contains(k) ? names[k] : k;
++            if (!values.empty()) values += ", ";
++            values += key + "=" + v.dump();
++        }
++        if (values.size() > 50)
++        {
++            auto cut = std::size_t{47};
++            while (cut && (static_cast<unsigned char>(values[cut]) & 0xc0) == 0x80) --cut;
++            values = values.substr(0, cut) + "...";
++        }
++        text(38, y + 70, values, 13);
++        if (c["native"].contains("measurements"))
++        {
++            auto const& m = c["native"]["measurements"];
++            std::ostringstream measured;
++            measured.precision(4);
++            if (c["native"].value("type", "").starts_with("digital_"))
++            {
++                measured << "Measured logic: ";
++                for (auto const& v : m.at("digital")) measured << "01XZ"[v.get<unsigned>() % 4] << ' ';
++            }
++            else
++            {
++                int pin = 0;
++                for (auto const& v : m.at("voltage"))
++                {
++                    if (pin && pin % 2 == 0)
++                    {
++                        text(38, y + 94 + (pin / 2 - 1) * 18, measured.str(), 12);
++                        measured.str("");
++                        measured.clear();
++                    }
++                    else if (pin) measured << "; ";
++                    measured << "V(p" << pin << ")=" << v.get<double>();
++                    double imag = m.at("voltage_imag")[pin].get<double>();
++                    if (imag != 0) measured << (imag < 0 ? "-j" : "+j") << std::abs(imag);
++                    measured << " V";
++                    ++pin;
++                }
++                int line = pin ? (pin - 1) / 2 : 0;
++                text(38, y + 94 + line * 18, measured.str(), 12);
++                measured.str("");
++                measured.clear();
++                if (m.contains("derived_current_0_to_1"))
++                {
++                    auto const& cur = m["derived_current_0_to_1"];
++                    measured << "I(p0 to p1)=" << cur["real"].get<double>();
++                    double imag = cur["imag"].get<double>();
++                    if (imag != 0) measured << (imag < 0 ? "-j" : "+j") << std::abs(imag);
++                    measured << " A";
++                    text(38, y + 112, measured.str(), 12);
++                }
++            }
++            if (c["native"].value("type", "").starts_with("digital_")) text(38, y + 94, measured.str(), 12);
++        }
++        int pidx = 0;
++        for (auto const& p : c["pins"])
++        {
++            auto name = p["node"].get<std::string>();
++            auto n = nets.at(name);
++            int py = y + 20 + pidx++ * 23, nx = 520 + static_cast<int>(n) * 52;
++            out << "<path d=\"M 374 " << py << " H " << nx << "\" stroke=\"" << colors[n % 8] << "\" stroke-width=\"2\"/>";
++            out << "<circle cx=\"" << nx << "\" cy=\"" << py << "\" r=\"4\" fill=\"" << colors[n % 8] << "\"/>";
++            text(381, py - 4, "p" + std::to_string(p["pin"].get<int>()) + " / " + name, 12);
++        }
++    }
++    out << "</g></svg>\n";
++}
++
++struct xy { double x, y; };
++
++pl::position add(pl::position a, pl::position b) { return {a.x + b.x, a.y + b.y, a.z + b.z}; }
++pl::position mul(pl::position p, double k) { return {p.x * k, p.y * k, p.z * k}; }
++double dot(pl::position a, pl::position b) { return a.x * b.x + a.y * b.y + a.z * b.z; }
++pl::position cross(pl::position a, pl::position b) { return {a.y*b.z-a.z*b.y, a.z*b.x-a.x*b.z, a.x*b.y-a.y*b.x}; }
++pl::position unit(pl::position p)
++{
++    double length = std::sqrt(dot(p, p));
++    if (!std::isfinite(length) || length < 1e-10) throw std::runtime_error("camera position/target must define a nonzero direction");
++    return mul(p, 1 / length);
++}
++json xyz_json(pl::position p) { return {p.x, p.y, p.z}; }
++pl::position checked_xyz(json const& value, std::string const& name)
++{
++    if (!value.is_array() || value.size() != 3) throw std::runtime_error(name + " must be a native xyz array");
++    for (auto const& v : value) if (!v.is_number() || !std::isfinite(v.get<double>()) || std::abs(v.get<double>()) > 1e8) throw std::runtime_error(name + " contains an invalid coordinate");
++    return {value[0], value[1], value[2]};
++}
++
++json camera_save(json const& input, bool native_state, json& warnings)
++{
++    json raw = native_state || input.contains("camera_save") ? input.value("camera_save", json()) : input.value("Experiment", input).value("CameraSave", json());
++    try
++    {
++        if (raw.is_string())
++        {
++            if (raw.get<std::string>().empty()) return json::object();
++            raw = json::parse(raw.get<std::string>());
++        }
++        if (raw.is_null()) return json::object();
++        if (!raw.is_object()) throw std::runtime_error("CameraSave must be an object or JSON-encoded object");
++        return raw;
++    }
++    catch (std::exception const& e)
++    {
++        warnings.push_back(std::string("Cannot decode saved camera; using fallback: ") + e.what());
++        return json::object();
++    }
++}
++
++struct view_camera
++{
++    pl::position right{.707106781187, -.707106781187, 0};
++    pl::position up{-.408248290464, -.408248290464, .816496580928};
++    pl::position forward{-.577350269190, -.577350269190, -.577350269190};
++    pl::position position{}, target{}, rotation{};
++    double distance{2}, fov{60}, zoom{1}, ortho_height{1}, near_plane{1e-4};
++    bool perspective{false}, fit{true}, rotation_available{false};
++    std::string source{"fallback-isometric"};
++    json saved = json::object(), warnings = json::array(), assumptions = json::array();
++
++    void euler_basis(pl::position native)
++    {
++        // PhysicsLab serializes native x,z,y. Its SDK does not document the
++        // client Euler composition; ZXY is an explicit Unity-style renderer
++        // approximation, never reported as exact client-camera replication.
++        rotation = native;
++        rotation_available = true;
++        double x = native.x * std::acos(-1.0) / 180;
++        double y = native.z * std::acos(-1.0) / 180;
++        double z = native.y * std::acos(-1.0) / 180;
++        auto rotate = [&](pl::position p) {
++            p = {std::cos(z)*p.x-std::sin(z)*p.y, std::sin(z)*p.x+std::cos(z)*p.y, p.z};
++            p = {p.x, std::cos(x)*p.y-std::sin(x)*p.z, std::sin(x)*p.y+std::cos(x)*p.z};
++            p = {std::cos(y)*p.x+std::sin(y)*p.z, p.y, -std::sin(y)*p.x+std::cos(y)*p.z};
++            return pl::position{p.x, p.z, p.y};
++        };
++        right = rotate({1,0,0}); up = rotate({0,1,0}); forward = rotate({0,0,1});
++        assumptions.push_back("TargetRotation uses renderer Unity-style ZXY Euler approximation; PhysicsLab client composition is not documented");
++    }
++    void look_at()
++    {
++        rotation_available = false;
++        assumptions = json::array();
++        forward = unit(add(target, mul(position, -1)));
++        pl::position reference_up{0,0,1};
++        if (std::abs(dot(forward, reference_up)) > .999) reference_up = {0,1,0};
++        right = unit(cross(forward, reference_up));
++        up = unit(cross(right, forward));
++        distance = std::sqrt(dot(add(position, mul(target, -1)), add(position, mul(target, -1))));
++    }
++    double depth(pl::position p) const { return dot(add(p, mul(position, -1)), forward); }
++    json metadata() const
++    {
++        return {{"source", source}, {"coordinate_order", "native xyz; CameraSave strings serialize x,z,y"}, {"distance_unit", "native coordinate units"},
++            {"saved_raw", saved}, {"position", xyz_json(position)}, {"target", xyz_json(target)}, {"rotation", rotation_available ? xyz_json(rotation) : json()},
++            {"right", xyz_json(right)}, {"up", xyz_json(up)}, {"forward", xyz_json(forward)}, {"distance", distance}, {"fov_y_deg", fov},
++            {"projection", perspective ? "perspective" : "orthographic"}, {"orthographic_height", ortho_height}, {"zoom", zoom},
++            {"fit", fit}, {"near_plane", near_plane}, {"assumptions", assumptions}, {"warnings", warnings}};
++    }
++};
++
++view_camera make_camera(json const& saved, json const& options, std::vector<pl::position> const& points, bool top, int height, double frame_width = 530, double frame_height = 0)
++{
++    if (!options.is_object()) throw std::runtime_error("camera options must be an object");
++    std::set<std::string> const keys{"mode", "position", "target", "rotation", "distance", "yaw_deg", "pitch_deg", "zoom", "fov_y_deg", "projection", "orthographic_height", "fit", "overview"};
++    for (auto const& [key, ignored] : options.items()) if (!keys.contains(key)) throw std::runtime_error("Unknown camera option: " + key);
++    auto number = [&](char const* name, double fallback, double lo, double hi) {
++        if (!options.contains(name)) return fallback;
++        auto const& value = options.at(name);
++        if (!value.is_number() || !std::isfinite(value.get<double>()) || value.get<double>() < lo || value.get<double>() > hi) throw std::runtime_error(std::string("Invalid camera ") + name);
++        return value.get<double>();
++    };
++    view_camera c;
++    c.saved = saved;
++    std::string mode = options.value("mode", "saved");
++    if (mode != "saved" && mode != "auto" && mode != "custom") throw std::runtime_error("camera mode must be saved, auto or custom");
++    bool saved_valid = false;
++    if (!saved.empty() && mode != "auto" && !top)
++    {
++        try
++        {
++            auto center = pl::detail::parse_xyz(saved.at("VisionCenter").get<std::string>());
++            auto rotation = pl::detail::parse_xyz(saved.at("TargetRotation").get<std::string>());
++            c.target = checked_xyz(xyz_json(center), "saved VisionCenter");
++            checked_xyz(xyz_json(rotation), "saved TargetRotation");
++            if (!saved.at("Distance").is_number()) throw std::runtime_error("saved Distance is not numeric");
++            c.distance = saved.at("Distance").get<double>();
++            if (!std::isfinite(c.distance) || c.distance <= 1e-4 || c.distance > 1e8) throw std::runtime_error("saved Distance is invalid");
++            c.euler_basis(rotation);
++            c.source = "saved"; c.perspective = true; c.fit = false; saved_valid = true;
++            c.assumptions.push_back("CameraSave has no documented FOV/projection mapping; perspective and 60-degree vertical FOV are renderer defaults, not recovered client settings");
++            c.assumptions.push_back("Saved camera is world-space but its origin relative to component native coordinates is undocumented; no hidden tabletop offset is applied");
++            if (saved.contains("Mode")) c.assumptions.push_back("CameraSave Mode identifies experiment kind, not orthographic/perspective projection");
++        }
++        catch (std::exception const& e) { c.warnings.push_back(std::string("Saved camera incomplete/invalid; using fitted isometric fallback: ") + e.what()); }
++    }
++    if (top && !options.contains("mode") && !options.contains("position") && !options.contains("rotation") && !options.contains("yaw_deg") && !options.contains("pitch_deg"))
++    {
++        c.right = {1,0,0}; c.up = {0,1,0}; c.forward = {0,0,-1};
++        c.source = "explicit-top"; c.perspective = false; c.fit = true;
++    }
++    if (mode == "auto") { c.source = "auto-fit"; c.fit = true; }
++    if (mode == "custom" || options.contains("position") || options.contains("target") || options.contains("rotation") || options.contains("yaw_deg") || options.contains("pitch_deg"))
++    {
++        c.source = "custom";
++        c.fit = mode == "auto";
++        if (!saved_valid && !options.contains("projection")) c.perspective = true;
++    }
++    if (options.contains("fit"))
++    {
++        if (!options["fit"].is_boolean()) throw std::runtime_error("camera fit must be boolean");
++        c.fit = options["fit"].get<bool>();
++    }
++    c.fov = number("fov_y_deg", c.fov, 5, 150);
++    c.zoom = number("zoom", 1, .05, 20);
++    c.distance = number("distance", c.distance, 1e-4, 1e8);
++    if (options.contains("projection"))
++    {
++        auto projection = options.at("projection").get<std::string>();
++        if (projection != "perspective" && projection != "orthographic") throw std::runtime_error("camera projection must be perspective or orthographic");
++        c.perspective = projection == "perspective";
++    }
++    if (options.contains("target")) c.target = checked_xyz(options["target"], "camera target");
++    bool has_euler = options.contains("rotation") || options.contains("yaw_deg") || options.contains("pitch_deg");
++    if (options.contains("position") && (has_euler || options.contains("distance"))) throw std::runtime_error("camera position+target cannot also specify rotation/yaw/pitch/distance");
++    if (has_euler)
++    {
++        auto rotation = options.contains("rotation") ? checked_xyz(options["rotation"], "camera rotation") : (saved_valid ? c.rotation : pl::position{50,0,0});
++        rotation.x = number("pitch_deg", rotation.x, -36000, 36000);
++        rotation.z = number("yaw_deg", rotation.z, -36000, 36000);
++        c.euler_basis(rotation);
++    }
++    if (options.contains("position"))
++    {
++        if (!options.contains("target") && !saved_valid) throw std::runtime_error("custom camera position requires an explicit target when no saved target exists");
++        c.position = checked_xyz(options["position"], "camera position");
++        c.look_at();
++        c.assumptions.push_back("Explicit position/target uses a deterministic look-at basis with native +Z up, avoiding saved Euler ambiguity");
++    }
++    else c.position = add(c.target, mul(c.forward, -c.distance));
++    double h = frame_height > 0 ? frame_height : height - 290, w = frame_width;
++    double tan_y = std::tan(c.fov * std::acos(-1.0) / 360), tan_x = tan_y * w / h;
++    c.ortho_height = number("orthographic_height", 2 * c.distance * tan_y, 1e-5, 1e8);
++    if (c.fit)
++    {
++        pl::position lo{1e99,1e99,1e99}, hi{-1e99,-1e99,-1e99};
++        for (auto p : points) { lo = {std::min(lo.x,p.x),std::min(lo.y,p.y),std::min(lo.z,p.z)}; hi = {std::max(hi.x,p.x),std::max(hi.y,p.y),std::max(hi.z,p.z)}; }
++        c.target = mul(add(lo,hi), .5);
++        double distance = .2, max_x = .2, max_y = .12;
++        for (auto p : points)
++        {
++            auto q = add(p, mul(c.target, -1));
++            max_x = std::max(max_x, std::abs(dot(q,c.right)));
++            max_y = std::max(max_y, std::abs(dot(q,c.up)));
++            distance = std::max(distance, std::max(std::abs(dot(q,c.right))/tan_x, std::abs(dot(q,c.up))/tan_y) - dot(q,c.forward));
++        }
++        c.distance = distance * 1.08;
++        c.ortho_height = std::max(max_y * 2, max_x * 2 * h / w) * 1.08;
++        c.position = add(c.target, mul(c.forward,-c.distance));
++        if (saved_valid) c.source = "saved-orientation-fitted";
++        c.warnings.push_back("fit adjusted camera target/distance/framing to selected geometry; original saved camera and every component transform remain unchanged");
++    }
++    return c;
++}
++
++// Geometry is schematic; the component center and Euler rotation are the
++// original PL native xyz, decoded by physicslab.h (serialized x,z,y).
++pl::position local_to_world(json const& c, pl::position p)
++{
++    auto const& rot = c.at("rotation");
++    double ax = rot[0].get<double>() * std::acos(-1.0) / 180;
++    double ay = rot[1].get<double>() * std::acos(-1.0) / 180;
++    double az = rot[2].get<double>() * std::acos(-1.0) / 180;
++    p = {p.x, std::cos(ax) * p.y - std::sin(ax) * p.z, std::sin(ax) * p.y + std::cos(ax) * p.z};
++    p = {std::cos(ay) * p.x + std::sin(ay) * p.z, p.y, -std::sin(ay) * p.x + std::cos(ay) * p.z};
++    p = {std::cos(az) * p.x - std::sin(az) * p.y, std::sin(az) * p.x + std::cos(az) * p.y, p.z};
++    return {p.x + c["position"][0].get<double>(), p.y + c["position"][1].get<double>(), p.z + c["position"][2].get<double>()};
++}
++
++pl::position port_position(json const& c, int pin)
++{
++    auto count = c.at("pins").size();
++    if (count <= 1) return local_to_world(c, {-.049, 0, .018});
++    if (count == 2) return local_to_world(c, {pin == 0 ? -.049 : .049, 0, .018});
++    auto left_count = (count + 1) / 2;
++    bool left = static_cast<std::size_t>(pin) < left_count;
++    auto row = left ? pin : pin - static_cast<int>(left_count);
++    auto rows = left ? left_count : count - left_count;
++    double y = rows < 2 ? 0 : -.021 + .042 * static_cast<double>(row) / static_cast<double>(rows - 1);
++    return local_to_world(c, {left ? -.049 : .049, y, .018});
++}
++
++std::string compact_properties(json const& c)
++{
++    std::map<std::string, std::string> names{{"电阻", "R"}, {"电容", "C"}, {"电感", "L"}, {"电压", "V"},
++        {"电流", "I"}, {"开关", "stored state"}, {"内阻", "R_internal"}, {"十进制", "value"}, {"状态", "stored state"},
++        {"放大系数", "beta"}, {"最大功率", "max power"}};
++    std::map<std::string, std::string> units{{"电阻", " ohm"}, {"电容", " F"}, {"电感", " H"}, {"电压", " V"}, {"电流", " A"}, {"内阻", " ohm"}};
++    std::string result;
++    int shown = 0;
++    for (auto const& [key, value] : c["properties"].items())
++    {
++        if (key == "锁定" || key == "内阻" || key == "理想模式" || key == "高电平" || key == "低电平" || key == "最大电流") continue;
++        if (shown++ == 2) { result += " ..."; break; }
++        if (!result.empty()) result += "; ";
++        result += (names.contains(key) ? names[key] : key) + "=" + value.dump() + units[key];
++    }
++    return result;
++}
++
++// A low-detail locator, projected once from the complete original scene. It is
++// not a second render/solve, and it never discards distant components to make
++// the selection look larger. Wires connect centers here, not physical pins.
++json render_locator(json const& global, std::set<std::string> const& visible, std::ostream& out, double x, double y, double width, double height)
++{
++    auto const& components = global.at("components");
++    view_camera basis;
++    double xmin=1e99,xmax=-1e99,ymin=1e99,ymax=-1e99;
++    std::map<std::string,xy> projected;
++    for(auto const& c:components)
++    {
++        auto center=local_to_world(c,{});
++        xy p{dot(center,basis.right),-dot(center,basis.up)};
++        projected.emplace(c["id"].get<std::string>(),p);
++        xmin=std::min(xmin,p.x);xmax=std::max(xmax,p.x);ymin=std::min(ymin,p.y);ymax=std::max(ymax,p.y);
++    }
++    double scale=std::min((width-28)/std::max(.01,xmax-xmin),(height-78)/std::max(.01,ymax-ymin));
++    auto screen=[&](xy p)->xy{return {x+width*.5+(p.x-(xmin+xmax)*.5)*scale,y+43+(height-78)*.5+(p.y-(ymin+ymax)*.5)*scale};};
++    out<<"<g id=\"global-locator\" data-total-components=\""<<components.size()<<"\">"
++       <<"<rect x=\""<<x<<"\" y=\""<<y<<"\" width=\""<<width<<"\" height=\""<<height<<"\" rx=\"7\" fill=\"#eef2f5\" stroke=\"#b5c3cd\"/>"
++       <<"<text x=\""<<x+10<<"\" y=\""<<y+20<<"\" font-size=\"13\">Global locator | rough isometric</text>";
++    std::size_t stride=std::max<std::size_t>(1,(global["wires"].size()+399)/400),drawn=0;
++    std::ostringstream wire_path;
++    for(std::size_t i=0;i<global["wires"].size();i+=stride)
++    {
++        auto const& w=global["wires"][i];
++        auto a=projected.find(w["Source"].get<std::string>()),b=projected.find(w["Target"].get<std::string>());
++        if(a==projected.end()||b==projected.end())continue;
++        auto p=screen(a->second),q=screen(b->second);
++        wire_path<<"M "<<p.x<<' '<<p.y<<" L "<<q.x<<' '<<q.y<<' ';
++        ++drawn;
++    }
++    out<<"<path d=\""<<wire_path.str()<<"\" fill=\"none\" stroke=\"#b4c1ca\" opacity=\".5\" stroke-width=\".55\"/>";
++    json selected_ids=json::array(),selected_refs=json::array();
++    json markers=json::array();
++    // The selected markers are drawn last so dense clusters remain visible.
++    for(bool selected:{false,true})
++    {
++        std::ostringstream marker_path;
++        double r=selected?2.7:1.5;
++        for(auto const& c:components)
++        {
++            auto id=c["id"].get<std::string>();
++            if(visible.contains(id)!=selected)continue;
++            auto p=screen(projected.at(id));
++            marker_path<<"M "<<p.x-r<<' '<<p.y<<" a "<<r<<' '<<r<<" 0 1 0 "<<2*r<<" 0 a "<<r<<' '<<r<<" 0 1 0 "<<-2*r<<" 0 Z ";
++            markers.push_back({{"id",id},{"ref",c["ref"]},{"x",p.x},{"y",p.y},{"selected",selected}});
++            if(selected){selected_ids.push_back(id);selected_refs.push_back(c["ref"]);}
++        }
++        out<<"<path data-mini-layer=\""<<(selected?"selected":"unselected")<<"\" d=\""<<marker_path.str()
++           <<"\" fill=\""<<(selected?"#ffd33d":"#8399aa")<<"\" stroke=\""<<(selected?"#9a7000":"#678296")<<"\" stroke-width=\".45\"/>";
++    }
++    // One metadata node retains auditable component-to-marker ownership while
++    // only three batched SVG paths reach Cairo, even for thousands of gates.
++    out<<"<metadata id=\"locator-markers\">"<<escaped(markers.dump())<<"</metadata>";
++    out<<"<text x=\""<<x+10<<"\" y=\""<<y+height-17<<"\" font-size=\"12\">Yellow: in main view "<<visible.size()<<'/'<<components.size()<<"</text></g>";
++    return {{"enabled",true},{"total_components",components.size()},{"highlighted_components",selected_ids.size()},
++            {"highlighted_ids",selected_ids},{"highlighted_refs",selected_refs},{"wire_total",global["wires"].size()},{"wire_drawn",drawn},
++            {"projection","fixed-isometric-all-original-centers"},{"rough",true},{"geometry_mutated",false},
++            {"bounds",{x,y,width,height}},{"note","Locator includes all original components and distant outliers. Yellow means visible in the main view; center-to-center wires may be sampled, not pin-level evidence."}};
++}
++
++json render_spatial(json const& data, json const& global, std::ostream& out, std::size_t offset, std::size_t limit, bool top, json const& camera_options)
++{
++    auto const& cs = data.at("components");
++    auto end = std::min(cs.size(), offset + limit);
++    if (offset >= cs.size()) throw std::runtime_error("page offset exceeds component count");
++    std::vector<pl::position> points;
++    std::map<std::string, std::size_t> selected;
++    bool generated = false;
++    for (std::size_t i = offset; i < end; ++i)
++    {
++        selected[cs[i]["id"].get<std::string>()] = i;
++        generated |= cs[i]["position_source"] == "generated";
++        for (double x : {-.06, .06}) for (double y : {-.04, .04}) for (double z : {-.015, .025}) points.push_back(local_to_world(cs[i], {x, y, z}));
++    }
++    std::vector<int> legend_y;
++    int legend_bottom = 135;
++    auto legend_end = offset;
++    bool reserve_locator = end-offset < global["components"].size() || !camera_options.empty();
++    for (std::size_t i = offset; i < std::min(end, offset + 4); ++i)
++    {
++        auto card_height = 100 + static_cast<int>((std::min<std::size_t>(8,cs[i]["pins"].size()) + 1) / 2) * 18;
++        if(legend_bottom+card_height>(reserve_locator?545:730)) break;
++        legend_y.push_back(legend_bottom);
++        legend_bottom += card_height;
++        ++legend_end;
++    }
++    // The diagram, not a repeated component list, owns the canvas dimensions.
++    // Long pin maps remain authoritative in the JSON and compact tool details.
++    int height = 820;
++    auto camera = make_camera(data.value("saved_camera", json::object()), camera_options, points, top, height);
++    double focal = (height - 290) / (2 * std::tan(camera.fov * std::acos(-1.0) / 360));
++    auto screen = [&](pl::position p) -> xy {
++        auto q = add(p, mul(camera.position, -1));
++        double scale = camera.perspective ? focal / std::max(camera.near_plane, dot(q, camera.forward)) : (height - 290) / camera.ortho_height;
++        scale *= camera.zoom;
++        return {365 + dot(q, camera.right) * scale, (height + 90) * .5 - dot(q, camera.up) * scale};
++    };
++    if (camera_options.empty() || (camera_options.value("mode", "saved") == "saved" && !camera_options.contains("fit") && !camera_options.contains("position") && !camera_options.contains("target") && !camera_options.contains("zoom")))
++    {
++        bool outside = false;
++        double lo_x=1e99,hi_x=-1e99,lo_y=1e99,hi_y=-1e99;
++        for(auto p:points){auto s=screen(p);outside|=camera.depth(p)<=camera.near_plane||s.x<25||s.x>705||s.y<125||s.y>775;lo_x=std::min(lo_x,s.x);hi_x=std::max(hi_x,s.x);lo_y=std::min(lo_y,s.y);hi_y=std::max(hi_y,s.y);}
++        if(outside || (hi_x-lo_x)*(hi_y-lo_y)<530*530*.08)
++        {
++            auto fitted=camera_options;fitted["fit"]=true;
++            camera=make_camera(data.value("saved_camera",json::object()),fitted,points,top,height);
++            camera.warnings.push_back("Automatic framing fallback: saved/default view was clipped or mostly empty; only view target/distance changed, original camera and component transforms are preserved");
++        }
++    }
++    auto camera_result = camera.metadata();
++    camera_result["requested"] = camera_options;
++    camera_result["fov_source"] = camera_options.contains("fov_y_deg") ? "explicit-renderer-option" : "renderer-default-not-saved";
++    camera_result["projected_centers"] = json::array();
++    camera_result["clipped_components"] = json::array();
++    camera_result["behind_camera"] = json::array();
++    camera_result["width"] = 1080; camera_result["height"] = height;
++    camera_result["legend_components"] = legend_end-offset;
++    camera_result["omitted_legend_components"] = end-legend_end;
++    std::set<std::string> renderable;
++    for (std::size_t i = offset; i < end; ++i)
++    {
++        auto p = local_to_world(cs[i], {});
++        auto s = screen(p);
++        auto id = cs[i]["id"].get<std::string>();
++        bool behind = camera.depth(p) <= camera.near_plane;
++        bool outside = behind || s.x < 12 || s.x > 718 || s.y < 112 || s.y > height - 38;
++        camera_result["projected_centers"].push_back({{"id",id}, {"ref",cs[i]["ref"]}, {"x",s.x}, {"y",s.y}, {"depth",camera.depth(p)}, {"outside_frame",outside}});
++        if (outside) camera_result["clipped_components"].push_back(id);
++        if (behind) camera_result["behind_camera"].push_back(id);
++        else if (!outside) renderable.insert(id);
++    }
++    if (!camera_result["clipped_components"].empty()) camera_result["warnings"].push_back("Some selected component centers are outside this camera frame; use camera.fit=true or change position/target/zoom. The full netlist is unchanged.");
++    out << "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"1080\" height=\"" << height << "\" viewBox=\"0 0 1080 " << height << "\">";
++    out << "<rect width=\"100%\" height=\"100%\" fill=\"#f7f9fa\"/><g font-family=\"DejaVu Sans,sans-serif\" fill=\"#182936\">";
++    auto text = [&](double x, double y, std::string const& s, int size = 13, char const* fill = "#182936") {
++        out << "<text x=\"" << x << "\" y=\"" << y << "\" fill=\"" << fill << "\" font-size=\"" << size << "\">" << escaped(s) << "</text>";
++    };
++    text(22, 30, "Aurex | spatial circuit view", 23);
++    text(22, 54, "Camera: " + camera.source + " | " + (camera.perspective ? "perspective" : "orthographic") + ". Native component positions/rotations preserved.");
++    text(22, 75, generated ? "Some coordinates were generated (no position provided). IDs/pins/values are authoritative." : "Bodies and terminal geometry are schematic. Saved layout is not rearranged.", 12);
++    text(22, 95, "Dot = terminal; crossing wires are not junctions. Use topology view for dense connectivity.", 12);
++    out << "<defs><clipPath id=\"scene\"><rect x=\"12\" y=\"112\" width=\"706\" height=\"" << height - 150 << "\"/></clipPath></defs><g clip-path=\"url(#scene)\">";
++    // Quiet screen grid only: it carries no invented physical measurements.
++    for (int x = 25; x < 719; x += 35) out << "<path d=\"M " << x << " 115 V " << height - 35 << "\" stroke=\"#e8edf0\"/>";
++    for (int y = 115; y < height - 34; y += 35) out << "<path d=\"M 12 " << y << " H 718\" stroke=\"#e8edf0\"/>";
++    std::size_t off_page_wires = 0;
++    std::ostringstream wire_layer;
++    for (auto const& wire : data["wires"])
++    {
++        auto a = selected.find(wire["Source"].get<std::string>()), b = selected.find(wire["Target"].get<std::string>());
++        if (a == selected.end() || b == selected.end() || !renderable.contains(wire["Source"]) || !renderable.contains(wire["Target"])) { if (a != selected.end() || b != selected.end()) ++off_page_wires; continue; }
++        auto p = screen(port_position(cs[a->second], wire["SourcePin"]));
++        auto q = screen(port_position(cs[b->second], wire["TargetPin"]));
++        double lift = std::min(35.0, std::abs(p.x - q.x) * .13 + 10);
++        wire_layer << "<path data-source=\"" << escaped(wire["Source"].get<std::string>()) << "\" data-target=\"" << escaped(wire["Target"].get<std::string>())
++            << "\" d=\"M " << p.x << ' ' << p.y << " C " << p.x << ' ' << p.y - lift << ' ' << q.x << ' ' << q.y - lift << ' ' << q.x << ' ' << q.y
++            << "\" stroke=\"#8e792d\" stroke-width=\"2.6\" opacity=\".85\" fill=\"none\"/>";
++    }
++    auto polygon = [&](json const& c, std::vector<pl::position> const& vertices, char const* fill) {
++        out << "<polygon points=\"";
++        for (auto p : vertices) { auto q = screen(local_to_world(c, p)); out << q.x << ',' << q.y << ' '; }
++        out << "\" fill=\"" << fill << "\" stroke=\"#205276\" stroke-width=\"1.2\"/>";
++    };
++    std::vector<std::size_t> paint;
++    for (std::size_t i = offset; i < end; ++i) if (renderable.contains(cs[i]["id"])) paint.push_back(i);
++    std::stable_sort(paint.begin(), paint.end(), [&](auto a, auto b) { return camera.depth(local_to_world(cs[a], {})) > camera.depth(local_to_world(cs[b], {})); });
++    for (auto i : paint)
++    {
++        auto const& c = cs[i];
++        auto center = screen(local_to_world(c, {}));
++        out << "<g data-component-id=\"" << escaped(c["id"].get<std::string>()) << "\" data-position=\"" << escaped(c["position"].dump()) << "\" data-rotation=\"" << escaped(c["rotation"].dump())
++            << "\" data-center-x=\"" << center.x << "\" data-center-y=\"" << center.y << "\">";
++        struct face { std::vector<pl::position> vertices; char const* fill; double depth{}; };
++        std::vector<face> faces{
++            {{{-.046, -.025, -.012}, {-.046, .025, -.012}, {-.046, .025, .012}, {-.046, -.025, .012}}, "#286895"},
++            {{{.046, -.025, -.012}, {.046, .025, -.012}, {.046, .025, .012}, {.046, -.025, .012}}, "#286895"},
++            {{{-.046, -.025, -.012}, {.046, -.025, -.012}, {.046, -.025, .012}, {-.046, -.025, .012}}, "#205982"},
++            {{{-.046, .025, -.012}, {.046, .025, -.012}, {.046, .025, .012}, {-.046, .025, .012}}, "#205982"},
++            {{{-.046, -.025, -.012}, {.046, -.025, -.012}, {.046, .025, -.012}, {-.046, .025, -.012}}, "#367fac"},
++            {{{-.046, -.025, .012}, {.046, -.025, .012}, {.046, .025, .012}, {-.046, .025, .012}}, "#367fac"},
++        };
++        for (auto& face : faces) for (auto p : face.vertices)
++        {
++            auto world = local_to_world(c, p);
++            face.depth -= camera.depth(world);
++        }
++        // Render all transformed faces far-to-near. Hardcoding the original
++        // +X/+Y sides leaves holes when PL's default 180-degree rotation flips
++        // the visible sides; depth ordering preserves a solid body at any pose.
++        std::stable_sort(faces.begin(), faces.end(), [](face const& a, face const& b) { return a.depth < b.depth; });
++        for (auto const& face : faces) polygon(c, face.vertices, face.fill);
++        auto type = c["type"].get<std::string>();
++        auto surface_line = [&](std::vector<pl::position> const& points) {
++            out << "<polyline points=\"";
++            for (auto p : points) { auto q = screen(local_to_world(c, p)); out << q.x << ',' << q.y << ' '; }
++            out << "\" fill=\"none\" stroke=\"#eff8ff\" stroke-width=\"1.7\"/>";
++        };
++        auto symbol_pos = screen(local_to_world(c, {0, 0, .016}));
++        if (type == "Resistor") surface_line({{-.028, 0, .016}, {-.021, 0, .016}, {-.016, -.008, .016}, {-.008, .008, .016}, {0, -.008, .016}, {.008, .008, .016}, {.016, -.008, .016}, {.021, 0, .016}, {.028, 0, .016}});
++        else if (type == "Basic Capacitor")
++        {
++            surface_line({{-.026, 0, .016}, {-.006, 0, .016}});
++            surface_line({{-.006, -.013, .016}, {-.006, .013, .016}});
++            surface_line({{.006, -.013, .016}, {.006, .013, .016}});
++            surface_line({{.006, 0, .016}, {.026, 0, .016}});
++        }
++        else
++        {
++            std::string symbol;
++            if (type == "Battery Source") symbol = "+  -";
++            else if (type == "Basic Inductor") symbol = "L";
++            else if (type == "Logic Input") symbol = "IN";
++            else if (type == "Logic Output") symbol = "OUT";
++            else if (type == "Ground Component")
++            {
++                out << "<path d=\"M " << symbol_pos.x << ' ' << symbol_pos.y - 13 << " V " << symbol_pos.y - 2
++                    << " M " << symbol_pos.x - 13 << ' ' << symbol_pos.y - 2 << " H " << symbol_pos.x + 13
++                    << " M " << symbol_pos.x - 9 << ' ' << symbol_pos.y + 4 << " H " << symbol_pos.x + 9
++                    << " M " << symbol_pos.x - 4 << ' ' << symbol_pos.y + 10 << " H " << symbol_pos.x + 4
++                    << "\" fill=\"none\" stroke=\"#eff8ff\" stroke-width=\"2.2\"/>";
++            }
++            else if (type == "D Flipflop") symbol = "DFF";
++            else if (type.ends_with(" Gate"))
++            {
++                symbol = type.substr(0, type.size() - 5);
++                std::transform(symbol.begin(), symbol.end(), symbol.begin(), [](unsigned char ch) { return static_cast<char>(std::toupper(ch)); });
++                if (symbol == "NO") symbol = "NOT";
++            }
++            if (!symbol.empty()) text(symbol_pos.x - symbol.size() * 3.7, symbol_pos.y + 3, symbol, 12, "#eff8ff");
++        }
++        out << "</g>";
++    }
++    // Wires run above the simplified bodies so both exact terminals stay
++    // visibly connected, rather than appearing to terminate at a box edge.
++    out << wire_layer.str();
++    struct annotation_box { double x, y, w, h; };
++    std::vector<annotation_box> pin_labels;
++    for (auto i : paint)
++    {
++        auto const& c = cs[i];
++        for (auto const& pin : c["pins"])
++        {
++            auto p = screen(port_position(c, pin["pin"]));
++            out << "<circle cx=\"" << p.x << "\" cy=\"" << p.y << "\" r=\"4.6\" fill=\"#ead59b\" stroke=\"#6d551e\" stroke-width=\"1.2\"/>";
++            if(paint.size()>6 || c["pins"].size()>8) continue;
++            auto label = c["ref"].get<std::string>() + ".p" + std::to_string(pin["pin"].get<int>()) + ":" + pin["node"].get<std::string>();
++            auto center = screen(local_to_world(c, {}));
++            double width = label.size() * 8.7 + 6;
++            double label_x = p.x < center.x ? p.x - 10 - width : p.x + 9;
++            label_x = std::clamp(label_x, 18.0, 706.0 - width);
++            double label_y = p.y - 25;
++            for (int attempt = 0; attempt < 20; ++attempt)
++            {
++                bool collides = false;
++                for (auto const& box : pin_labels) collides |= label_x < box.x + box.w + 3 && label_x + width + 3 > box.x && label_y < box.y + box.h + 3 && label_y + 25 > box.y;
++                if (!collides) break;
++                label_y -= 25;
++                if (label_y < 116) label_y = p.y + 12 + attempt * 25;
++            }
++            pin_labels.push_back({label_x, label_y, width, 22});
++            out << "<path d=\"M " << p.x << ' ' << p.y << " L " << std::clamp(p.x, label_x, label_x + width) << ' ' << label_y + 22 << "\" stroke=\"#7c8e9c\" stroke-width=\".8\"/>";
++            out << "<rect x=\"" << label_x - 3 << "\" y=\"" << label_y << "\" width=\"" << width << "\" height=\"22\" rx=\"3\" fill=\"#ffffff\" fill-opacity=\".96\"/>";
++            text(label_x, label_y + 17, label, 16);
++        }
++    }
++    // Short high-contrast identities remain readable after the application
++    // resizes the image to 768px; they are annotations, never layout changes.
++    for (auto i : paint)
++    {
++        if(paint.size()>8) continue;
++        auto const& c = cs[i];
++        auto center = screen(local_to_world(c, {}));
++        double top_edge = center.y, bottom_edge = center.y;
++        for (double x : {-.046, .046}) for (double y : {-.025, .025}) for (double z : {-.012, .012})
++        {
++            double edge = screen(local_to_world(c, {x, y, z})).y;
++            top_edge = std::min(top_edge, edge);
++            bottom_edge = std::max(bottom_edge, edge);
++        }
++        std::string name = c["label"].get<std::string>();
++        // Useful short native IDs may be drawn as a fallback without turning
++        // them into a saved Label or a falsely named public port.
++        if (name.empty() && c["id"].get<std::string>().size() <= 14) name = c["id"].get<std::string>();
++        if (c["type"] == "Ground Component") name = "GND";
++        if (name.empty() || name.size() > 14)
++        {
++            name = c["type"].get<std::string>();
++            if (name == "Logic Input") name = "IN";
++            else if (name == "Logic Output") name = "OUT";
++            else if (name == "Resistor") name = "R";
++            else if (name == "Battery Source") name = "V";
++            else if (name.size() > 14) name = name.substr(0, 14);
++        }
++        auto label = c["ref"].get<std::string>() + " " + name;
++        if (c["type"] == "Ground Component") label += " (1 pin)";
++        if (c["type"] == "Resistor" && c["properties"].contains("电阻"))
++        {
++            std::ostringstream r; r.precision(5); r << c["properties"]["电阻"].get<double>();
++            label += " / " + r.str() + " ohm";
++        }
++        double width = std::max(75.0, label.size() * 8.3 + 14);
++        double x = std::clamp(center.x - width * .5, 18.0, 706.0 - width);
++        double y = c["type"] == "Ground Component" ? top_edge - 35 : bottom_edge + 8;
++        y = std::clamp(y, 116.0, static_cast<double>(height - 67));
++        auto preferred_y=y;
++        for(int attempt=0;attempt<24;++attempt)
++        {
++            bool collides=false;
++            for(auto const&box:pin_labels) collides|=x<box.x+box.w+3&&x+width+3>box.x&&y<box.y+box.h+3&&y+30>box.y;
++            if(!collides)break;
++            y=std::clamp(preferred_y+(attempt%2?-1:1)*((attempt/2)+1)*32.0,116.0,static_cast<double>(height-67));
++        }
++        out << "<path d=\"M " << center.x << ' ' << (y > center.y ? y : y + 27) << " L " << center.x << ' ' << center.y << "\" stroke=\"#8ea5b4\" stroke-width=\".9\"/>";
++        out << "<rect x=\"" << x << "\" y=\"" << y << "\" width=\"" << width << "\" height=\"27\" rx=\"4\" fill=\"white\" stroke=\"#bac9d3\"/>";
++        text(x + 7, y + 19, label, 16);
++        pin_labels.push_back({x,y,width,27});
++    }
++    std::size_t label_overlap_count=0;
++    for(std::size_t i=0;i<pin_labels.size();++i) for(std::size_t j=i+1;j<pin_labels.size();++j)
++    {
++        auto const&a=pin_labels[i];auto const&b=pin_labels[j];
++        label_overlap_count+=a.x<b.x+b.w&&a.x+a.w>b.x&&a.y<b.y+b.h&&a.y+a.h>b.y;
++    }
++    camera_result["label_overlap_count"]=label_overlap_count;
++    if(label_overlap_count) camera_result["warnings"].push_back("Projected pin/identity labels overlap; no clipping does NOT imply legibility. Focus fewer components or adjust camera angle/zoom, and use authoritative pin mappings.");
++    out << "</g>";
++    out << "<path d=\"M 735 113 V " << height - 22 << "\" stroke=\"#cbd5dd\"/>";
++    for (std::size_t i = offset; i < legend_end; ++i)
++    {
++        auto const& c = cs[i];
++        int y = legend_y[i - offset];
++        text(751, y, c["ref"].get<std::string>() + "  " + (c["label"].get<std::string>().empty() ? c["type"].get<std::string>() : c["label"].get<std::string>()), 15);
++        text(751, y + 19, c["type"].get<std::string>(), 12);
++        text(751, y + 37, compact_properties(c), 12);
++        if (c["native"].contains("measurements"))
++        {
++            auto const& m = c["native"]["measurements"];
++            std::ostringstream value; value.precision(4);
++            if (m.contains("voltage_across_0_to_1"))
++            {
++                auto const& v = m["voltage_across_0_to_1"];
++                value << "V(p0)-V(p1)=" << v["real"].get<double>();
++                double imag = v["imag"].get<double>();
++                if (imag) value << (imag < 0 ? "-j" : "+j") << std::abs(imag);
++                value << " V";
++                if (m.contains("derived_current_0_to_1"))
++                {
++                    auto const& current = m["derived_current_0_to_1"];
++                    value << "; I=" << current["real"].get<double>();
++                    double current_imag = current["imag"].get<double>();
++                    if (current_imag) value << (current_imag < 0 ? "-j" : "+j") << std::abs(current_imag);
++                    value << " A";
++                }
++            }
++            else if (c["native"].value("type", "").starts_with("digital_")) { value << "Measured logic "; for (auto const& d : m["digital"]) value << "01XZ"[d.get<unsigned>() % 4] << ' '; }
++            text(751, y + 55, value.str(), 11);
++        }
++        text(751, y + 76, std::to_string(c["pins"].size()) + (c["pins"].size() == 1 ? " pin:" : " pins:"), 13);
++        std::string pins;
++        std::size_t pin_index = 0;
++        for (auto const& pin : c["pins"])
++        {
++            if(pin_index>=8) break;
++            if (!pins.empty()) pins += "; ";
++            pins += c["ref"].get<std::string>() + ".p" + std::to_string(pin["pin"].get<int>()) + "=" + pin["node"].get<std::string>();
++            if (++pin_index % 2 == 0 || pin_index == c["pins"].size())
++            {
++                text(751, y + 94 + static_cast<int>((pin_index - 1) / 2) * 18, pins, 13);
++                pins.clear();
++            }
++        }
++    }
++    if(end>legend_end)
++    {
++        text(751, reserve_locator?555:745, std::to_string(end-legend_end)+" more selected components", 13);
++        text(751, reserve_locator?576:766, "Focus 1-4 IDs for readable pins/values.", 12);
++        camera_result["warnings"].push_back("Dense selection: per-pin labels and repeated legend entries are intentionally omitted; use focus_ids with 1-4 components for electrical details");
++    }
++    text(22, height - 15, (data.value("focused", false) ? "Focused components " : "Components ") + std::to_string(offset + 1) + "-" + std::to_string(end) + "/" + std::to_string(data.value("total_components", cs.size())) + "; " + std::to_string(off_page_wires) + " external connections; " + std::to_string(camera_result["clipped_components"].size()) + " outside camera. Full native xyz/pins in JSON.", 11);
++    if(reserve_locator && renderable.size()<global["components"].size())
++        camera_result["minimap"]=render_locator(global,renderable,out,751,590,307,200);
++    out << "</g></svg>";
++    return camera_result;
++}
++
++// Publication covers are a server-owned policy, not an agent's inspection
++// camera. Fixed canvas and all-component framing keep large digital circuits
++// bounded and prevent a previous local focus from becoming the public cover.
++std::set<std::string> primary_cluster(json const& components)
++{
++    std::set<std::string> selected;
++    std::array<double,3> lo{},hi{};
++    for(std::size_t axis=0;axis<3;++axis)
++    {
++        std::vector<double> values;
++        for(auto const&c:components) values.push_back(c["position"][axis].get<double>());
++        std::sort(values.begin(),values.end());
++        double q10=values[values.size()/10],q90=values[values.size()*9/10];
++        double extent=std::max(.2,q90-q10);
++        lo[axis]=q10-3*extent;hi[axis]=q90+3*extent;
++    }
++    for(auto const&c:components)
++    {
++        bool inside=true;
++        for(std::size_t a=0;a<3;++a) inside&=c["position"][a]>=lo[a]&&c["position"][a]<=hi[a];
++        if(inside) selected.insert(c["id"]);
++    }
++    // This is only a labelled viewport suggestion, never removal from saved
++    // data or the mandatory all-components publication cover.
++    if(components.size()<32 || selected.size()*5<components.size()*4)
++        for(auto const&c:components) selected.insert(c["id"]);
++    return selected;
++}
++
++json render_overview(json const& original, std::ostream& out, bool publication=true, json const& options=json::object(), bool region=false)
++{
++    auto data=original;
++    if(original["components"].empty()) throw std::runtime_error("cannot render an empty overview");
++    auto cluster=primary_cluster(original["components"]);
++    json excluded=json::array();
++    for(auto const&c:original["components"]) if(!cluster.contains(c["id"])) excluded.push_back({{"id",c["id"]},{"ref",c["ref"]},{"type",c["type"]},{"position",c["position"]}});
++    std::size_t external=0;
++    if(region && !publication)
++    {
++        data["components"]=json::array();data["wires"]=json::array();
++        for(auto const&c:original["components"]) if(cluster.contains(c["id"])) data["components"].push_back(c);
++        for(auto const&w:original["wires"])
++        {
++            if(cluster.contains(w["Source"])&&cluster.contains(w["Target"])) data["wires"].push_back(w);
++            else ++external;
++        }
++    }
++    auto const& cs = data.at("components");
++    if (cs.empty()) throw std::runtime_error("cannot render an empty publication cover");
++    bool reserve_locator=!publication&&(region||!options.empty());
++    double frame_height=reserve_locator?600:780, frame_center_y=reserve_locator?405:510;
++    double scene_bottom=reserve_locator?710:920;
++    std::vector<pl::position> points;
++    for (auto const& c : cs) for (double x : {-.06,.06}) for (double y : {-.04,.04}) for (double z : {-.015,.025}) points.push_back(local_to_world(c,{x,y,z}));
++    auto camera = publication
++        ? make_camera(json::object(), {{"mode","custom"}, {"yaw_deg",45}, {"pitch_deg",60}, {"projection","orthographic"}, {"fit",true}}, points, false, 960)
++        : make_camera(data.value("saved_camera",json::object()), options, points, false, 960,1160,frame_height);
++    if(publication) camera.source = "fixed-publication-overview";
++    double xmin=1e99,xmax=-1e99,ymin=1e99,ymax=-1e99;
++    for (auto p : points)
++    {
++        double x=dot(p,camera.right), y=-dot(p,camera.up);
++        xmin=std::min(xmin,x); xmax=std::max(xmax,x); ymin=std::min(ymin,y); ymax=std::max(ymax,y);
++    }
++    double cx=(xmin+xmax)*.5,cy=(ymin+ymax)*.5;
++    double scale=std::min(1160/std::max(.01,xmax-xmin),780/std::max(.01,ymax-ymin))*.98;
++    if(publication)
++    {
++        camera.target=add(camera.target,add(mul(camera.right,cx-dot(camera.target,camera.right)),mul(camera.up,-cy-dot(camera.target,camera.up))));
++        camera.position=add(camera.target,mul(camera.forward,-camera.distance));
++        camera.ortho_height=780/scale;
++    }
++    double pan_x=0,pan_y=0;
++    auto screen=[&](pl::position p)->xy {
++        if(publication)return {640+(dot(p,camera.right)-cx)*scale,510+(-dot(p,camera.up)-cy)*scale};
++        auto q=add(p,mul(camera.position,-1));
++        double k=camera.perspective?(frame_height*.5)/std::tan(camera.fov*std::acos(-1.0)/360)/std::max(camera.near_plane,dot(q,camera.forward)):frame_height/camera.ortho_height;
++        return {640+pan_x+dot(q,camera.right)*k*camera.zoom,frame_center_y+pan_y-dot(q,camera.up)*k*camera.zoom};
++    };
++    if(!publication && (options.empty() || (options.value("mode","saved")=="saved" && !options.contains("fit") && !options.contains("target") && !options.contains("position") && !options.contains("zoom"))))
++    {
++        bool outside=false; double x0=1e99,x1=-1e99,y0=1e99,y1=-1e99;
++        for(auto p:points){auto s=screen(p);outside|=camera.depth(p)<=camera.near_plane||s.x<36||s.x>1244||s.y<105||s.y>scene_bottom;x0=std::min(x0,s.x);x1=std::max(x1,s.x);y0=std::min(y0,s.y);y1=std::max(y1,s.y);}
++        if(outside || (x1-x0)*(y1-y0)<1160*frame_height*.08)
++        {
++            auto fitted=options;fitted["fit"]=true;
++            camera=make_camera(data.value("saved_camera",json::object()),fitted,points,false,960,1160,frame_height);
++            camera.warnings.push_back("Automatic full-scene framing fallback: saved/default view was clipped or mostly empty; original camera and all positions/rotations are unchanged");
++        }
++    }
++    if(!publication && camera.fit)
++    {
++        // Perspective depth can make a fitted world-space bounding-box center
++        // visibly off-center. A documented image-plane pan centers the actual
++        // projection without rotating, moving, or flattening the saved scene.
++        double x0=1e99,x1=-1e99,y0=1e99,y1=-1e99;
++        for(auto p:points){auto s=screen(p);x0=std::min(x0,s.x);x1=std::max(x1,s.x);y0=std::min(y0,s.y);y1=std::max(y1,s.y);}
++        pan_x=640-(x0+x1)*.5;pan_y=frame_center_y-(y0+y1)*.5;
++    }
++    out << "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"1280\" height=\"960\" viewBox=\"0 0 1280 960\">"
++        << "<rect width=\"1280\" height=\"960\" fill=\"#f7f9fa\"/><g font-family=\"DejaVu Sans,sans-serif\" fill=\"#182936\">"
++        << "<text x=\"36\" y=\"43\" font-size=\"28\">Aurex | " << (region?"primary layout viewport (NOT the full scene)":"complete electrical experiment") << "</text>"
++        << "<text x=\"36\" y=\"73\" font-size=\"16\">" << cs.size() << " components; " << data["wires"].size()
++        << " connections. " << (region?std::to_string(cs.size())+"/"+std::to_string(original["components"].size())+" components; "+std::to_string(external)+" off-viewport connections":publication?"Fixed publication camera":"Complete-scene inspection overview") << "; original layout preserved.</text>"
++        << "<defs><clipPath id=\"overview-scene\"><rect x=\"24\" y=\"105\" width=\"1232\" height=\""<<scene_bottom-105<<"\"/></clipPath></defs><g clip-path=\"url(#overview-scene)\">";
++    std::vector<std::size_t> paint(cs.size()); std::iota(paint.begin(),paint.end(),0);
++    std::stable_sort(paint.begin(),paint.end(),[&](auto a,auto b){return camera.depth(local_to_world(cs[a],{}))>camera.depth(local_to_world(cs[b],{}));});
++    std::map<std::string,std::size_t> ids;
++    json clipped=json::array();
++    for (auto i : paint)
++    {
++        auto const& c=cs[i]; ids[c["id"].get<std::string>()]=i;
++        bool outside=false;
++        for (double x : {-.06,.06}) for (double y : {-.04,.04}) for (double z : {-.015,.025})
++        { auto p=screen(local_to_world(c,{x,y,z})); outside|=p.x<36||p.x>1244||p.y<105||p.y>scene_bottom; }
++        if(outside) clipped.push_back(c["id"]);
++        struct face {std::vector<pl::position> vertices; char const* color; double depth{};};
++        std::vector<face> faces{
++            {{{-.046,-.025,-.012},{-.046,.025,-.012},{-.046,.025,.012},{-.046,-.025,.012}},"#286895"},
++            {{{.046,-.025,-.012},{.046,.025,-.012},{.046,.025,.012},{.046,-.025,.012}},"#286895"},
++            {{{-.046,-.025,-.012},{.046,-.025,-.012},{.046,-.025,.012},{-.046,-.025,.012}},"#205982"},
++            {{{-.046,.025,-.012},{.046,.025,-.012},{.046,.025,.012},{-.046,.025,.012}},"#205982"},
++            {{{-.046,-.025,-.012},{.046,-.025,-.012},{.046,.025,-.012},{-.046,.025,-.012}},"#367fac"},
++            {{{-.046,-.025,.012},{.046,-.025,.012},{.046,.025,.012},{-.046,.025,.012}},"#367fac"}};
++        for(auto& face:faces) for(auto p:face.vertices) face.depth-=camera.depth(local_to_world(c,p));
++        std::stable_sort(faces.begin(),faces.end(),[](auto const&a,auto const&b){return a.depth<b.depth;});
++        out << "<g data-component-id=\"" << escaped(c["id"].get<std::string>()) << "\" data-position=\"" << escaped(c["position"].dump()) << "\" data-rotation=\"" << escaped(c["rotation"].dump()) << "\">";
++        for(auto const& face:faces)
++        {
++            out << "<polygon points=\"";
++            for(auto p:face.vertices){auto q=screen(local_to_world(c,p));out<<q.x<<','<<q.y<<' ';}
++            out << "\" fill=\""<<face.color<<"\" stroke=\"#205276\" stroke-width=\".55\"/>";
++        }
++        out << "</g>";
++    }
++    for(auto const& wire:data["wires"])
++    {
++        auto const&a=cs[ids.at(wire["Source"].get<std::string>())],&b=cs[ids.at(wire["Target"].get<std::string>())];
++        auto p=screen(port_position(a,wire["SourcePin"])),q=screen(port_position(b,wire["TargetPin"]));
++        out<<"<path d=\"M "<<p.x<<' '<<p.y<<" L "<<q.x<<' '<<q.y<<"\" fill=\"none\" stroke=\"#887334\" opacity=\".55\" stroke-width=\".85\"/>";
++    }
++    if(cs.size()<=256) for(auto const&c:cs) for(auto const&pin:c["pins"])
++    {auto p=screen(port_position(c,pin["pin"]));out<<"<circle cx=\""<<p.x<<"\" cy=\""<<p.y<<"\" r=\"1.9\" fill=\"#ead59b\"/>";}
++    out << "</g>";
++    json locator;
++    if(reserve_locator && (cs.size()<original["components"].size()||!clipped.empty()))
++    {
++        std::set<std::string> visible;
++        for(auto const& c:cs) visible.insert(c["id"]);
++        for(auto const& id:clipped) visible.erase(id.get<std::string>());
++        locator=render_locator(original,visible,out,948,730,307,200);
++        out<<"<text x=\"36\" y=\"760\" font-size=\"16\">Local viewport: "<<visible.size()<<'/'<<original["components"].size()<<" components in frame.</text>"
++           <<"<text x=\"36\" y=\"790\" font-size=\"14\">Global locator includes distant elements; yellow marks this view, not a changed circuit.</text>"
++           <<"<text x=\"36\" y=\"817\" font-size=\"14\">This rough locator is for orientation only. Use IDs/netlist for exact connections.</text>";
++    }
++    out << "<text x=\"36\" y=\"942\" font-size=\"13\">Overview is not pin-level evidence. Physical occlusion is possible; focus IDs to inspect connections and values.</text></g></svg>";
++    auto result=camera.metadata();
++    result["frame_pan_pixels"]={pan_x,pan_y};
++    result["overview"]=true; result["width"]=1280; result["height"]=960;
++    result["total_components"]=original["components"].size(); result["rendered_components"]=cs.size();
++    result["primary_cluster_component_count"]=cluster.size();result["spatial_outliers"]=excluded;
++    result["viewport_is_subset"]=region;result["external_connections"]=external;
++    if(region)result["warnings"].push_back("Primary layout viewport excludes explicitly listed distant components, NOT deleted or moved. Consult the separate full-scene overview and original netlist for complete layout/connectivity.");
++    result["clipped_component_ids"]=clipped; result["clipped_components"]=clipped;
++    result["occlusion_possible"]=true; result["saved_raw"]=data.value("saved_camera",json::object());
++    result["policy"]=publication?"fixed orthographic yaw=45 pitch=60; fit every component; ignore agent camera/focus/pagination":"full-scene overview, saved/default camera with explicit fit fallback if unusable; no component pagination or rearrangement";
++    result["label_overlap_count"]=0;
++    if(!locator.is_null()) result["minimap"]=locator;
++    result["labels_omitted_for_overview"]=true;
++    if(!publication) result["warnings"].push_back("Full-scene overview omits individual pin/value labels; no label overlap does not imply pin-level legibility. Use focus_ids or query for a local detail view");
++    return result;
++}
++
++int main(int argc, char** argv)
++{
++    try
++    {
++        if (argc < 5) throw std::runtime_error("usage: circuit_view render|create|state INPUT OUTPUT.svg OUTPUT.netlist.json [OFFSET] [LIMIT] [OUTPUT.sav|-] [auto|overview|region|spatial|topology] [isometric|top] [FOCUS_IDS_JSON] [QUERY] [CAMERA_JSON] [{\"with_image\":true|false}]");
++        auto input = read_json(argv[2]);
++        bool with_image = true;
++        if (argc > 13)
++        {
++            auto render_options = json::parse(argv[13]);
++            if (!render_options.is_object() || render_options.size() != 1 || !render_options.contains("with_image") || !render_options["with_image"].is_boolean())
++                throw std::runtime_error("render options must be {with_image: boolean}");
++            with_image = render_options["with_image"].get<bool>();
++        }
++        std::string mode = argv[1];
++        if (mode != "create" && mode != "render" && mode != "state") throw std::runtime_error("mode must be create, render or state");
++        json camera_warnings = json::array();
++        auto saved_camera = camera_save(input, mode == "state", camera_warnings);
++        json camera_options = mode != "render" ? input.value("camera", json::object()) : json::object();
++        if (argc > 12)
++        {
++            auto explicit_options = json::parse(argv[12]);
++            if (!explicit_options.is_object() || !camera_options.is_object()) throw std::runtime_error("camera must be an object");
++            camera_options.update(explicit_options);
++        }
++        if (camera_options.contains("overview") && !camera_options["overview"].is_boolean()) throw std::runtime_error("overview must be boolean");
++        bool overview=camera_options.value("overview",false);
++        // Community responses wrap the original Experiment without repeating
++        // its Type at the root. Preserve the file and copy the actual nested
++        // type into this in-memory wrapper, never assume electrical Type=0.
++        if (input.contains("Experiment") && !input.contains("Type")) input["Type"] = input.at("Experiment").at("Type");
++        std::optional<pl::experiment> ex;
++        json data;
++        if (mode == "state") data = inspect_state(input);
++        else
++        {
++            // The renderer consumes the exact raw camera itself. Removing it
++            // only from this in-memory loader copy prevents malformed camera
++            // text from blocking a valid electrical netlist. No input is saved.
++            auto loader_input = input;
++            if (mode == "render")
++            {
++                if (loader_input.contains("Experiment")) loader_input["Experiment"]["CameraSave"] = "";
++                else loader_input["CameraSave"] = "";
++            }
++            ex = mode == "create" ? from_spec(loader_input) : pl::experiment::load_from_json(loader_input);
++            data = inspect(*ex);
++        }
++        data["saved_camera"] = saved_camera;
++        for (auto const& warning : camera_warnings) data["warnings"].push_back(warning);
++        std::size_t offset = argc > 5 ? std::stoul(argv[5]) : 0;
++        std::size_t limit = argc > 6 ? std::stoul(argv[6]) : 12;
++        std::string view = argc > 8 ? argv[8] : "spatial";
++        if(view=="auto") view=data["components"].size()>8?"overview":"spatial";
++        if(view!="overview" && view!="region" && view!="spatial" && view!="topology") throw std::runtime_error("view must be auto, overview, region, spatial or topology");
++        bool complete_scene=overview || view=="overview" || view=="region";
++        if (!complete_scene && (!limit || limit > 24)) throw std::runtime_error("page limit must be 1..24");
++        if(complete_scene){offset=0;limit=data["components"].size();}
++        std::ofstream svg;
++        if (with_image) { svg.open(argv[3]); if (!svg) throw std::runtime_error("cannot write SVG"); }
++        std::string projection = argc > 9 ? argv[9] : "isometric";
++        auto visual_data = data;
++        std::set<std::string> targets;
++        json focus = argc > 10 ? json::parse(argv[10]) : json::array();
++        if(complete_scene) focus=json::array();
++        if (!focus.is_array() || focus.size() > limit) throw std::runtime_error("focus_ids must be an array no larger than page limit");
++        std::string query = argc > 11 ? argv[11] : "";
++        if(complete_scene) query.clear();
++        auto lower = [](std::string s) { for (auto& ch : s) if (static_cast<unsigned char>(ch) < 128) ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch))); return s; };
++        query = lower(query);
++        // Resolve each exact focus token before pagination and text search.
++        // A display Label must never shadow an actual Identifier or ref.
++        std::set<std::string> resolved_focus;
++        std::vector<std::string> primary_order;
++        for (auto const& token : focus)
++        {
++            if (!token.is_string() || token.get<std::string>().empty()) throw std::runtime_error("focus_ids entries must be nonempty strings");
++            bool found = false;
++            for (auto key : {"id", "ref", "label"})
++            {
++                std::vector<json const*> matches;
++                for (auto const& c : data["components"]) if (c[key] == token) matches.push_back(&c);
++                if (matches.empty()) continue;
++                if (matches.size() != 1)
++                {
++                    std::string message = "Ambiguous focus " + std::string(key) + " " + token.dump().substr(0, 140) + "; use an exact unique Identifier. Candidates: ";
++                    for (std::size_t i = 0; i < std::min<std::size_t>(8, matches.size()); ++i)
++                    {
++                        if (i) message += ", ";
++                        message += matches[i]->at("ref").get<std::string>() + "=" + matches[i]->at("id").dump();
++                    }
++                    if (matches.size() > 8) message += " (more matches omitted)";
++                    throw std::runtime_error(message);
++                }
++                auto id = matches[0]->at("id").get<std::string>();
++                if (resolved_focus.insert(id).second) primary_order.push_back(id);
++                found = true;
++                break;
++            }
++            if (!found) throw std::runtime_error("Unknown focus token " + token.dump().substr(0,140) + "; use an exact Identifier, ref or unique Label");
++        }
++        // Pagination applies to one deterministic, deduplicated union: exact
++        // focus in request order first, then query matches in original order.
++        for (auto const& c : data["components"])
++        {
++            bool match = !query.empty() && lower(c["id"].get<std::string>() + " " + c["label"].get<std::string>() + " " + c["type"].get<std::string>() + " " + c["properties"].dump()).find(query) != std::string::npos;
++            if (match && !resolved_focus.contains(c["id"].get<std::string>())) primary_order.push_back(c["id"].get<std::string>());
++        }
++        std::size_t match_count = primary_order.size();
++        bool focused = !focus.empty() || !query.empty();
++        json selection = json::object();
++        if (focused)
++        {
++            if (primary_order.empty()) throw std::runtime_error("No components match focus_ids/query");
++            if (offset >= primary_order.size()) throw std::runtime_error("focus/query offset exceeds total_matches=" + std::to_string(primary_order.size()));
++            auto page_end = std::min(primary_order.size(), offset + limit);
++            json primary_ids = json::array(), primary_refs = json::array(), neighbor_ids = json::array(), neighbor_refs = json::array();
++            std::map<std::string, std::string> refs;
++            for (auto const& c : data["components"]) refs.emplace(c["id"].get<std::string>(), c["ref"].get<std::string>());
++            for (std::size_t i = offset; i < page_end; ++i)
++            {
++                targets.insert(primary_order[i]);
++                primary_ids.push_back(primary_order[i]); primary_refs.push_back(refs.at(primary_order[i]));
++            }
++            auto selected = targets;
++            for (auto const& w : data["wires"])
++            {
++                if (selected.size() == limit) break;
++                if (targets.contains(w["Source"])) selected.insert(w["Target"]);
++                if (selected.size() == limit) break;
++                if (targets.contains(w["Target"])) selected.insert(w["Source"]);
++            }
++            visual_data["components"] = json::array();
++            visual_data["focused"] = true;
++            visual_data["total_components"] = data["components"].size();
++            for (auto const& c : data["components"]) if (selected.contains(c["id"])) visual_data["components"].push_back(c);
++            for (auto const& id : selected) if (!targets.contains(id)) { neighbor_ids.push_back(id); neighbor_refs.push_back(refs.at(id)); }
++            selection = {{"total_matches",match_count},{"offset",offset},{"limit",limit},{"primary_ids",primary_ids},{"primary_refs",primary_refs},
++                {"neighbor_ids",neighbor_ids},{"neighbor_refs",neighbor_refs},{"has_more",page_end<primary_order.size()},
++                {"next_offset",page_end<primary_order.size()?json(page_end):json()},
++                {"order","explicit focus in request order, then query matches in saved order; IDs deduplicated before paging"},
++                {"scope","Only primary_ids belong to this match page. Optional neighbors fill spare diagram slots and may recur across pages; they are not additional matches."}};
++            data["selection"] = selection;
++        }
++        std::size_t render_offset = focused ? 0 : offset;
++        if (projection != "isometric" && projection != "top") throw std::runtime_error("projection must be isometric or top");
++        if (!with_image)
++            data["camera"] = {{"source","not-rendered"},{"image_generated",false},{"overview",complete_scene},{"saved_raw",saved_camera},{"requested",camera_options},
++                {"warnings",{"with_image=false: no SVG/PNG or camera projection was generated. Component positions and the saved camera remain unchanged."}}};
++        else if(overview)
++        {
++            data["camera"]=render_overview(data,svg);
++            view="spatial"; projection="fixed-overview";
++        }
++        else if(view=="overview") data["camera"]=render_overview(data,svg,false,camera_options);
++        else if(view=="region") data["camera"]=render_overview(data,svg,false,camera_options,true);
++        else if (view == "topology")
++        {
++            render_topology(visual_data, svg, render_offset, limit);
++            data["camera"] = {{"source", "not-applied-topology"}, {"saved_raw", saved_camera}, {"warnings", {"Topology is a connectivity diagram; camera options are not applied"}}};
++        }
++        else if (view == "spatial") data["camera"] = render_spatial(visual_data, data, svg, render_offset, limit, projection == "top", camera_options);
++        else throw std::runtime_error("view must be spatial, overview or topology");
++        std::ofstream netlist(argv[4]);
++        if (!netlist) throw std::runtime_error("cannot write netlist");
++        netlist << data.dump(2) << '\n';
++        if (argc > 7 && std::string(argv[7]) != "-")
++        {
++            if (mode == "state") throw std::runtime_error("Native snapshot rendering does not export or round-trip a PhysicsLab document");
++            std::ofstream sav(argv[7]); if (!sav) throw std::runtime_error("cannot write sav");
++            // A source PL document remains byte-semantically unchanged in
++            // camera/layout data. Camera adjustment is render-only, never a save edit.
++            if (mode == "render") sav << input.dump();
++            else
++            {
++                auto exported=json::parse(ex->dump());
++                if(!saved_camera.empty()) exported["Experiment"]["CameraSave"]=saved_camera.dump();
++                sav << exported.dump();
++            }
++        }
++        json visible = json::array();
++        for (std::size_t i = render_offset; i < std::min(visual_data["components"].size(), render_offset + limit); ++i) visible.push_back(visual_data["components"][i]["id"]);
++        std::cout << json{{"components", data["components"].size()}, {"nodes", data["nodes"].size()}, {"offset", offset}, {"limit", limit}, {"view", view}, {"projection", projection},
++            {"visible_ids", visible}, {"focused", focused}, {"match_count", match_count}, {"selection",selection},{"with_image",with_image},
++            {"camera", data["camera"]}, {"state_origin", data.value("state_origin", json())}}.dump() << '\n';
++        return 0;
++    }
++    catch (std::exception const& error) { std::cerr << error.what() << '\n'; return 1; }
++}
+diff --git a/src/circuit_observe.cpp b/src/circuit_observe.cpp
+new file mode 100644
+index 0000000..bb3014c
+--- /dev/null
++++ b/src/circuit_observe.cpp
+@@ -0,0 +1,193 @@
++#include <phy_engine/phy_engine.h>
++#include <cstddef>
++#include <cstdint>
++#include <cmath>
++#include <limits>
++
++// Bounded observation ABI. Unlike the legacy real-only sampler, this preserves
++// AC phase and four-state digital values and never reads analog union storage
++// for an exclusively digital node.
++extern "C" int circuit_sample_complex(void* circuit_ptr, std::size_t* vec_pos,
++    std::size_t* chunk_pos, std::size_t comp_size, std::size_t capacity,
++    double* vr, double* vi, std::size_t* vo, double* ir, double* ii,
++    std::size_t* io, std::uint8_t* digital)
++{
++    if (!circuit_ptr || !vec_pos || !chunk_pos || !vr || !vi || !vo || !ir || !ii || !io || !digital) return 1;
++    auto* circuit = static_cast<phy_engine::circult*>(circuit_ptr);
++    auto& netlist = circuit->get_netlist();
++    vo[0] = io[0] = 0;
++    for (std::size_t c = 0; c < comp_size; ++c)
++    {
++        auto* model = phy_engine::netlist::get_model(netlist, phy_engine::netlist::model_pos{vec_pos[c], chunk_pos[c]});
++        if (!model || !model->ptr) return 2;
++        auto pins = model->ptr->generate_pin_view();
++        auto branches = model->ptr->generate_branch_view();
++        if (pins.size > capacity - vo[c] || branches.size > capacity - io[c]) return 3;
++        for (std::size_t p = 0; p < pins.size; ++p)
++        {
++            auto* node = pins.pins[p].nodes;
++            auto n = vo[c] + p;
++            vr[n] = vi[n] = 0;
++            digital[n] = 2;
++            if (!node) continue;
++            if (node->num_of_analog_node != 0)
++            {
++                vr[n] = node->node_information.an.voltage.real();
++                vi[n] = node->node_information.an.voltage.imag();
++                if(!std::isfinite(vr[n]) || !std::isfinite(vi[n])) return 4;
++            }
++            else
++            {
++                switch (node->node_information.dn.state)
++                {
++                    case phy_engine::model::digital_node_statement_t::L: digital[n] = 0; break;
++                    case phy_engine::model::digital_node_statement_t::H: digital[n] = 1; break;
++                    case phy_engine::model::digital_node_statement_t::Z: digital[n] = 3; break;
++                    default: digital[n] = 2;
++                }
++            }
++        }
++        for (std::size_t b = 0; b < branches.size; ++b)
++        {
++            ir[io[c] + b] = branches.branches[b].current.real();
++            ii[io[c] + b] = branches.branches[b].current.imag();
++            if(!std::isfinite(ir[io[c] + b]) || !std::isfinite(ii[io[c] + b])) return 4;
++        }
++        vo[c + 1] = vo[c] + pins.size;
++        io[c + 1] = io[c] + branches.size;
++    }
++    return 0;
++}
++
++// Read-only typed model attributes (including behavior-state flags). The
++// caller chooses catalog-declared indices; no guessed memory layout is read.
++extern "C" int circuit_get_model_scalar(void* circuit_ptr, std::size_t vec_pos,
++    std::size_t chunk_pos, std::size_t attribute, double* output)
++{
++    if(!circuit_ptr || !output) return 1;
++    auto* circuit=static_cast<phy_engine::circult*>(circuit_ptr);
++    auto* model=phy_engine::netlist::get_model(circuit->get_netlist(),phy_engine::netlist::model_pos{vec_pos,chunk_pos});
++    if(!model || !model->ptr) return 2;
++    auto value=model->ptr->get_attribute(attribute);
++    if(value.type==phy_engine::model::variant_type::d) *output=value.d;
++    else if(value.type==phy_engine::model::variant_type::boolean) *output=value.boolean?1:0;
++    else return 3;
++    return std::isfinite(*output)?0:4;
++}
++
++// A bounded exact-endpoint TR driver using the same native prepare/stamp/
++// nonlinear solve path. Unlike the legacy accumulated floating-point while
++// loop, 0.5s / 50us is exactly 10000 solves and ends at precisely base+0.5s.
++using circuit_trace_callback = int (*)(void*, double, std::size_t);
++
++// Version 1: each completed TR solve advances digital models exactly once,
++// before observation, including steps without a callback. No final extra tick.
++extern "C" int circuit_transient_digital_propagation_version() { return 1; }
++
++// Configured entry points use 1..64 complete digital ticks per TR solve.
++// Ticks advance state (e.g. TICK_DELAY); they are not a convergence tolerance
++// or a physical-time interval. The existing entry points retain count=1.
++extern "C" int circuit_transient_digital_propagation_configured_version() { return 1; }
++
++static bool circuit_has_hybrid_node(phy_engine::circult const& circuit)
++{
++    auto hybrid = [](phy_engine::model::node_t const& node) {
++        return node.num_of_analog_node != 0 && node.num_of_analog_node != node.pins.size();
++    };
++    if(hybrid(circuit.nl.ground_node)) return true;
++    for(auto const& block:circuit.nl.nodes)
++        for(auto node=block.begin;node!=block.curr;++node)
++            if(hybrid(*node)) return true;
++    return false;
++}
++
++static bool circuit_solution_finite(phy_engine::circult const& circuit)
++{
++    for(auto node:circuit.size_t_to_node_p)
++    {
++        auto v=node->node_information.an.voltage;
++        if(!std::isfinite(v.real())||!std::isfinite(v.imag())) return false;
++    }
++    for(auto branch:circuit.size_t_to_branch_p)
++        if(!std::isfinite(branch->current.real())||!std::isfinite(branch->current.imag())) return false;
++    return true;
++}
++
++extern "C" int circuit_run_transient_trace_configured(void* circuit_ptr, double step,
++    double stop, std::size_t max_steps, std::size_t sample_every,
++    std::size_t digital_steps_per_tr_step, circuit_trace_callback callback,
++    void* user, double* actual_stop, std::size_t* actual_steps,
++    std::size_t* actual_samples, std::size_t* actual_digital_steps)
++{
++    if(!circuit_ptr || !actual_stop || !actual_steps || !actual_samples || !actual_digital_steps) return 1;
++    auto* circuit=static_cast<phy_engine::circult*>(circuit_ptr);
++    double base=circuit->tr_duration;
++    *actual_stop=base;*actual_steps=0;*actual_samples=0;*actual_digital_steps=0;
++    if(digital_steps_per_tr_step==0 || digital_steps_per_tr_step>64) return 2;
++    if(!std::isfinite(step)||!std::isfinite(stop)||step<=0||stop<=0||step>stop||max_steps==0||max_steps>100000) return 2;
++    double ratio=stop/step,nearest=std::round(ratio);
++    if(!std::isfinite(ratio)||ratio>static_cast<double>(max_steps)+1e-8) return 2;
++    if(std::abs(ratio-nearest)<=32*std::numeric_limits<double>::epsilon()*std::max(1.0,ratio)) ratio=nearest;
++    auto count=static_cast<std::size_t>(std::ceil(ratio));
++    if(count==0||count>max_steps) return 2;
++    if(count>std::numeric_limits<std::size_t>::max()/digital_steps_per_tr_step) return 2;
++    // Sample only completed native solves. No invented t=0 operating point.
++    // The final point is always included, without duplicating a regular sample.
++    if(callback && (sample_every==0 || (count/sample_every+(count%sample_every!=0))>201)) return 2;
++    if(!std::isfinite(base)||!std::isfinite(base+stop)||base+stop<=base) return 2;
++    // A digital output on an analog node changes digital_out (MNA sources).
++    // Supporting that requires a coupled solve contract, not a second tick:
++    // a second tick would advance stateful digital models twice per TR step.
++    // Reject before preparation or sampling; disconnected analog and digital
++    // subgraphs, pure analog circuits, and pure digital circuits remain valid.
++    if(circuit_has_hybrid_node(*circuit)) return 5;
++    circuit->set_analyze_type(phy_engine::analyze_type::TR);
++    circuit->analyzer_setting.tr.t_step=step;
++    circuit->analyzer_setting.tr.t_stop=stop;
++    circuit->prepare();
++    for(std::size_t i=0;i<count;++i)
++    {
++        double target=base+(i+1==count?stop:std::min(stop,static_cast<double>(i+1)*step));
++        double prior=circuit->tr_duration;
++        circuit->update_tr_step(target-prior);
++        circuit->tr_duration=target;
++        if(!circuit->solve()||!circuit_solution_finite(*circuit)){circuit->tr_duration=prior;return 3;}
++        for(std::size_t tick=0;tick<digital_steps_per_tr_step;++tick) circuit->digital_clk();
++        *actual_digital_steps+=digital_steps_per_tr_step;
++        *actual_stop=target;*actual_steps=i+1;
++        if(callback && ((i+1)%sample_every==0 || i+1==count))
++        {
++            ++*actual_samples;
++            if(callback(user,circuit->tr_duration,i+1)!=0) return 4;
++        }
++    }
++    return 0;
++}
++
++extern "C" int circuit_run_transient_trace(void* circuit_ptr, double step,
++    double stop, std::size_t max_steps, std::size_t sample_every,
++    circuit_trace_callback callback, void* user, double* actual_stop,
++    std::size_t* actual_steps, std::size_t* actual_samples)
++{
++    std::size_t digital_steps{};
++    return circuit_run_transient_trace_configured(circuit_ptr,step,stop,max_steps,
++        sample_every,1,callback,user,actual_stop,actual_steps,actual_samples,&digital_steps);
++}
++
++extern "C" int circuit_run_transient_bounded_configured(void* circuit_ptr, double step,
++    double stop, std::size_t max_steps, std::size_t digital_steps_per_tr_step,
++    double* actual_stop, std::size_t* actual_steps, std::size_t* actual_digital_steps)
++{
++    std::size_t samples{};
++    return circuit_run_transient_trace_configured(circuit_ptr,step,stop,max_steps,
++        0,digital_steps_per_tr_step,nullptr,nullptr,actual_stop,actual_steps,
++        &samples,actual_digital_steps);
++}
++
++extern "C" int circuit_run_transient_bounded(void* circuit_ptr, double step,
++    double stop, std::size_t max_steps, double* actual_stop, std::size_t* actual_steps)
++{
++    std::size_t samples{};
++    return circuit_run_transient_trace(circuit_ptr,step,stop,max_steps,0,nullptr,
++        nullptr,actual_stop,actual_steps,&samples);
++}
+diff --git a/include/phy_engine/model/models/non-linear/bjt_ebers_moll.h b/include/phy_engine/model/models/non-linear/bjt_ebers_moll.h
+new file mode 100644
+index 0000000..aff76d5
+--- /dev/null
++++ b/include/phy_engine/model/models/non-linear/bjt_ebers_moll.h
+@@ -0,0 +1,191 @@
++#pragma once
++#include <algorithm>
++#include <cmath>
++#include "../../model_refs/base.h"
++
++namespace phy_engine::model::details
++{
++    // Quasi-static Ebers-Moll transport model; independent implementation.
++    // https://ngspice.sourceforge.io/docs/ngspice-manual.pdf (BJT chapter)
++    // https://github.com/ngspice/ngspice/blob/master/src/spicelib/devices/bjt/bjtload.c
++    // Reference equations with qb=1, no leakage/parasitic/charge-storage extensions:
++    // Ic=If-(1+1/Br)*Ir; Ib=If/Bf+Ir/Br; Ie=-(Ic+Ib).
++    // Legacy PE Is was a BE base-current scale, not SPICE transport IS.
++    // Preserve forward-active compatibility with transport_Is=Is*BetaF.
++    // No Early effect, breakdown, charge storage, parasitic resistance or
++    // calibrated temperature scaling of Is/Beta. Temp sets thermal voltage.
++    struct bjt_ebers_moll_state
++    {
++        double Is{1e-16}, N{1.0}, BetaF{100.0}, Temp{27.0}, Area{1.0};
++        double BetaR{1.0}, Nr{1.0};
++        double Ut{};
++        double last_be{}, last_bc{};
++        double jacobian[3][3]{};
++    };
++
++    inline bool bjt_valid(bjt_ebers_moll_state const& q) noexcept
++    {
++        return std::isfinite(q.Is) && q.Is>0 && std::isfinite(q.N) && q.N>0
++            && std::isfinite(q.BetaF) && q.BetaF>0 && std::isfinite(q.BetaR) && q.BetaR>0
++            && std::isfinite(q.Nr) && q.Nr>0 && std::isfinite(q.Temp) && q.Temp>-273.15
++            && std::isfinite(q.Area) && q.Area>0 && std::isfinite(q.Is*q.BetaF*q.Area);
++    }
++
++    struct bjt_junction { double current{}, conductance{}; };
++    inline bjt_junction bjt_diode(double voltage, double thermal, double scale) noexcept
++    {
++        // A C1 tangent continuation prevents exp overflow during Newton's
++        // trial steps. Ordinary silicon operating voltages use exact expm1.
++        double const x=voltage/thermal;
++        double const ex=std::exp(std::min(x,60.0));
++        return {scale*(x>60.0?ex*(1.0+x-60.0)-1.0:std::expm1(x)),
++                scale*ex/thermal};
++    }
++
++    inline double bjt_limit(double voltage, double previous, double thermal, double scale) noexcept
++    {
++        // Junction-voltage limiting is numerical iteration control, not an
++        // output clamp. check_convergence requires the unlimited solution.
++        double const critical=thermal*std::log(thermal/(std::sqrt(2.0)*scale));
++        if(voltage>critical && std::abs(voltage-previous)>2*thermal)
++        {
++            if(previous>0)
++            {
++                double const argument=1+(voltage-previous)/thermal;
++                return argument>0?previous+thermal*std::log(argument):critical;
++            }
++            return thermal*std::log(std::max(voltage/thermal,1.0));
++        }
++        return voltage;
++    }
++
++    struct bjt_evaluation
++    {
++        double current[3]{};
++        double du[3]{};
++        double dv[3]{};
++    };
++    inline bjt_evaluation bjt_evaluate(bjt_ebers_moll_state const& q, double be, double bc) noexcept
++    {
++        double const scale=q.Is*q.BetaF*q.Area;
++        auto f=bjt_diode(be,q.N*q.Ut,scale);
++        auto r=bjt_diode(bc,q.Nr*q.Ut,scale);
++        bjt_evaluation out{};
++        out.current[0]=f.current/q.BetaF+r.current/q.BetaR;
++        out.current[1]=f.current-(1+1/q.BetaR)*r.current;
++        out.current[2]=-(out.current[0]+out.current[1]);
++        out.du[0]=f.conductance/q.BetaF;
++        out.du[1]=f.conductance;
++        out.du[2]=-(out.du[0]+out.du[1]);
++        out.dv[0]=r.conductance/q.BetaR;
++        out.dv[1]=-(1+1/q.BetaR)*r.conductance;
++        out.dv[2]=-(out.dv[0]+out.dv[1]);
++        return out;
++    }
++
++    template<class Q> inline bool bjt_prepare(Q& q) noexcept
++    {
++        if(!bjt_valid(q)) return false;
++        q.Ut=1.380650524e-23*(q.Temp+273.15)/1.6021765314e-19;
++        q.last_be=q.last_bc=0;
++        return true;
++    }
++
++    template<class Q> inline bool bjt_stamp(Q& q, MNA::MNA& mna) noexcept
++    {
++        if(!bjt_valid(q)) return false;
++        auto b=q.pins[0].nodes;auto c=q.pins[1].nodes;auto e=q.pins[2].nodes;
++        if(!b||!c||!e) return false;
++        constexpr double sign=Q::polarity;
++        double be=sign*(b->node_information.an.voltage.real()-e->node_information.an.voltage.real());
++        double bc=sign*(b->node_information.an.voltage.real()-c->node_information.an.voltage.real());
++        if(!std::isfinite(be)||!std::isfinite(bc)) return false;
++        double scale=q.Is*q.BetaF*q.Area;
++        be=bjt_limit(be,q.last_be,q.N*q.Ut,scale);
++        bc=bjt_limit(bc,q.last_bc,q.Nr*q.Ut,scale);
++        q.last_be=be;q.last_bc=bc;
++        auto eval=bjt_evaluate(q,be,bc);
++        std::size_t nodes[]{b->node_index,c->node_index,e->node_index};
++        for(std::size_t row=0;row<3;++row)
++        {
++            q.jacobian[row][0]=eval.du[row]+eval.dv[row];
++            q.jacobian[row][1]=-eval.dv[row];
++            q.jacobian[row][2]=-eval.du[row];
++            double const rhs=sign*(eval.current[row]-eval.du[row]*be-eval.dv[row]*bc);
++            if(!std::isfinite(rhs)) return false;
++            for(std::size_t col=0;col<3;++col)
++            {
++                if(!std::isfinite(q.jacobian[row][col])) return false;
++                mna.G_ref(nodes[row],nodes[col])+=q.jacobian[row][col];
++            }
++            mna.I_ref(nodes[row])-=rhs;
++        }
++        return true;
++    }
++
++    template<class Q> inline bool bjt_converged(Q const& q) noexcept
++    {
++        auto b=q.pins[0].nodes;auto c=q.pins[1].nodes;auto e=q.pins[2].nodes;
++        if(!b||!c||!e) return false;
++        double const be=Q::polarity*(b->node_information.an.voltage.real()-e->node_information.an.voltage.real());
++        double const bc=Q::polarity*(b->node_information.an.voltage.real()-c->node_information.an.voltage.real());
++        return std::isfinite(be)&&std::isfinite(bc)&&std::abs(be-q.last_be)<1e-8&&std::abs(bc-q.last_bc)<1e-8;
++    }
++
++    template<class Q> inline bool bjt_ac(Q& q, MNA::MNA& mna) noexcept
++    {
++        for(std::size_t i=0;i<3;++i)
++            for(std::size_t j=0;j<3;++j)
++            {
++                if(!q.pins[i].nodes||!q.pins[j].nodes) return false;
++                mna.G_ref(q.pins[i].nodes->node_index,q.pins[j].nodes->node_index)+=q.jacobian[i][j];
++            }
++        return true;
++    }
++
++    template<class Q> inline variant bjt_get(Q const& q, std::size_t index) noexcept
++    {
++        double value{};
++        switch(index)
++        {
++            case 0:value=q.Is;break;case 1:value=q.N;break;case 2:value=q.BetaF;break;
++            case 3:value=q.Temp;break;case 4:value=q.Area;break;case 5:value=q.BetaR;break;
++            case 6:value=q.Nr;break;
++            case 16:case 17:case 18:case 19:case 20:
++            {
++                auto b=q.pins[0].nodes;auto c=q.pins[1].nodes;auto e=q.pins[2].nodes;
++                if(!b||!c||!e||q.Ut<=0) return {};
++                double const be=Q::polarity*(b->node_information.an.voltage.real()-e->node_information.an.voltage.real());
++                double const bc=Q::polarity*(b->node_information.an.voltage.real()-c->node_information.an.voltage.real());
++                if(index<19) value=Q::polarity*bjt_evaluate(q,be,bc).current[index-16];
++                else value=Q::polarity*(index==19?be:bc);
++                break;
++            }
++            default:return {};
++        }
++        return {.d{value},.type{variant_type::d}};
++    }
++
++    template<class Q> inline bool bjt_set(Q& q, std::size_t index, variant value) noexcept
++    {
++        if(value.type!=variant_type::d||!std::isfinite(value.d)) return false;
++        if(index==3?value.d<=-273.15:value.d<=0) return false;
++        switch(index)
++        {
++            case 0:q.Is=value.d;return true;case 1:q.N=value.d;return true;case 2:q.BetaF=value.d;return true;
++            case 3:q.Temp=value.d;return true;case 4:q.Area=value.d;return true;case 5:q.BetaR=value.d;return true;
++            case 6:q.Nr=value.d;return true;default:return false;
++        }
++    }
++
++    inline constexpr fast_io::u8string_view bjt_attribute_name(std::size_t index) noexcept
++    {
++        switch(index)
++        {
++            case 0:return u8"Is";case 1:return u8"N";case 2:return u8"BetaF";case 3:return u8"Temp";
++            case 4:return u8"Area";case 5:return u8"BetaR";case 6:return u8"Nr";
++            case 16:return u8"I_B";case 17:return u8"I_C";case 18:return u8"I_E";
++            case 19:return u8"V_BE";case 20:return u8"V_BC";default:return {};
++        }
++    }
++}

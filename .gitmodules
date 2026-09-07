@@ -1,0 +1,4 @@
+[submodule "third-parties/Phy-Engine"]
+	path = third-parties/Phy-Engine
+	url = https://github.com/Phy-Engine-Dev/Phy-Engine.git
+	branch = aurex

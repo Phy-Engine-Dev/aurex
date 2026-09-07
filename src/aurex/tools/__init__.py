@@ -19,6 +19,8 @@ from .phy_engine import (
 )
 from .plar_tools import (
     PLAR_CONTEXT_TOOL,
+    PLAR_SUMMARY_TOOL,
+    PLAR_EXPERIMENT_FILE_TOOL,
     PLAR_CHECK_FOLLOWING_TOOL,
     PLAR_GET_COMMENTS_TOOL,
     PLAR_GET_OLDEST_COMMENT_TOOL,
@@ -29,20 +31,27 @@ from .plar_tools import (
     PLAR_RELATIONS_TOOL,
     PLAR_STATUS_SAVE_TOOL,
     PLAR_UPLOAD_SAV_TOOL,
+    PLAR_PUBLISH_EXPERIMENT_TOOL,
     plar_check_following,
     plar_list_builtin_tags,
     plar_get_comments,
     plar_get_oldest_comment,
     plar_get_experiment_context,
+    plar_get_summary,
+    plar_get_experiment_file,
     plar_get_relations,
     plar_get_status_save,
     plar_get_user,
     plar_oldest_by_user,
     plar_query_experiments,
     plar_upload_sav,
+    plar_publish_experiment,
 )
 from .registry import ToolRegistry, ToolSpec
-from .web_search import WEB_SEARCH_TOOL, ddg_web_search
+from .web_search import WEB_SEARCH_TOOL, WEB_FETCH_TOOL, web_search as search_web, web_fetch
+from .circuits import register_circuit_tools
+from .hdl import register_hdl_tools
+from .hdl_workspace import register_hdl_workspace_tools
 
 
 def _end_tool(_runtime, args: dict[str, Any]) -> dict[str, Any]:
@@ -65,7 +74,8 @@ def create_registry() -> ToolRegistry:
             )
         )
 
-    add(WEB_SEARCH_TOOL, ddg_web_search)
+    add(WEB_SEARCH_TOOL, search_web)
+    add(WEB_FETCH_TOOL, web_fetch)
 
     add(LOCAL_GET_TARGET_CONTEXT_TOOL, local_get_target_context)
 
@@ -78,12 +88,18 @@ def create_registry() -> ToolRegistry:
     add(PLAR_RELATIONS_TOOL, plar_get_relations)
     add(PLAR_CHECK_FOLLOWING_TOOL, plar_check_following)
     add(PLAR_CONTEXT_TOOL, plar_get_experiment_context)
+    add(PLAR_SUMMARY_TOOL, plar_get_summary)
+    add(PLAR_EXPERIMENT_FILE_TOOL, plar_get_experiment_file)
     add(PLAR_STATUS_SAVE_TOOL, plar_get_status_save)
     add(PLAR_UPLOAD_SAV_TOOL, plar_upload_sav)
+    add(PLAR_PUBLISH_EXPERIMENT_TOOL, plar_publish_experiment)
 
     add(PHY_ENGINE_BUILD_TOOL, phy_engine_build)
     add(VERILOG_TO_SAV_TOOL, verilog_to_sav)
     add(PE_SIMULATE_TOOL, pe_simulate)
+    register_circuit_tools(reg)
+    register_hdl_tools(reg)
+    register_hdl_workspace_tools(reg)
 
     add(LLM_GENERATE_VERILOG_TOOL, llm_generate_verilog)
     add(LLM_WRITE_PUBLISH_TEXT_TOOL, llm_write_publish_text)

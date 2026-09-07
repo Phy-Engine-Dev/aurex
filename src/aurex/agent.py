@@ -2995,7 +2995,15 @@ class AurexAgent:
         user_text: str,
         user: Any | None = None,
         task_id: str | None = None,
+        session_id: str | None = None,
+        run_id: str | None = None,
+        images: list[str] | None = None,
     ) -> dict[str, Any]:
+        if self.cfg.llm.enabled:
+            from .session_agent import SessionAgent
+            return SessionAgent(cfg=self.cfg, config_path=self.config_path, tools=self.tools, logger=self.logger).handle(
+                user_text=user_text, user=user, task_id=task_id, session_id=session_id, run_id=run_id, images=images,
+            )
         tid = task_id or new_task_id()
         mention = (self.cfg.agent.mention_tag or "").strip()
         clean_text = (user_text or "").strip()
