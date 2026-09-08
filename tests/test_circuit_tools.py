@@ -6,6 +6,7 @@ from pathlib import Path
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 import xml.etree.ElementTree as ET
 from dataclasses import replace
@@ -15,7 +16,8 @@ sys.path.insert(0, str(ROOT / "src"))
 
 from aurex.config import AurexConfig
 from aurex.phy_engine.catalog import PL_MAX_POWER_W
-from aurex.tools.circuits import (_render_spec, circuit_analyze, circuit_compare_traces, circuit_create,
+from aurex.tools.circuits import (_editable_component_manifest, _render_spec, _spatial_context,
+                                  _summarize_numeric_series, circuit_analyze, circuit_compare_traces, circuit_create,
                                   circuit_edit, circuit_inspect,
                                   circuit_query_many, circuit_read_trace,
                                   normalize_spec, register_circuit_tools)
@@ -69,6 +71,68 @@ class CircuitValidationTests(unittest.TestCase):
             self.assertEqual(component["properties"]["最大功率"], PL_MAX_POWER_W)
             self.assertTrue(component["properties"]["锁定"])
         self.assertEqual(rendered["components"][0]["properties"]["内阻"], 0)
+
+    def test_native_edit_manifest_preserves_writable_spec_not_renderer_properties(self):
+        spec = normalize_spec({"components": [
+            {"id": "V1", "type": "vdc", "nodes": ["supply", "gnd"],
+             "params": {"v": 5}, "position": [0.1, 0.2, 0.0]},
+            {"id": "R1", "type": "resistor", "nodes": ["supply", "gnd"],
+             "params": {"r": 10}, "position": [0.3, 0.2, 0.0]},
+        ]})
+        manifest = _editable_component_manifest(spec, ["R1", "V1"], limit=1)
+        self.assertEqual(manifest, [
+            {"id": "R1", "type": "resistor", "nodes": ["supply", "gnd"],
+             "params": {"r": 10.0}, "pin_labels": ["1", "2"]},
+        ])
+
+    def test_spatial_context_has_directions_and_never_confuses_proximity_with_connectivity(self):
+        data = {"components": [
+            {"id": "R", "ref": "C1", "type": "Resistor", "position": [0, 0, 0],
+             "pins": [{"node": "n"}, {"node": "gnd"}]},
+            {"id": "C", "ref": "C2", "type": "Basic Capacitor", "position": [-1, 0, 0],
+             "pins": [{"node": "other"}, {"node": "gnd"}]},
+            {"id": "V", "ref": "C3", "type": "Battery Source", "position": [0, 2, 0],
+             "pins": [{"node": "v"}, {"node": "return"}]},
+        ]}
+        context = _spatial_context(data, ["R"])
+        self.assertEqual(context["relations"][0]["nearest"][0]["direction"], "left")
+        self.assertTrue(context["relations"][0]["nearest"][0]["electrically_connected"])
+        self.assertEqual(context["relations"][0]["nearest"][0]["shared_nodes"], ["gnd"])
+        self.assertEqual(context["relations"][0]["nearest"][1]["direction"], "above")
+        self.assertFalse(context["relations"][0]["nearest"][1]["electrically_connected"])
+
+    def test_numeric_trace_summary_distinguishes_window_stability_from_settled_remainder(self):
+        series = [(0, 0.0, 0.0), (1, 1.0, 0.05), (2, 2.0, 1.0),
+                  (3, 3.0, 1.02), (4, 4.0, 1.01)]
+        result = _summarize_numeric_series(
+            series, window_s=1.0, stability_threshold=0.1, change_threshold=0.1)
+        self.assertEqual(result["first_stable_sampled_window"]["start_time_s"], 0.0)
+        self.assertEqual(result["settled_for_remainder"]["start_time_s"], 2.0)
+        self.assertEqual(result["changes_at_or_above_threshold"], 1)
+        self.assertEqual(result["largest_consecutive_change"]["to_time_s"], 2.0)
+
+    def test_numeric_trace_summary_is_linear_and_does_not_claim_periodicity(self):
+        # Alternating values defeat every long stable window.  This is the
+        # quadratic worst case for a per-start rescan, while the monotonic
+        # deque implementation remains linear in the recorded sample count.
+        sample_count = 30_000
+        series = [(index, index * .01, float(index & 1))
+                  for index in range(sample_count)]
+        started = time.perf_counter()
+        result = _summarize_numeric_series(
+            series, window_s=150.0, stability_threshold=.1,
+            change_threshold=.5)
+        elapsed = time.perf_counter() - started
+        self.assertIsNone(result["first_stable_sampled_window"])
+        self.assertEqual(result["changes_at_or_above_threshold"], sample_count - 1)
+        self.assertEqual(result["direction_reversals_at_or_above_threshold"], sample_count - 2)
+        self.assertTrue(result["multiple_threshold_changes_observed"])
+        self.assertFalse(result["periodic_oscillation_tested"])
+        self.assertIn("does not prove periodic oscillation", result["change_evidence_note"])
+        self.assertNotIn("repeated_changes_observed", result)
+        # Generous enough for slow CI, but an O(n^2) implementation on this
+        # adversarial series cannot satisfy it.
+        self.assertLess(elapsed, 3.0)
 
 
 @unittest.skipUnless(os.environ.get("AUREX_PHY_ENGINE_BUILD"), "set AUREX_PHY_ENGINE_BUILD to run native engine integration tests")
@@ -155,6 +219,19 @@ class CircuitNativeTests(unittest.TestCase):
         for c in measured["measurements"]["components"]:
             if c["type"] == "resistor":
                 self.assertAlmostEqual(c["derived_current_0_to_1"]["real"], .25, places=8)
+
+        # The same edit workflow starts directly from a PLSAV import. Focused
+        # inspection supplies exact writable native params; no manual rebuild.
+        focused = circuit_inspect(self.runtime, {
+            "path": created["sav_path"], "focus_id": "R1", "limit": 2})
+        contract = focused["edit_contract"]["components"]
+        self.assertEqual([(row["id"], row["params"]["r"]) for row in contract], [("R1", 10.0)])
+        imported_edit = circuit_edit(self.runtime, {"path": created["sav_path"], "operations": [
+            {"action": "update", "id": "R1", "params": {"r": 40}},
+        ]})
+        imported_result = circuit_analyze(self.runtime, {"path": imported_edit["circuit_path"]})
+        resistor = next(row for row in imported_result["measurements"]["components"] if row["id"] == "R1")
+        self.assertAlmostEqual(resistor["derived_current_0_to_1"]["real"], .125, places=8)
 
     def test_ac_preserves_imaginary_voltage(self):
         spec = {"components": [
@@ -320,11 +397,22 @@ class CircuitNativeTests(unittest.TestCase):
             {"id": "V1", "ref": "C1", "type": "Battery Source", "label": ""}])
         self.assertEqual(result["results"][1]["components"], [
             {"id": "R1", "ref": "C2", "type": "Resistor", "label": ""}])
-        catalog = {row["id"]: row for row in result["component_catalog"]}
-        self.assertNotIn("position", catalog["V1"])
-        self.assertIn("total_connections", catalog["V1"]["pins"][0])
+        self.assertNotIn("component_catalog", result)
+        self.assertNotIn("pins", result["results"][0]["components"][0])
+        self.assertEqual(result["selected_fields"], ["identity"])
         self.assertLess(len(json.dumps(result)), 5000)
-        node_id = catalog["V1"]["pins"][0]["node"]
+        detailed = circuit_query_many(self.runtime, {
+            "path": created["circuit_path"], "queries": ["V1", "R1"], "limit": 1,
+            "fields": ["pins", "properties.电阻", "edit.r"],
+        })
+        voltage = detailed["results"][0]["components"][0]
+        resistor = detailed["results"][1]["components"][0]
+        self.assertIn("total_connections", voltage["pins"][0])
+        self.assertEqual(voltage["missing_fields"], ["properties.电阻", "edit.r"])
+        self.assertEqual(resistor["properties"], {"电阻": 10})
+        self.assertEqual(resistor["edit"], {"r": 10})
+        self.assertNotIn("measurements", resistor)
+        node_id = voltage["pins"][0]["node"]
         node = circuit_query_many(self.runtime, {
             "path": created["circuit_path"], "queries": [node_id, "N999999", "R1"], "limit": 8,
         })
@@ -332,9 +420,129 @@ class CircuitNativeTests(unittest.TestCase):
         self.assertEqual(node["failed_query_count"], 1)
         self.assertEqual(node["results"][0]["nodes"][0]["id"], node_id)
         self.assertEqual(node["results"][0]["nodes"][0]["total_connections"], 2)
+        self.assertNotIn("connections", node["results"][0]["nodes"][0])
+        self.assertTrue(node["results"][0]["components"][0]["matched_pins"])
         self.assertFalse(node["results"][1]["ok"])
-        self.assertEqual(node["results"][2]["component_ids"], ["R1"])
         self.assertEqual(node["results"][2]["components"][0]["type"], "Resistor")
+        repeated = circuit_query_many(self.runtime, {
+            "path": created["circuit_path"], "queries": ["R1", "R1"], "limit": 1,
+        })
+        self.assertEqual([[c["id"] for c in row["components"]]
+                          for row in repeated["results"]], [["R1"], ["R1"]])
+
+        complete = circuit_query_many(self.runtime, {
+            "path": created["circuit_path"], "queries": ["R1"], "all": True,
+        })
+        self.assertEqual(complete["selected_fields"], ["all"])
+        self.assertIn("properties", complete["results"][0]["components"][0])
+        self.assertIn("pins", complete["results"][0]["components"][0])
+        with self.assertRaisesRegex(ToolError, "Unsupported.*properties"):
+            circuit_query_many(self.runtime, {
+                "path": created["circuit_path"], "queries": ["R1"],
+                "fields": ["properties"],
+            })
+        with self.assertRaisesRegex(ToolError, "mutually exclusive"):
+            circuit_query_many(self.runtime, {
+                "path": created["circuit_path"], "queries": ["R1"],
+                "fields": ["pins"], "all": True,
+            })
+
+        analyzed = circuit_analyze(self.runtime, {
+            "path": created["circuit_path"], "analysis": "dc",
+        })
+        recorded = circuit_query_many(self.runtime, {
+            "path": analyzed["state_path"], "queries": ["R1"],
+            "fields": ["native_type", "measurements.voltage"],
+        })["results"][0]["components"][0]
+        self.assertEqual(recorded["native_type"], "resistor")
+        self.assertEqual(recorded["measurements"]["voltage"], [5.0, 0.0])
+        self.assertNotIn("current", recorded["measurements"])
+
+    def test_circuit_query_many_reads_high_and_low_levels_independently(self):
+        skeleton = Path(self.temp.name) / "query-levels.json"
+        saved = Path(self.temp.name) / "query-levels.sav"
+        skeleton.write_text(json.dumps({"title": "query levels", "components": [
+            {"id": "IN", "model_id": "Logic Input",
+             "properties": {"开关": 1, "低电平": 0.25, "高电平": 3.25},
+             "nodes": ["signal"], "position": [0, 0, 0]},
+            {"id": "OUT", "model_id": "Logic Output", "properties": {},
+             "nodes": ["signal"], "position": [.2, 0, 0]},
+        ]}))
+        build = Path(os.environ["AUREX_PHY_ENGINE_BUILD"]).resolve()
+        subprocess.run([str(build / "circuit_view"), "create", str(skeleton),
+            str(Path(self.temp.name) / "query-levels.svg"),
+            str(Path(self.temp.name) / "query-levels.netlist.json"), "0", "8", str(saved)],
+            check=True, capture_output=True, text=True)
+
+        high = circuit_query_many(self.runtime, {
+            "path": str(saved), "queries": ["C1"], "fields": ["properties.高电平"],
+        })["results"][0]["components"][0]
+        self.assertEqual(high["properties"], {"高电平": 3.25})
+        self.assertNotIn("低电平", high["properties"])
+        self.assertNotIn("pins", high)
+
+        low = circuit_query_many(self.runtime, {
+            "path": str(saved), "queries": ["C1"], "fields": ["properties.低电平"],
+        })["results"][0]["components"][0]
+        self.assertEqual(low["properties"], {"低电平": 0.25})
+        self.assertNotIn("高电平", low["properties"])
+
+        spatial = circuit_query_many(self.runtime, {
+            "path": str(saved), "queries": ["C1"], "fields": ["spatial"],
+        })["results"][0]
+        self.assertIn("spatial", spatial)
+        self.assertNotIn("spatial_context", spatial)
+
+    def test_original_plsav_ref_resolves_stable_identity_after_native_expansion(self):
+        # Imported components can expand into native helpers.  Here C1 owns a
+        # core and helper, so the renderer-local C2 names the helper while the
+        # original PLSAV C2 must still resolve LOAD by source_ref.
+        provenance = lambda source_ref, role=None: {
+            "model_id": "Basic Capacitor" if source_ref == "C1" else "Resistor",
+            "parent_identifier": "CAP" if source_ref == "C1" else "LOAD",
+            "source_ref": source_ref,
+            **({"is_helper": True, "decomposition_role": role} if role else {}),
+        }
+        spec = {"components": [
+            {"id": "CAP", "type": "capacitor", "nodes": ["internal", "gnd"],
+             "params": {"c": 1e-6}, "pl_source": provenance("C1")},
+            {"id": "CAP:esr", "type": "resistor", "nodes": ["vcc", "internal"],
+             "params": {"r": 1.0},
+             "pl_source": provenance("C1", "series_resistance")},
+            {"id": "LOAD", "type": "resistor", "nodes": ["vcc", "gnd"],
+             "params": {"r": 1000}, "pl_source": provenance("C2")},
+            {"id": "V", "type": "vdc", "nodes": ["vcc", "gnd"],
+             "params": {"v": 5}, "pl_source": {
+                 "model_id": "Battery Source", "parent_identifier": "V", "source_ref": "C3"}},
+        ]}
+        analyzed = circuit_analyze(self.runtime, {"spec": spec, "analysis": "dc"})
+        inspected = circuit_inspect(self.runtime, {
+            "path": analyzed["state_path"], "query": "C2", "limit": 4})
+        self.assertEqual(inspected["source_ref_query"], {
+            "source_ref": "C2", "resolved_native_ids": ["LOAD"],
+            "shown_native_ids": ["LOAD"],
+            "stable_across_import_revisions": True,
+        })
+        load = next(row for row in inspected["netlist"]["components"]
+                    if row["id"] == "LOAD")
+        self.assertEqual(load["source_ref"], "C2")
+        self.assertNotEqual(load["ref"], "C2")
+        batch = circuit_query_many(self.runtime, {
+            "path": analyzed["state_path"], "queries": ["C2", "C2"], "limit": 4})
+        self.assertEqual(batch["results"][0]["components"][0]["source_ref"], "C2")
+        self.assertEqual(batch["results"][0]["component_ids"], ["LOAD"])
+        self.assertEqual(batch["results"][1]["component_ids"], ["LOAD"])
+        expanded = circuit_inspect(self.runtime, {
+            "path": analyzed["state_path"], "query": "C1", "limit": 1})
+        self.assertEqual(expanded["source_ref_query"]["resolved_native_ids"],
+                         ["CAP", "CAP:esr"])
+        self.assertEqual(expanded["source_ref_query"]["shown_native_ids"], ["CAP"])
+        self.assertTrue(expanded["pagination"]["has_more"])
+        expanded_batch = circuit_query_many(self.runtime, {
+            "path": analyzed["state_path"], "queries": ["C1"], "limit": 1})
+        self.assertTrue(expanded_batch["results"][0]["ok"])
+        self.assertEqual(expanded_batch["results"][0]["match_count"], 2)
+        self.assertEqual(expanded_batch["results"][0]["component_ids"], ["CAP"])
 
     def test_position_aware_schematic_routes_exact_nodes_and_marks_partial_context(self):
         created = circuit_create(self.runtime, {"spec": {"components": [
@@ -367,6 +575,17 @@ class CircuitNativeTests(unittest.TestCase):
         partial_svg = Path(partial["artifact"]["svg_path"]).read_text()
         self.assertIn('marker-end="url(#external-arrow)"', partial_svg)
         self.assertIn('id="global-locator"', partial_svg)
+        focused_data = circuit_inspect(self.runtime, {
+            "path": created["circuit_path"], "focus_id": "R1", "limit": 3})
+        nearest = focused_data["spatial_context"]["relations"][0]["nearest"]
+        by_neighbor = {row["id"]: row for row in nearest}
+        self.assertEqual(by_neighbor["V"]["direction"], "left")
+        self.assertTrue(by_neighbor["V"]["electrically_connected"])
+        focused_image = circuit_inspect(self.runtime, {
+            "path": created["circuit_path"], "focus_id": "R1", "limit": 3,
+            "with_image": True})
+        self.assertEqual(focused_image["pagination"]["view"], "schematic")
+        self.assertTrue(focused_image["camera"]["schematic"])
 
     def test_trace_comparison_distinguishes_within_run_change_from_cross_run_difference(self):
         def run(state):
@@ -631,6 +850,34 @@ class CircuitNativeTests(unittest.TestCase):
         self.assertFalse(page["interpolated"])
         self.assertFalse(page["has_more"])
         self.assertNotIn("samples", result["measurements"]["transient"])
+        summary = circuit_read_trace(self.runtime, {"path": result["state_path"],
+            "mode": "summary", "nodes": ["out"], "stability_window_s": .05,
+            "stability_threshold_v": .1, "change_threshold_v": .01})
+        self.assertEqual(summary["mode"], "analog_nodes")
+        self.assertEqual(summary["sample_scope"]["selected"], 100)
+        self.assertGreater(summary["nodes"]["out"]["sampled_range"], .3)
+        self.assertIsNotNone(summary["nodes"]["out"]["settled_for_remainder"])
+
+    def test_trace_summary_reads_relay_model_state_without_scanning_sample_pages(self):
+        spec = {"components": [
+            {"id": "V", "type": "vdc", "nodes": ["coil", "gnd"], "params": {"v": 1}},
+            {"id": "CONTACT", "type": "vdc", "nodes": ["com", "gnd"], "params": {"v": 5}},
+            {"id": "RELAY", "type": "relay_current_spdt",
+             "nodes": ["nc", "com", "no", "coil", "gnd"],
+             "params": {"i_pull": .02, "r": 20, "l": 1e-6}},
+            {"id": "RNC", "type": "resistor", "nodes": ["nc", "gnd"], "params": {"r": 1000}},
+            {"id": "RNO", "type": "resistor", "nodes": ["no", "gnd"], "params": {"r": 1000}},
+        ]}
+        result = circuit_analyze(self.runtime, {"spec": spec, "analysis": "tr",
+            "tr_step": .01, "tr_stop": .05, "tr_sample_every": 1})
+        summary = circuit_read_trace(self.runtime, {"path": result["state_path"],
+            "mode": "summary", "component_ids": ["RELAY"],
+            "stability_window_s": .01})
+        relay = summary["components"][0]
+        self.assertEqual(relay["type"], "relay_current_spdt")
+        self.assertIn("engaged", relay["model_state"])
+        self.assertEqual(relay["model_state"]["engaged"]["final"], 1.0)
+        self.assertGreaterEqual(len(relay["pin_voltage_v"]), 5)
 
     def test_generic_bjt_roundtrip_and_observed_terminal_kcl(self):
         for kind, sign in [("npn", 1), ("pnp", -1)]:

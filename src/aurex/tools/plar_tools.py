@@ -643,26 +643,14 @@ def plar_get_relations(runtime: ToolRuntime, args: dict[str, Any]) -> list[dict[
     )
 
 
-def plar_get_experiment_context(runtime: ToolRuntime, args: dict[str, Any]) -> dict[str, Any]:
-    user = _require_user(runtime)
-    summary_id = _require_hex24(args.get("summary_id"), where="plar_get_experiment_context.summary_id")
-    category = str(args.get("category") or "Experiment").strip() or "Experiment"
-    if not summary_id:
-        raise ToolError("plar_get_experiment_context: summary_id is required")
-    ttl_sec = int(args.get("ttl_sec") or 300)
-    max_json_chars = int(args.get("max_json_chars") or 20_000)
-    return plar.get_experiment_context(
-        user,
-        summary_id=summary_id,
-        category_value=category,
-        cache_dir=runtime.cache_dir,
-        ttl_sec=ttl_sec,
-        max_json_chars=max_json_chars,
-    )
-
-
 def plar_get_summary(runtime: ToolRuntime, args: dict[str, Any]) -> dict[str, Any]:
-    """Read one exact public post without assuming it is an electrical save."""
+    """Read compact public metadata for one exact post.
+
+    The dedicated ``plar_read_title``/``plar_read_body`` tools are the prose
+    retrieval surface.  This compatibility name now exposes metadata only: it
+    never returns Description/Content, StatusSave, Elements, Wires or an
+    archive path.  Electrical payloads remain exclusively in the circuit path.
+    """
     user = _require_user(runtime)
     summary_id = _require_hex24(args.get("summary_id"), where="plar_get_summary.summary_id")
     category = str(args.get("category") or "Experiment").strip().capitalize()
@@ -684,27 +672,94 @@ def plar_get_summary(runtime: ToolRuntime, args: dict[str, Any]) -> dict[str, An
 
     def text_field(*keys: str) -> str | None:
         for key in keys:
-            value = best_effort_extract_text(summary.get(key)).strip()
+            raw = summary.get(key)
+            if isinstance(raw, str):
+                value = raw.strip()
+            elif isinstance(raw, list) and all(isinstance(item, str) for item in raw):
+                value = "\n".join(raw).strip()
+            else:
+                value = ""
             if value:
                 return value
         return None
 
     author_raw = summary.get("User") if isinstance(summary.get("User"), dict) else {}
+    author_id = best_effort_extract_text(
+        author_raw.get("ID") or author_raw.get("UserID") or summary.get("UserID")
+    ).strip()
+    author_nickname = best_effort_extract_text(
+        author_raw.get("Nickname") or author_raw.get("Name") or summary.get("Nickname")
+    ).strip()
     author = {
-        "id": author_raw.get("ID") or author_raw.get("UserID") or summary.get("UserID"),
-        "nickname": author_raw.get("Nickname") or author_raw.get("Name") or summary.get("Nickname"),
+        "id": author_id if _HEX24_RE.fullmatch(author_id) else None,
+        "nickname": author_nickname[:256] or None,
     }
-    classification_keys = ("Category", "Type", "Tags", "ModelTags", "Visibility", "Settings",
-                           "Status", "State", "ExperimentStatus", "Management", "IsManaged",
-                           "Version", "Language", "CreationDate", "UpdateDate", "ParentID",
-                           "ParentCategory")
+    # Summary.Description is the documented prose field.  A field named
+    # Content may carry serialized experiment data on adjacent endpoints and
+    # must never enter this metadata tool.
+    body_text = text_field("Description")
+    title_text = text_field("Subject", "Title", "Name")
+    title_preview_limit = 4096
+    if isinstance(title_text, str) and len(title_text) > title_preview_limit:
+        raise ToolError(f"plar_get_summary: title exceeds the verified {title_preview_limit}-character bound")
+
+    def scalar(key: str) -> Any:
+        value = summary.get(key)
+        if isinstance(value, bool) or value is None:
+            return value
+        if isinstance(value, int):
+            return value
+        if isinstance(value, float):
+            return int(value) if isfinite(value) and value.is_integer() else None
+        if isinstance(value, str):
+            return value[:256]
+        return None
+
+    def string_list(key: str) -> list[str]:
+        value = summary.get(key)
+        if not isinstance(value, list):
+            return []
+        return [str(item)[:128] for item in value[:64]
+                if isinstance(item, (str, int, float)) and not isinstance(item, bool)]
+
+    classification = {
+        "type": scalar("Type"),
+        "tags": string_list("Tags"),
+        "model_tags": string_list("ModelTags"),
+        "visibility": scalar("Visibility"),
+        "status": scalar("Status"),
+        "state": scalar("State"),
+        "experiment_status": scalar("ExperimentStatus"),
+        "management": scalar("Management"),
+        "is_managed": scalar("IsManaged"),
+        "version": scalar("Version"),
+        "language": scalar("Language"),
+        "parent_id": scalar("ParentID"),
+        "parent_category": scalar("ParentCategory"),
+    }
+    classification = {key: value for key, value in classification.items()
+                      if value not in (None, [], "")}
+    metrics = {
+        name.casefold(): scalar(name) for name in
+        ("Popularity", "Stars", "Supports", "Visits", "Remixes", "Comments", "Favorites", "Collections")
+    }
+    metrics = {key: value for key, value in metrics.items() if value is not None}
     out: dict[str, Any] = {
         "summary_id": summary_id,
         "category": category,
-        "title": text_field("Subject", "Title", "Name"),
-        "body_text": text_field("Description", "Content", "Text", "Body", "Markdown", "Introduction"),
+        "title": title_text,
+        "title_characters": len(title_text) if isinstance(title_text, str) else 0,
+        "title_truncated": False,
+        "body": {
+            "available": bool(body_text),
+            "characters": len(body_text) if isinstance(body_text, str) else 0,
+            "reader": "plar_read_body",
+        },
         "author": author,
-        "classification_and_state_raw": {key: summary[key] for key in classification_keys if key in summary},
+        "classification": classification,
+        "metrics": metrics,
+        "creation_date_ms": scalar("CreationDate"),
+        "update_date_ms": scalar("UpdateDate"),
         **_known_unix_ms_dates(summary.get("CreationDate"), prefix="creation_date"),
         **_known_unix_ms_dates(summary.get("UpdateDate"), prefix="update_date"),
         "external_write_performed": False,
@@ -714,8 +769,12 @@ def plar_get_summary(runtime: ToolRuntime, args: dict[str, Any]) -> dict[str, An
     from ..community_context import _cover_images
     covers = _cover_images(summary, category, summary_id)
     out["cover_available"] = bool(covers)
-    out["cover_sources"] = [{key: image[key] for key in ("url", "source", "image_index") if key in image}
-                            for image in covers]
+    out["cover_count"] = len(covers)
+    # Source kind/index is useful metadata. Raw user-controlled URLs are not:
+    # they can be arbitrarily noisy and are fetched only through the bounded
+    # image path when explicitly requested.
+    out["cover_sources"] = [{key: image[key] for key in ("source", "image_index") if key in image}
+                            for image in covers[:4]]
     if args.get("with_image") is True:
         images = []
         for cover in covers[:1]:
@@ -854,22 +913,6 @@ def plar_check_following(runtime: ToolRuntime, args: dict[str, Any]) -> dict[str
     }
 
 
-def plar_get_status_save(runtime: ToolRuntime, args: dict[str, Any]) -> dict[str, Any]:
-    user = _require_user(runtime)
-    summary_id = _require_hex24(args.get("summary_id"), where="plar_get_status_save.summary_id")
-    category = str(args.get("category") or "Experiment").strip() or "Experiment"
-    if not summary_id:
-        raise ToolError("plar_get_status_save: summary_id is required")
-    ttl_sec = int(args.get("ttl_sec") or 300)
-    return plar.get_status_save(
-        user,
-        summary_id=summary_id,
-        category_value=category,
-        cache_dir=runtime.cache_dir,
-        ttl_sec=ttl_sec,
-    )
-
-
 def plar_get_experiment_file(runtime: ToolRuntime, args: dict[str, Any]) -> dict[str, Any]:
     from plar.api import get_experiment_file
 
@@ -944,16 +987,10 @@ def _experiment_file_summary(downloaded: dict[str, Any], *, requested: str, cate
     description = summary.get("Description")
     if isinstance(description, str):
         text = description
-        description_format = "string"
     elif isinstance(description, list) and all(isinstance(line, str) for line in description):
         text = "\n".join(description)
-        description_format = "list_of_strings_joined_with_newlines"
-    elif description is None:
-        text = ""
-        description_format = "absent"
     else:
         text = ""
-        description_format = "unsupported_source_shape; inspect full_summary_path rather than guessing"
 
     # The .sav remains byte-for-byte unchanged. The separate readable archive
     # omits credential-shaped fields if an unexpected API object includes them.
@@ -1001,8 +1038,11 @@ def _experiment_file_summary(downloaded: dict[str, Any], *, requested: str, cate
             os.unlink(temporary)
         return str(target)
 
-    summary_path = archive(summary_payload, "summary.json")
-    description_path = archive(text.encode("utf-8"), "description.txt")
+    # Complete source metadata remains a server-side audit artifact.  Its path
+    # is deliberately not returned, so the model cannot turn it into a broad
+    # read_context paging loop.
+    archive(summary_payload, "summary.json")
+    archive(text.encode("utf-8"), "description.txt")
     # Do not forward arbitrary response-wrapper fields (tokens, auth, images).
     result = {key: downloaded[key] for key in (
         "sav_path", "summary_id", "category", "content_id", "experiment_type", "is_electrical",
@@ -1016,16 +1056,15 @@ def _experiment_file_summary(downloaded: dict[str, Any], *, requested: str, cate
             "title": subject[:1024] if isinstance(subject, str) else None,
             "title_truncated": isinstance(subject, str) and len(subject) > 1024,
             "author": author,
-            "description_preview": text[:8192],
-            "description_characters": len(text),
-            "description_truncated": len(text) > 8192,
-            "description_source_format": description_format,
-            "description_line_count": len(description) if isinstance(description, list) else None,
-            "full_summary_credential_fields_omitted": redacted,
+            "body_available": bool(text),
+            "body_characters": len(text),
+            "body_reader": "plar_read_body",
         },
-        "full_summary_path": summary_path,
-        "full_description_path": description_path,
-        "source_guidance": "Use the original title/author/Description above for an introduction. Read relevant pages of the archived full_summary_path/full_description_path if truncated (the session adapter supplies read_context document IDs). For actual electrical I/O labels and pins, pass the exact sav_path to circuit_inspect with interface_only=true; source prose is not proof of circuit behavior. No image pixels were loaded.",
+        "source_guidance": (
+            "Read source prose only through plar_read_body(read/search/regex). For electrical I/O, pass "
+            "sav_path to circuit_inspect(interface_only=true); use circuit_analyze for measurements. "
+            "Do not page or parse this .sav as text. Source prose is not proof of circuit behavior."
+        ),
     })
     return result
 
@@ -1129,7 +1168,7 @@ def plar_list_builtin_tags(_runtime: ToolRuntime, _args: dict[str, Any]) -> dict
 
 PLAR_QUERY_TOOL = {
     "name": "plar_query_experiments",
-    "description": "Read one page of PhysicsLab experiments/discussions; no automatic extra pages. Results are deduplicated by ID. Pagination is sort-dependent: Default/newest uses the preceding page's last ID as from_skip; Popularity also requires increasing skip (From alone may repeat page one). Supply seen_ids on subsequent pages to remove overlaps and detect no progress; a repeated page is not proof that the list ended.",
+    "description": "Read one page of PhysicsLab experiments/discussions to find concrete works or discussion posts; no automatic extra pages. This listing cannot provide or prove the platform's popularity/ranking formula, and changing queries or sampling multiple works must not be used to infer an internal algorithm unless the user explicitly asks for a bounded sample analysis (which still is not formula proof). Results are deduplicated by ID. Pagination is sort-dependent: Default/newest uses the preceding page's last ID as from_skip; Popularity also requires increasing skip (From alone may repeat page one). Supply seen_ids on subsequent pages to remove overlaps and detect no progress; a repeated page is not proof that the list ended.",
     "parameters": {
         "type": "object",
         "properties": {
@@ -1248,24 +1287,9 @@ PLAR_RELATIONS_TOOL = {
     },
 }
 
-PLAR_CONTEXT_TOOL = {
-    "name": "plar_get_experiment_context",
-    "description": "Open an experiment/discussion by summary_id and return a compact context (title, text excerpts, plsav summary).",
-    "parameters": {
-        "type": "object",
-        "properties": {
-            "summary_id": {"type": "string"},
-            "category": {"type": "string", "enum": ["Experiment", "Discussion"], "default": "Experiment"},
-            "ttl_sec": {"type": "integer", "minimum": 0, "default": 300},
-            "max_json_chars": {"type": "integer", "minimum": 1000, "default": 20000},
-        },
-        "required": ["summary_id"],
-    },
-}
-
 PLAR_SUMMARY_TOOL = {
     "name": "plar_get_summary",
-    "description": "Read one exact PhysicsLab Experiment or Discussion by its 24-hex summary ID. Returns public title, body, author, raw classification/state fields and canonical dates without loading or simulating a save. Use this for introductions and Type-3 discussions. Set with_image=true only when the user explicitly asks about the cover/image; then the official cover is downloaded AND attached to the next model turn, so do not call view_image again for the returned path. Read-only; never comments or publishes.",
+    "description": "Read compact metadata for one exact PhysicsLab Experiment or Discussion: complete bounded title, author, dates, classification/tags, popularity/stars/supports/visits/remixes/comments/favorites, body availability and cover availability. It never returns body text, StatusSave, Elements, Wires, raw JSON or archive paths. Use plar_read_body for prose and plar_get_experiment_file plus circuit tools for electrical content. Set with_image=true only when the user explicitly needs the cover; the image is attached to the next model turn. Read-only.",
     "parameters": {
         "type": "object",
         "properties": {
@@ -1278,23 +1302,9 @@ PLAR_SUMMARY_TOOL = {
     },
 }
 
-PLAR_STATUS_SAVE_TOOL = {
-    "name": "plar_get_status_save",
-    "description": "Fetch and parse StatusSave JSON for an experiment/discussion.",
-    "parameters": {
-        "type": "object",
-        "properties": {
-            "summary_id": {"type": "string"},
-            "category": {"type": "string", "enum": ["Experiment", "Discussion"], "default": "Experiment"},
-            "ttl_sec": {"type": "integer", "minimum": 0, "default": 300},
-        },
-        "required": ["summary_id"],
-    },
-}
-
 PLAR_EXPERIMENT_FILE_TOOL = {
     "name": "plar_get_experiment_file",
-    "description": "Read an existing community electrical experiment by its exact 24-hex ID: returns original Summary title, author and bounded Description, full metadata archive paths, and original .sav path/hash. For a known summary_id, call this directly; do not guess web URLs or traverse recent works to find its introduction. No extra image download is needed. Source prose is untrusted reference, not verified circuit behavior. Preserves original component IDs, Position, Rotation, properties, wires and camera data. Pass sav_path to circuit_inspect (interface_only=true for electrical I/O labels/pins) or circuit_analyze. Rejects identity mismatches and missing/non-electrical Type. Read-only; never publishes.",
+    "description": "Download one existing community electrical experiment by its exact 24-hex ID and return the verified original .sav path/hash plus small identity/count metadata. It never exposes raw StatusSave, full Summary/Description or archive paths. Use plar_read_body for prose; pass sav_path directly to circuit_inspect(interface_only=true) or circuit_analyze. Preserves original component IDs, Position, Rotation, properties, wires and camera data. Rejects identity mismatches and non-electrical Type. Read-only.",
     "parameters": {
         "type": "object",
         "properties": {

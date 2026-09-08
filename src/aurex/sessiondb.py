@@ -74,6 +74,38 @@ class SessionDB:
                 );
                 CREATE INDEX IF NOT EXISTS task_plan_order
                     ON task_plan_items(run_id, ordinal);
+                CREATE TABLE IF NOT EXISTS subagent_runs (
+                    id TEXT PRIMARY KEY, session_id TEXT NOT NULL,
+                    parent_run_id TEXT NOT NULL, depth INTEGER NOT NULL,
+                    objective TEXT NOT NULL, context TEXT NOT NULL,
+                    status TEXT NOT NULL, report TEXT NOT NULL DEFAULT '{}',
+                    deadline_at REAL, created REAL NOT NULL, updated REAL NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS subagent_runs_parent
+                    ON subagent_runs(parent_run_id, created, id);
+                CREATE TABLE IF NOT EXISTS subagent_messages (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT, subagent_id TEXT NOT NULL,
+                    session_id TEXT NOT NULL, parent_run_id TEXT NOT NULL,
+                    role TEXT NOT NULL, data TEXT NOT NULL, created REAL NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS subagent_messages_child
+                    ON subagent_messages(subagent_id, id);
+                CREATE TABLE IF NOT EXISTS subagent_events (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT, subagent_id TEXT NOT NULL,
+                    session_id TEXT NOT NULL, parent_run_id TEXT NOT NULL,
+                    kind TEXT NOT NULL, data TEXT NOT NULL, created REAL NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS subagent_events_child
+                    ON subagent_events(subagent_id, id);
+                CREATE TABLE IF NOT EXISTS subagent_tool_outcomes (
+                    subagent_id TEXT NOT NULL, call_id TEXT NOT NULL,
+                    session_id TEXT NOT NULL, parent_run_id TEXT NOT NULL,
+                    name TEXT NOT NULL, ok INTEGER NOT NULL,
+                    document_id TEXT NOT NULL, message_id INTEGER NOT NULL,
+                    created REAL NOT NULL, PRIMARY KEY(subagent_id, call_id)
+                );
+                CREATE INDEX IF NOT EXISTS subagent_tools_parent
+                    ON subagent_tool_outcomes(parent_run_id, created);
             """)
             columns = {r['name'] for r in db.execute('PRAGMA table_info(runs)')}
             if 'input_data' not in columns:
@@ -369,12 +401,193 @@ class SessionDB:
                        (did, sid, 'Tool ' + name, full_json, now))
             message = {'role': 'tool', 'tool_call_id': call_id, 'content': encode({
                 'ok': ok, 'document_id': did,
-                'message': 'Complete tool outcome is durably archived. Use read_context to read the actual result; do not infer unlisted values.'})}
+                'message': ('Raw tool outcome is archived for operator audit only. '
+                            'A bounded model-facing projection follows before the next model turn; '
+                            'do not infer values from this placeholder.')})}
             row = db.execute('INSERT INTO messages(session_id,run_id,role,data,created) VALUES(?,?,?,?,?)',
                              (sid, rid, 'tool', encode(message), now))
             mid = int(row.lastrowid)
             db.execute('INSERT INTO tool_outcomes VALUES(?,?,?,?,?,?,?,?)', (rid, call_id, sid, name, int(ok), did, mid, now))
             return did, mid
+
+    @staticmethod
+    def _subagent_run(row) -> dict | None:
+        if row is None:
+            return None
+        value = dict(row)
+        value['context'] = json.loads(value['context'])
+        value['report'] = json.loads(value['report'])
+        return value
+
+    def create_subagent(self, sid: str, rid: str, child_id: str, objective: str,
+                        context: dict, *, deadline_at: float | None = None) -> dict:
+        """Create one depth-1 trace bound to an existing parent task.
+
+        Subagents are deliberately not sessions or runs: they cannot enter the
+        scheduler and their messages can never be selected as parent model history.
+        """
+        if (not isinstance(child_id, str) or not re.fullmatch(r'[0-9a-f]{32}', child_id)
+                or not isinstance(objective, str) or not objective.strip()):
+            raise ValueError('A subagent requires a UUID-hex ID and nonempty objective')
+        if not isinstance(context, dict):
+            raise ValueError('Subagent context must be an object')
+        encoded_context = encode(context)
+        if len(objective) > 65536 or len(encoded_context) > 2_000_000:
+            raise ValueError('Subagent handoff exceeds its durable input limit')
+        if deadline_at is not None and (not isinstance(deadline_at, (int, float)) or deadline_at <= 0):
+            raise ValueError('Subagent deadline_at must be a positive timestamp or null')
+        with self.connect() as db:
+            db.execute('BEGIN IMMEDIATE')
+            parent = db.execute('SELECT session_id FROM runs WHERE id=?', (rid,)).fetchone()
+            if parent is None or parent['session_id'] != sid:
+                raise ValueError('Parent task does not belong to this session')
+            if db.execute('SELECT 1 FROM subagent_runs WHERE id=?', (child_id,)).fetchone():
+                raise ValueError('Subagent ID already exists')
+            now = time.time()
+            db.execute('''INSERT INTO subagent_runs
+                (id,session_id,parent_run_id,depth,objective,context,status,report,deadline_at,created,updated)
+                VALUES(?,?,?,?,?,?,'running','{}',?,?,?)''',
+                (child_id, sid, rid, 1, objective.strip(), encoded_context,
+                 float(deadline_at) if deadline_at is not None else None, now, now))
+        return self.get_subagent(child_id)
+
+    def get_subagent(self, child_id: str) -> dict | None:
+        with self.connect() as db:
+            row = db.execute('SELECT * FROM subagent_runs WHERE id=?', (child_id,)).fetchone()
+        return self._subagent_run(row)
+
+    def subagents(self, sid: str, rid: str) -> list[dict]:
+        """Return compact child rows for a parent task, without copying history."""
+        with self.connect() as db:
+            if db.execute('SELECT 1 FROM runs WHERE id=? AND session_id=?', (rid, sid)).fetchone() is None:
+                raise ValueError('Parent task does not belong to this session')
+            rows = db.execute('''SELECT * FROM subagent_runs
+                WHERE session_id=? AND parent_run_id=? ORDER BY created,id''', (sid, rid)).fetchall()
+        return [self._subagent_run(row) for row in rows]
+
+    def subagent_message(self, child_id: str, message: dict) -> int:
+        if (not isinstance(message, dict) or message.get('role') not in
+                {'system', 'user', 'assistant', 'tool'}):
+            raise ValueError('Invalid subagent message')
+        with self.connect() as db:
+            db.execute('BEGIN IMMEDIATE')
+            child = db.execute('SELECT * FROM subagent_runs WHERE id=?', (child_id,)).fetchone()
+            if child is None or child['status'] != 'running':
+                raise ValueError('Subagent is missing or no longer running')
+            now = time.time()
+            row = db.execute('''INSERT INTO subagent_messages
+                (subagent_id,session_id,parent_run_id,role,data,created)
+                VALUES(?,?,?,?,?,?)''', (child_id, child['session_id'], child['parent_run_id'],
+                                        message['role'], encode(message), now))
+            db.execute('UPDATE subagent_runs SET updated=? WHERE id=?', (now, child_id))
+            return int(row.lastrowid)
+
+    def subagent_event(self, child_id: str, kind: str, data: Any) -> int:
+        if not isinstance(kind, str) or not kind:
+            raise ValueError('Subagent event kind must be nonempty text')
+        with self.connect() as db:
+            child = db.execute('SELECT * FROM subagent_runs WHERE id=?', (child_id,)).fetchone()
+            if child is None:
+                raise ValueError('Unknown subagent')
+            now = time.time()
+            row = db.execute('''INSERT INTO subagent_events
+                (subagent_id,session_id,parent_run_id,kind,data,created)
+                VALUES(?,?,?,?,?,?)''', (child_id, child['session_id'], child['parent_run_id'],
+                                        kind, encode(data), now))
+            db.execute('UPDATE subagent_runs SET updated=? WHERE id=?', (now, child_id))
+            return int(row.lastrowid)
+
+    def subagent_tool_outcome(self, child_id: str, call_id: str, name: str,
+                              full_json: str, ok: bool) -> tuple[str, int]:
+        """Archive a child tool result without writing to parent ``messages``."""
+        if (not isinstance(call_id, str) or not call_id.startswith(child_id + ':')
+                or not isinstance(name, str) or not name or not isinstance(full_json, str)
+                or type(ok) is not bool):
+            raise ValueError('Invalid subagent tool outcome')
+        json.loads(full_json)
+        with self.connect() as db:
+            db.execute('BEGIN IMMEDIATE')
+            child = db.execute('SELECT * FROM subagent_runs WHERE id=?', (child_id,)).fetchone()
+            if child is None or child['status'] != 'running' or child['depth'] != 1:
+                raise ValueError('Subagent is missing, terminal, or has invalid depth')
+            old = db.execute('''SELECT * FROM subagent_tool_outcomes
+                WHERE subagent_id=? AND call_id=?''', (child_id, call_id)).fetchone()
+            if old is not None:
+                return old['document_id'], old['message_id']
+            did, now = uuid.uuid4().hex, time.time()
+            db.execute('INSERT INTO documents(id,session_id,title,content,created) VALUES(?,?,?,?,?)',
+                       (did, child['session_id'], 'Subagent tool ' + name, full_json, now))
+            message = {'role': 'tool', 'tool_call_id': call_id, 'content': encode({
+                'ok': ok, 'document_id': did,
+                'message': ('Raw child tool outcome is archived for operator audit only. '
+                            'A bounded model-facing projection follows before the next child turn.')})}
+            row = db.execute('''INSERT INTO subagent_messages
+                (subagent_id,session_id,parent_run_id,role,data,created)
+                VALUES(?,?,?,?,?,?)''', (child_id, child['session_id'], child['parent_run_id'],
+                                        'tool', encode(message), now))
+            mid = int(row.lastrowid)
+            db.execute('INSERT INTO subagent_tool_outcomes VALUES(?,?,?,?,?,?,?,?,?)',
+                       (child_id, call_id, child['session_id'], child['parent_run_id'],
+                        name, int(ok), did, mid, now))
+            db.execute('UPDATE subagent_runs SET updated=? WHERE id=?', (now, child_id))
+            return did, mid
+
+    def update_subagent_tool_message(self, child_id: str, message_id: int, content: str):
+        if not isinstance(content, str):
+            raise ValueError('Subagent tool message content must be text')
+        with self.connect() as db:
+            db.execute('BEGIN IMMEDIATE')
+            row = db.execute('''SELECT m.data,t.document_id FROM subagent_messages m
+                JOIN subagent_tool_outcomes t ON t.message_id=m.id AND t.subagent_id=m.subagent_id
+                WHERE m.id=? AND m.subagent_id=? AND m.role='tool' ''',
+                (message_id, child_id)).fetchone()
+            if row is None:
+                raise ValueError('Message is not an archived outcome for this subagent')
+            data = json.loads(row['data'])
+            data['content'] = (content if row['document_id'] in content else
+                               content + '\n[Raw evidence document_id=' + row['document_id'] + ']')
+            db.execute('UPDATE subagent_messages SET data=? WHERE id=?', (encode(data), message_id))
+
+    def finish_subagent(self, child_id: str, status: str, report: dict) -> dict:
+        if status not in {'completed', 'needs_attention', 'cancelled', 'timed_out', 'error'}:
+            raise ValueError('Invalid terminal subagent status')
+        if not isinstance(report, dict):
+            raise ValueError('Subagent report must be an object')
+        with self.connect() as db:
+            db.execute('BEGIN IMMEDIATE')
+            child = db.execute('SELECT * FROM subagent_runs WHERE id=?', (child_id,)).fetchone()
+            if child is None:
+                raise ValueError('Unknown subagent')
+            if child['status'] != 'running':
+                saved = json.loads(child['report'])
+                if child['status'] != status or saved != report:
+                    raise ValueError('Subagent already has a different terminal result')
+                return self._subagent_run(child)
+            now = time.time()
+            db.execute('UPDATE subagent_runs SET status=?,report=?,updated=? WHERE id=?',
+                       (status, encode(report), now, child_id))
+        return self.get_subagent(child_id)
+
+    def subagent_trace(self, sid: str, rid: str, child_id: str) -> dict:
+        """Read a foldable operator trace; never used as parent model context."""
+        with self.connect() as db:
+            child = db.execute('''SELECT * FROM subagent_runs
+                WHERE id=? AND session_id=? AND parent_run_id=?''', (child_id, sid, rid)).fetchone()
+            if child is None:
+                raise ValueError('Subagent does not belong to this parent task')
+            messages = db.execute('''SELECT id,role,data,created FROM subagent_messages
+                WHERE subagent_id=? ORDER BY id''', (child_id,)).fetchall()
+            events = db.execute('''SELECT id,kind,data,created FROM subagent_events
+                WHERE subagent_id=? ORDER BY id''', (child_id,)).fetchall()
+            tools = db.execute('''SELECT call_id,name,ok,document_id,message_id,created
+                FROM subagent_tool_outcomes WHERE subagent_id=? ORDER BY created,call_id''',
+                (child_id,)).fetchall()
+        return {
+            'subagent': self._subagent_run(child),
+            'messages': [{**dict(row), 'data': json.loads(row['data'])} for row in messages],
+            'events': [{**dict(row), 'data': json.loads(row['data'])} for row in events],
+            'tool_outcomes': [{**dict(row), 'ok': bool(row['ok'])} for row in tools],
+        }
 
     def final_answer(self, sid: str, rid: str, review_id: str, answer: str) -> tuple[int, bool]:
         """Journal one reviewed final per task, atomically and idempotently.

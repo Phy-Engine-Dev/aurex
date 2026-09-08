@@ -95,7 +95,7 @@ class InvalidToolRecoveryTests(unittest.TestCase):
         forbidden.assert_not_called()
         self.assertEqual(sum(e['kind'] == 'invalid_tool_response' for e in agent.db.events(result['session_id'])), 1)
 
-    def test_length_truncated_tool_batch_gets_review_before_next_execution(self):
+    def test_length_truncated_tool_batch_retries_in_same_agent_before_execution(self):
         tools, execute, forbidden = self.tools()
         partial = support.reply('', calls=[call('cut', 'external_write', '{"rows":[')], finish='length')
         agent, fake = self.arrange([
@@ -106,8 +106,11 @@ class InvalidToolRecoveryTests(unittest.TestCase):
         self.assertEqual(result['status'], 'completed')
         forbidden.assert_not_called()
         execute.assert_called_once()
-        self.assertEqual(fake.requests[1][0][0]['content'], FINAL_SYSTEM)
+        self.assertNotEqual(fake.requests[1][0][0]['content'], FINAL_SYSTEM)
+        self.assertTrue(fake.requests[1][1]['tools'])
         self.assertTrue(fake.requests[2][1]['tools'])
+        self.assertFalse(any(messages[0].get('content') == FINAL_SYSTEM
+                             for messages, _ in fake.requests))
         self.assertEqual(sum(e['kind'] == 'generation_continuation' for e in agent.db.events(result['session_id'])), 1)
 
     def test_clarification_invalid_response_never_enables_tools(self):
@@ -123,17 +126,19 @@ class InvalidToolRecoveryTests(unittest.TestCase):
         execute.assert_not_called()
         forbidden.assert_not_called()
 
-    def test_invalid_tool_from_reviewer_does_not_consume_reply_or_accept_candidate(self):
+    def test_direct_answer_is_not_reopened_by_an_independent_reviewer(self):
         invalid = support.reply('UNVERIFIED_REVIEW', calls=[call('bad', arguments='[')], finish='tool_calls')
-        agent, fake = self.arrange([support.reply('Candidate one'), support.reply('Candidate two')],
+        agent, fake = self.arrange([support.reply('Candidate one')],
             review_error=InvalidToolCall('Malformed review tool arguments', invalid))
         result = agent.handle(user_text='Explain the supplied measurement')
         self.assertEqual(result['status'], 'completed')
-        self.assertEqual(result['answer'], 'Measured 5 V.')
+        self.assertEqual(result['answer'], 'Candidate one')
         events = agent.db.events(result['session_id'])
         self.assertEqual(sum(e['kind'] == 'answer' for e in events), 1)
-        self.assertEqual(sum(e['kind'] == 'task_continues' for e in events), 1)
-        self.assertNotIn('UNVERIFIED_REVIEW', json.dumps(fake.requests[-1][0]))
+        self.assertEqual(sum(e['kind'] == 'task_continues' for e in events), 0)
+        self.assertEqual(len(fake.requests), 1)
+        self.assertNotEqual(fake.requests[0][0][0].get('content'), FINAL_SYSTEM)
+        self.assertNotIn('UNVERIFIED_REVIEW', json.dumps(fake.requests[0][0]))
 
     def test_transport_failure_is_not_silently_reissued_as_format_recovery(self):
         agent, fake = self.arrange([ModelError('Connection failed')])
@@ -167,7 +172,8 @@ class InvalidToolRecoveryTests(unittest.TestCase):
         self.assertEqual(source.encode('utf-8'), description.encode('utf-8'))
         presented = json.dumps(fake.requests[1][0], ensure_ascii=False)
         self.assertIn('full_description_path', presented)
-        self.assertIn('read_context', presented)
+        self.assertNotIn('read_context', presented)
+        self.assertIn('audit_only_no_reread', presented)
         self.assertNotIn('ARCHIVED_TAIL_ONLY', presented)
 
 

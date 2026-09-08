@@ -20,12 +20,7 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..",
 
 from aurex.config import AurexConfig, LLMConfig, StorageConfig, TrackingConfig
 from aurex.context_budget import ContextBudget
-from aurex.session_agent import (SHORT_COMMUNITY_SYSTEM, SessionAgent,
-                                 _is_archived_full_netlist,
-                                 _is_short_community_lookup,
-                                 _mutate_task_plan,
-                                 _short_community_required_tools,
-                                 _review_requests_answer_revision,
+from aurex.session_agent import (SYSTEM, SessionAgent, _mutate_task_plan,
                                  _progress_fingerprint)
 from aurex.sessiondb import SessionDB
 from aurex.tools.registry import ToolRegistry, ToolSpec
@@ -96,6 +91,47 @@ class SessionAgentTests(unittest.TestCase):
                            llm=LLMConfig(enabled=True, context_length=32768, max_output_tokens=512, max_images=2),
                            agent=replace(AurexConfig().agent, max_tool_loops=3))
 
+    def test_circuit_analyze_tracking_preview_does_not_echo_netlist(self):
+        data = {
+            'state_path': '/cache/result.pe-state.json',
+            'circuit_path': '/cache/design.circuit.json',
+            'statistics': {'components': 631, 'wires': 900, 'nodes': 700,
+                           'component_types': {'Logic Input': 24}},
+            'netlist': {'components': [{'id': str(i),
+                'native': {'pl_source': {'assumptions': ['x' * 2000]}}}
+                for i in range(40)]},
+            'measurements': {'analysis': 'tr', 'transient': {
+                'actual_stop_s': 1e-5, 'completed_steps': 10,
+                'requested_step_s': 1e-6}, 'component_scope': {
+                    'total': 631, 'shown': 8, 'omitted': 623,
+                    'complete_state_path': '/cache/result.pe-state.json'}},
+        }
+        tools = ToolRegistry()
+        tools.register(ToolSpec('circuit_analyze', 'Analyze',
+            {'type': 'object'}, lambda *_: data))
+        call = {'id': 'analyze', 'type': 'function', 'function': {
+            'name': 'circuit_analyze', 'arguments': '{}'}}
+        agent, fake = self.agent([
+            reply('', calls=[call], finish='tool_calls'),
+            reply('已取得有界测量。'),
+        ], tools)
+        result = agent.handle(user_text='做一次有界测量')
+        event = next(item for item in agent.db.events(result['session_id'])
+                     if item['kind'] == 'tool_end')
+        preview = event['data']['preview']
+        model_tool = next(message['content'] for message in fake.requests[1][0]
+                          if message.get('role') == 'tool')
+        self.assertEqual(preview, model_tool)
+        projected = json.loads(preview)
+        self.assertTrue(projected['fields']['/ok'])
+        self.assertEqual(projected['fields']['/data/statistics'],
+                         {'components': 631, 'wires': 900, 'nodes': 700})
+        self.assertEqual(projected['fields']['/data/measurements/transient']['completed_steps'], 10)
+        self.assertNotIn('/data/netlist/components', projected['sections'])
+        self.assertNotIn('component_types', preview)
+        self.assertEqual(event['data']['raw_result_storage'],
+                         'task_database_audit')
+
     def agent(self, outputs, registry=None):
         fake = FakeLLM(self.cfg.llm, outputs)
         with mock.patch("aurex.session_agent.VLLMClient", return_value=fake):
@@ -121,73 +157,48 @@ class SessionAgentTests(unittest.TestCase):
         recovered = _mutate_task_plan(db, sid, rid, {"action": "get"})
         self.assertEqual(recovered["items"][0]["note"], "exact durable finding")
 
-    def test_full_netlist_documents_are_not_model_paging_targets(self):
-        db = SessionDB(os.path.join(self.temp.name, "documents.sqlite3"))
-        sid = db.session("document-session")
-        netlist = db.document(sid, "circuit_query_many: full netlist_path", '{"components": []}')
-        ordinary = db.document(sid, "Experiment summary", "text")
-        self.assertTrue(_is_archived_full_netlist(db, sid, netlist))
-        self.assertFalse(_is_archived_full_netlist(db, sid, ordinary))
-        self.assertFalse(_is_archived_full_netlist(db, sid, "missing"))
+    def test_broad_archive_and_search_tools_are_not_model_facing(self):
+        tools = ToolRegistry()
+        for name in ('read_context', 'read_content', 'web_search', 'web_fetch'):
+            tools.register(ToolSpec(name, name, {'type': 'object'},
+                                    lambda *_: self.fail('excluded tool ran')))
+        agent, fake = self.agent([reply('现有上下文足够回答。')], tools)
+        agent.handle(user_text='解释已有资料')
+        names = {schema['function']['name'] for schema in fake.requests[0][1]['tools']}
+        self.assertNotIn('read_context', names)
+        self.assertNotIn('read_content', names)
+        self.assertNotIn('web_search', names)
+        self.assertIn('web_fetch', names)
 
-    def test_completed_durable_plan_disables_execution_tools_while_answering(self):
-        agent, fake = self.agent([reply("依据现有证据，验证已完成。")])
+    def test_completed_durable_plan_remains_navigation_not_a_tool_gate(self):
+        tools = ToolRegistry()
+        tools.register(ToolSpec('measure', 'Measure', {'type': 'object'}, lambda *_: {}))
+        agent, fake = self.agent([reply("依据现有证据，验证已完成。")], tools)
         sid = agent.db.session("completed-plan")
         rid = agent.db.enqueue_task(sid, "设计然后验证一个电路", source="admin")
         agent.db.set_task_plan(sid, rid, [{"id": "verify", "title": "验证"}])
         agent.db.update_task_plan_item(sid, rid, "verify", "completed", note="5 V measured")
         result = agent.handle(user_text="设计然后验证一个电路", session_id=sid, run_id=rid)
         self.assertEqual(result["status"], "completed")
-        # The first request is the execution/final-draft turn. The subsequent
-        # request is the independent final reviewer and has its own contract.
-        self.assertEqual(fake.requests[0][1]["tools"], [])
-        self.assertIn("全部持久化步骤已完成", fake.requests[0][0][0]["content"])
+        names = {schema['function']['name'] for schema in fake.requests[0][1]['tools']}
+        self.assertIn('measure', names)
+        self.assertIn('task_plan', names)
+        self.assertIn("SERVER_TASK_PLAN_JSON", fake.requests[0][0][0]["content"])
+        self.assertIn('"status": "completed"', fake.requests[0][0][0]["content"])
 
-    def test_completed_plan_wording_correction_uses_answer_revision_mode(self):
-        plan = [{'id': 'verify', 'status': 'completed'}]
-        review = {'review_document_id': 'review-doc',
-                  'answer': '候选结论与实际轨迹矛盾，请修正公开答案，删除错误表述。'}
-        self.assertTrue(_review_requests_answer_revision(review, plan, []))
-        self.assertFalse(_review_requests_answer_revision(
-            {'review_document_id': 'review-doc', 'answer': '请重新运行瞬态验证。'}, plan, []))
-        self.assertFalse(_review_requests_answer_revision(review, plan, [
-            {'id': 'verify', 'status': 'in_progress'}]))
-        self.assertFalse(_review_requests_answer_revision(
-            {'review_document_id': None, 'answer': '请修正公开答案。'}, plan, []))
+    def test_system_has_no_hidden_final_reviewer_or_server_route(self):
+        self.assertNotIn('独立终审', SYSTEM)
+        self.assertNotIn('审核后继续', SYSTEM)
+        self.assertIn('不插入独立审核模型', SYSTEM)
+        self.assertIn('同一个执行 agent', SYSTEM)
+        self.assertIn('当结论已经覆盖当前请求', SYSTEM)
+        self.assertIn('不得在内部循环重写同一份草稿', SYSTEM)
+        self.assertIn('直接说“我不知道”或“目前无法确认”', SYSTEM)
+        self.assertIn('不要再对同一目标调用plar_get_summary/plar_read_title/plar_read_body', SYSTEM)
 
-    def test_short_community_route_is_narrow_and_never_captures_cpu_work(self):
-        self.assertTrue(_is_short_community_lookup(
-            'community', '<user=' + 'a' * 24 + '>@aurex</user> 介绍一下这个用户',
-            explicit_publish_requested=False))
-        self.assertTrue(_is_short_community_lookup(
-            'community', '总结一下这个用户发布的作品',
-            explicit_publish_requested=False))
-        self.assertTrue(_is_short_community_lookup(
-            'community', '<user=' + 'a' * 24 + '>@aurex</user> 总结一下 <user=' +
-            'b' * 24 + '>@Target</user> 这个用户发布的内容',
-            explicit_publish_requested=False))
-        self.assertTrue(_is_short_community_lookup(
-            'community', '请总结用户 <user=' + 'b' * 24 + '>@MapMaths</user> 最近发布的内容；'
-                         '只查询少量最新公开作品，不要分析电路。',
-            explicit_publish_requested=False))
-        self.assertTrue(_is_short_community_lookup(
-            'admin', '只读审计：介绍用户 <user=' + 'b' * 24 + '>@MapMaths</user>；不要发布或评论。',
-            explicit_publish_requested=False))
-        for request in ('介绍并验证他的CPU设计', '介绍这个用户并仿真电路',
-                        '介绍这个用户然后发布实验'):
-            self.assertFalse(_is_short_community_lookup(
-                'community', request, explicit_publish_requested=False))
-        self.assertFalse(_is_short_community_lookup(
-            'web', '介绍一下这个用户', explicit_publish_requested=False))
-        self.assertFalse(_is_short_community_lookup(
-            'community', '<user=' + 'a' * 24 + '>@aurex</user> 介绍一下这个实验',
-            explicit_publish_requested=False))
-
-    def test_short_community_evidence_checklist_is_intent_scoped(self):
-        self.assertEqual(_short_community_required_tools('介绍用户 MapMaths 的创作概况，不要评论'),
-                         {'plar_get_user', 'plar_query_experiments'})
-        self.assertEqual(_short_community_required_tools('查询用户最新发布的实验，回答评论区最新一条评论是谁发布的'),
-                         {'plar_query_experiments', 'plar_get_comments'})
+    def test_comment_context_defaults_are_independent(self):
+        self.assertEqual(self.cfg.agent.community_max_related_post_comments, 16)
+        self.assertEqual(self.cfg.agent.community_max_related_user_messages, 32)
 
     def test_task_hard_timeout_stops_and_returns_fixed_template_without_review(self):
         self.cfg = replace(self.cfg, agent=replace(self.cfg.agent, task_timeout_sec=1))
@@ -237,7 +248,7 @@ class SessionAgentTests(unittest.TestCase):
         self.assertEqual(guard['data']['reason'], 'same_token_run')
         self.assertEqual(len([event for event in events if event['kind'] == 'answer']), 1)
 
-    def test_short_community_lookup_uses_read_only_tools_and_one_no_think_finalizer(self):
+    def test_community_request_is_model_directed_and_has_one_final_reply(self):
         from types import SimpleNamespace
         tools = ToolRegistry()
         tools.register(ToolSpec('plar_get_user', 'Get user', {'type': 'object'},
@@ -246,7 +257,8 @@ class SessionAgentTests(unittest.TestCase):
         tools.register(ToolSpec('plar_query_experiments', 'Query works', {'type': 'object'},
             lambda *_: [{'subject': 'PID调节器电路', 'popularity': 850},
                         {'subject': '混沌电路', 'popularity': 404}]))
-        # This unrelated capability must not be visible on the short route.
+        # There is no server short/long classifier: the model sees normal
+        # capabilities and decides whether it needs them.
         tools.register(ToolSpec('circuit_analyze', 'Analyze circuit', {'type': 'object'},
                                 lambda *_: self.fail('Circuit tool must not run')))
         get_user = {'id': 'profile', 'type': 'function', 'function': {
@@ -258,7 +270,6 @@ class SessionAgentTests(unittest.TestCase):
             reply('', calls=[works], finish='tool_calls'),
             reply('@Alice @H₂CO₃ 是活跃创作者，还问过一个并不存在的问题。'),
         ], tools)
-        fake.short_final_answers = iter([{'answer': 'H₂CO₃ 是社区用户，公开资料显示等级 18，发布过 62 个实验，获得 607 星。作品示例包括《PID调节器电路》和《混沌电路》。'}])
         sid = agent.db.session('short-community')
         uid, target = 'a' * 24, 'b' * 24
         rid = agent.db.enqueue_task(sid,
@@ -273,31 +284,122 @@ class SessionAgentTests(unittest.TestCase):
             result = agent.handle(user_text=agent.db.get_task(rid)['prompt'],
                                   session_id=sid, run_id=rid, user=user)
         self.assertEqual(result['status'], 'completed')
-        self.assertIn('H₂CO₃ 是社区用户', result['answer'])
-        self.assertNotIn('@Alice @H₂CO₃', result['answer'])
+        self.assertIn('H₂CO₃ 是活跃创作者', result['answer'])
         self.assertEqual([options['thinking'] for _, options in fake.requests],
                          [True, False, False])
-        self.assertEqual(fake.requests[-1][0][0]['content'],
-                         __import__('aurex.task_reply', fromlist=['SHORT_COMMUNITY_FINAL_SYSTEM']).SHORT_COMMUNITY_FINAL_SYSTEM)
-        self.assertEqual(fake.requests[-1][1]['tools'], [])
-        for messages, options in fake.requests[:-1]:
+        for messages, options in fake.requests:
             if options['tools']:
                 names = {tool['function']['name'] for tool in options['tools']}
-                self.assertLessEqual(names, {'plar_get_user', 'plar_query_experiments',
-                                             'plar_get_comments', 'plar_get_oldest_comment',
-                                             'plar_oldest_by_user', 'plar_get_relations',
-                                             'plar_check_following', 'plar_list_builtin_tags',
-                                             'read_context'})
-        self.assertEqual(
-            [{tool['function']['name'] for tool in options['tools']}
-             for _, options in fake.requests[:-1]],
-            [{'plar_get_user', 'plar_query_experiments'},
-             {'plar_query_experiments'}])
+                self.assertIn('circuit_analyze', names)
+                self.assertIn('spawn_subagent', names)
+                self.assertNotIn('read_context', names)
+                self.assertNotIn('web_search', names)
         post.assert_called_once()
-        self.assertTrue(any(event['kind'] == 'short_community_finalized'
-                            for event in agent.db.events(sid)))
+        self.assertEqual(sum(event['kind'] == 'answer'
+                             for event in agent.db.events(sid)), 1)
         self.assertFalse(any(event['kind'] == 'task_continues'
                              for event in agent.db.events(sid)))
+
+    def test_unknown_platform_formula_is_answered_from_evidence_without_sampling_or_simulation(self):
+        tools = ToolRegistry()
+        list_works = mock.Mock(side_effect=AssertionError('Sparse works cannot prove a platform formula'))
+        simulate = mock.Mock(side_effect=AssertionError('A platform formula question is not a circuit task'))
+        tools.register(ToolSpec('plar_query_experiments',
+            'Find concrete works; this listing cannot provide or prove the platform popularity/ranking formula.',
+            {'type': 'object', 'properties': {}}, list_works))
+        tools.register(ToolSpec('circuit_analyze', 'Analyze a circuit',
+            {'type': 'object', 'properties': {}}, simulate))
+        agent, fake = self.agent([
+            reply('我不知道物实热度的内部计算公式；当前没有官方定义或可直接证明它的证据。'),
+        ], tools)
+        result = agent.handle(user_text='物实热度怎么算？')
+        self.assertEqual(result['status'], 'completed')
+        self.assertIn('不知道', result['answer'])
+        list_works.assert_not_called()
+        simulate.assert_not_called()
+        prompt = fake.requests[0][0][0]['content']
+        self.assertIn('不能从少量作品指标或搜索样本反推', prompt)
+        self.assertIn('直接回答“我不知道/无法确认内部公式”', prompt)
+        # This is a model decision, not a server-side short/long router: the
+        # typed tools remain available for requests that actually need them.
+        names = {schema['function']['name'] for schema in fake.requests[0][1]['tools']}
+        self.assertIn('plar_query_experiments', names)
+        self.assertIn('circuit_analyze', names)
+
+    def test_fresh_community_context_keeps_title_body_cover_and_bounded_comments_without_compaction(self):
+        from PIL import Image
+        from types import SimpleNamespace
+        cover = os.path.join(self.temp.name, 'cover.png')
+        Image.new('RGB', (16, 16), 'white').save(cover)
+        enriched = {
+            'target': {'type': 'Experiment', 'id': 'b' * 24},
+            'title': '纯数字优化原理',
+            'description': '这是完整且有界的原帖正文。',
+            'metadata': {'category': 0, 'stars': 12},
+            'comments': [{'id': str(i), 'content': '相关评论'} for i in range(16)],
+            'images': [{'path': cover, 'source': 'cover'}],
+        }
+        tools = ToolRegistry()
+        tools.register(ToolSpec('circuit_analyze', 'Analyze', {'type': 'object'},
+                                lambda *_: self.fail('model chose direct answer')))
+        agent, fake = self.agent([reply('纯数字优化通常来自离散状态与逻辑化简。')], tools)
+        sid = agent.db.session('fresh-community')
+        rid = agent.db.enqueue_task(
+            sid, '为什么纯数字有优化？', source='community',
+            requester_user_id='a' * 24, requester_nickname='Alice',
+            target={'type': 'Experiment', 'id': 'b' * 24}, reply_id='c' * 24)
+        user = SimpleNamespace(user_id='d' * 24)
+        resolution = {'requires_reference_clarification': False,
+                      'reason_code': 'explicit_experiment'}
+        with mock.patch('aurex.community_context.build_mention_context',
+                        return_value=enriched) as build, \
+             mock.patch('aurex.community_context.resolve_wall_reference',
+                        return_value=resolution), \
+             mock.patch('plar.api.post_task_comment_once', return_value={'Status': 200}):
+            result = agent.handle(user_text='为什么纯数字有优化？', session_id=sid,
+                                  run_id=rid, user=user)
+        self.assertEqual(result['status'], 'completed')
+        self.assertEqual(build.call_args.kwargs['max_related_post_comments'], 16)
+        self.assertEqual(build.call_args.kwargs['max_related_user_messages'], 32)
+        request = fake.requests[0][0][-1]['content']
+        self.assertIsInstance(request, list)
+        text = request[0]['text']
+        self.assertIn('纯数字优化原理', text)
+        self.assertIn('这是完整且有界的原帖正文', text)
+        self.assertIn('<reference_context>', text)
+        self.assertNotIn('audit_document_id=', text)
+        self.assertTrue(any(part.get('type') == 'image_url' for part in request))
+        names = {schema['function']['name'] for schema in fake.requests[0][1]['tools']}
+        self.assertIn('circuit_analyze', names)
+        self.assertIn('spawn_subagent', names)
+        self.assertNotIn('web_search', names)
+        self.assertIsNone(fake.requests[0][1]['max_tokens'])
+        events = agent.db.events(sid)
+        self.assertFalse(any(event['kind'] == 'compaction_start' for event in events))
+        self.assertTrue(any(event['kind'] == 'cover_auto_loaded' for event in events))
+
+    def test_main_can_call_isolated_subagent_and_remains_only_final_owner(self):
+        tools = ToolRegistry()
+        child_call = {'id': 'child-call', 'type': 'function', 'function': {
+            'name': 'spawn_subagent', 'arguments': json.dumps({
+                'objective': '核对一个测点', 'details': '限定单点', 'state': '未开始',
+                'evidence': [], 'constraints': ['不外发'], 'next_move': '读取电压',
+            }, ensure_ascii=False)}}
+        report = {'child_id': 'child-1', 'status': 'completed',
+                  'conclusion': '测点为5V', 'key_evidence': ['doc-1'],
+                  'limitations': [], 'next_action': '主agent回答'}
+        agent, fake = self.agent([
+            reply('', calls=[child_call], finish='tool_calls'),
+            reply('隔离核对结果为5V。'),
+        ], tools)
+        with mock.patch('aurex.subagent_runtime.run_isolated_subagent',
+                        return_value=report) as run_child:
+            result = agent.handle(user_text='请隔离核对后回答')
+        run_child.assert_called_once()
+        self.assertEqual(result['answer'], '隔离核对结果为5V。')
+        self.assertEqual(len([event for event in agent.db.events(result['session_id'])
+                              if event['kind'] == 'answer']), 1)
+        self.assertIn('测点为5V', json.dumps(fake.requests[1][0], ensure_ascii=False))
 
     def test_admin_dry_run_exercises_short_lookup_and_finishes_locally(self):
         tools = ToolRegistry()
@@ -314,8 +416,8 @@ class SessionAgentTests(unittest.TestCase):
             reply('', calls=[{'id': 'works', 'type': 'function', 'function': {
                 'name': 'plar_query_experiments', 'arguments': '{"user_id":"' + 'e' * 24 + '"}'}}],
                 finish='tool_calls'),
+            reply('MapMaths 的公开签名是 Trismegistus。'),
         ], tools)
-        fake.short_final_answers = iter([{'answer': 'MapMaths 的公开签名是 Trismegistus。'}])
         sid = agent.db.session('admin-short-dry-run', source='admin')
         request = '只读审计：介绍用户 <user=' + 'e' * 24 + '>@MapMaths</user>。'
         rid = agent.db.enqueue_task(sid, request, source='admin',
@@ -325,7 +427,7 @@ class SessionAgentTests(unittest.TestCase):
         self.assertEqual(result['answer'], 'MapMaths 的公开签名是 Trismegistus。')
         self.assertEqual([options['thinking'] for _, options in fake.requests],
                          [True, False, False])
-        self.assertTrue(any(event['kind'] == 'short_community_finalized'
+        self.assertTrue(any(event['kind'] == 'final_reply_once'
                             for event in agent.db.events(sid)))
 
     def test_first_request_thinks_then_tool_turn_is_no_think_and_reasoning_is_not_replayed(self):
@@ -334,15 +436,13 @@ class SessionAgentTests(unittest.TestCase):
         call = {"id": "call1", "type": "function", "function": {"name": "read_voltage", "arguments": "{}"}}
         agent, fake = self.agent([reply("", reasoning="private reasoning marker", calls=[call], finish="tool_calls"), reply("Measured 5 V")], tools)
         result = agent.handle(user_text="Measure voltage")
-        self.assertEqual([options["thinking"] for _, options in fake.requests], [True, False, False])
-        self.assertEqual(fake.requests[0][1]["max_tokens"], 4096)
-        self.assertIsNone(fake.requests[1][1]["max_tokens"])
-        self.assertEqual(fake.requests[-1][1]['tools'], [])
+        self.assertEqual([options["thinking"] for _, options in fake.requests], [True, False])
+        self.assertTrue(all(options["max_tokens"] is None for _, options in fake.requests))
         self.assertEqual(result["answer"], "Measured 5 V")
         self.assertNotIn("private reasoning marker", json.dumps(agent.db.messages(result["session_id"])))
         self.assertNotIn("private reasoning marker", json.dumps(fake.requests[-1][0]))
-        self.assertFalse(any(message.get('role') == 'tool' or 'tool_calls' in message
-                             for message in fake.requests[-1][0]))
+        self.assertTrue(any(message.get('role') == 'tool'
+                            for message in fake.requests[-1][0]))
         self.assertTrue(any(e["kind"] == "reasoning_delta" for e in agent.db.events(result["session_id"])))
 
     def test_reasoning_only_first_turn_recovers_without_replaying_private_reasoning(self):
@@ -353,8 +453,8 @@ class SessionAgentTests(unittest.TestCase):
         result = agent.handle(user_text="Check this bounded question")
         self.assertEqual(result["status"], "completed")
         self.assertEqual(result["answer"], "Recovered concise answer")
-        self.assertEqual([options["thinking"] for _, options in fake.requests], [True, False, False])
-        self.assertEqual(fake.requests[0][1]["max_tokens"], 4096)
+        self.assertEqual([options["thinking"] for _, options in fake.requests], [True, False])
+        self.assertTrue(all(options["max_tokens"] is None for _, options in fake.requests))
         self.assertNotIn("private loop", json.dumps(fake.requests[1][0]))
         self.assertNotIn("private loop", json.dumps(agent.db.messages(result["session_id"])))
         events = agent.db.events(result["session_id"])
@@ -398,7 +498,7 @@ class SessionAgentTests(unittest.TestCase):
         call = {'id': 'look', 'type': 'function', 'function': {'name': 'view_image', 'arguments': json.dumps({'path': path})}}
         agent, fake = self.agent([reply(calls=[call], finish='tool_calls'), reply('Visible diagram checked')])
         result = agent.handle(user_text='Look at this screenshot', images=[path])
-        self.assertNotIn('"type": "image_url"', json.dumps(fake.requests[0][0]))
+        self.assertIn('"type": "image_url"', json.dumps(fake.requests[0][0]))
         self.assertIn('"type": "image_url"', json.dumps(fake.requests[1][0]))
         self.assertIn('"type": "image_url"', json.dumps(fake.requests[-1][0]))
         self.assertTrue(result['tool_results'][0].ok)
@@ -411,14 +511,10 @@ class SessionAgentTests(unittest.TestCase):
         valid = {"id": "actual", "type": "function", "function": {"name": "measure", "arguments": "{}"}}
         agent, fake = self.agent([reply("unfinished", calls=[incomplete], finish="length"),
                                  reply("", calls=[valid], finish="tool_calls"), reply("Measured result verified")], tools)
-        fake.final_reviews = iter([
-            {'outcome': 'continue', 'answer': 'No measurement was executed; submit a complete focused measurement.'},
-            {'outcome': 'completed', 'answer': 'Measured result verified'},
-        ])
         result = agent.handle(user_text="Run long task", session_id="length-test")
         self.assertEqual(result["answer"], "Measured result verified")
         executed.assert_called_once()
-        self.assertEqual([x[1]["thinking"] for x in fake.requests], [True, False, False, False, False])
+        self.assertEqual([x[1]["thinking"] for x in fake.requests], [True, False, False])
         events = agent.db.events("length-test")
         self.assertTrue(any(e["kind"] == "generation_continuation" for e in events))
         self.assertFalse(any(e["kind"] == "tool_start" and e["data"]["call_id"] == "cut" for e in events))
@@ -431,7 +527,7 @@ class SessionAgentTests(unittest.TestCase):
         result = agent.handle(user_text="Remember this diagram", images=[path])
         saved = json.dumps(agent.db.messages(result["session_id"]))
         self.assertIn(path, saved, "Archived upload needs a path that remains available after image eviction/compaction")
-        self.assertNotIn('"type": "image_url"', json.dumps([r[0] for r in fake.requests]))
+        self.assertIn('"type": "image_url"', json.dumps([r[0] for r in fake.requests]))
 
     def test_plain_long_web_input_is_archived_and_compacted(self):
         agent, fake = self.agent([reply("answer")])
@@ -451,6 +547,10 @@ class SessionAgentTests(unittest.TestCase):
         names = {tool["function"]["name"] for tool in fake.requests[0][1]["tools"]}
         self.assertIn("plar_get_experiment_file", names)
         self.assertIn("plar_get_summary", names)
+        self.assertIn("web_fetch", names)
+        self.assertIn("spawn_subagent", names)
+        self.assertNotIn("web_search", names)
+        self.assertNotIn("read_context", names)
         self.assertNotIn("plar_get_status_save", names)
         self.assertNotIn("plar_get_experiment_context", names)
 
@@ -473,8 +573,7 @@ class SessionAgentTests(unittest.TestCase):
         agent, fake = self.agent([reply("", calls=[call], finish="tool_calls"), reply("More investigation is needed")], tools)
         result = agent.handle(user_text="Investigate")
         self.assertEqual(agent.db.get(result["session_id"])["status"], "completed")
-        self.assertTrue(fake.requests[-2][1]["tools"])
-        self.assertEqual(fake.requests[-1][1]['tools'], [])
+        self.assertTrue(fake.requests[-1][1]["tools"])
         answers = [event for event in agent.db.events(result["session_id"]) if event["kind"] == "answer"]
         self.assertFalse(answers[-1]["data"]["tool_limit_reached"])
 
@@ -509,21 +608,17 @@ class SessionAgentTests(unittest.TestCase):
         self.assertTrue(json.loads(saved["full_json"])["ok"])
         self.assertTrue(any(e["kind"] == "artifact_error" for e in agent.db.events(result["session_id"])))
 
-    def test_task_continues_pending_publication_until_review_reports_a_real_blocker(self):
-        agent, fake = self.agent([reply("All done"), reply("Cannot access publishing account")])
-        fake.final_reviews = iter([
-            {'outcome': 'completed', 'answer': 'All done'},
-            {'outcome': 'blocked', 'answer': 'Publishing account unavailable; experiment has not been published.'},
-        ])
+    def test_pending_publication_stops_once_without_review_continuation(self):
+        agent, fake = self.agent([reply("All done")])
         sid = agent.db.session('pending-publication')
         rid = agent.db.enqueue_task(sid, 'Complete and publish my experiment', source='admin',
                                     explicit_publish_requested=True)
         result = agent.handle(user_text='Complete and publish my experiment', session_id=sid, run_id=rid)
         self.assertEqual(agent.db.get(result["session_id"])["status"], "needs_attention")
-        self.assertIn('not been published', result['answer'])
-        self.assertTrue(any(e['kind'] == 'task_continues' for e in agent.db.events(sid)))
+        self.assertIn('外部发布尚未取得成功回执', result['answer'])
+        self.assertFalse(any(e['kind'] == 'task_continues' for e in agent.db.events(sid)))
         self.assertEqual(len([e for e in agent.db.events(sid) if e['kind'] == 'answer']), 1)
-        self.assertEqual([x[1]['thinking'] for x in fake.requests], [True, False, False, False])
+        self.assertEqual([x[1]['thinking'] for x in fake.requests], [True])
 
     def test_admin_reply_is_local_and_idempotent_without_requester_id(self):
         agent, fake = self.agent([reply('Measured 5 V')])
@@ -534,7 +629,7 @@ class SessionAgentTests(unittest.TestCase):
             again = agent.handle(user_text='Measure', session_id=sid, run_id=rid)
         self.assertEqual(result['answer'], again['answer'])
         self.assertNotIn('@', result['answer'])
-        self.assertEqual(len(fake.requests), 2)
+        self.assertEqual(len(fake.requests), 1)
         finals = [m['message'] for m in agent.db.messages(sid) if m['message'].get('_final_review_id')]
         self.assertEqual(len(finals), 1)
         self.assertIsNone(fake.on_tick)
@@ -566,9 +661,71 @@ class SessionAgentTests(unittest.TestCase):
         self.assertEqual(source['content'], raw)
         messages = [row['message'] for row in agent.db.messages(result['session_id'])]
         tool_text = next(m['content'] for m in messages if m['role'] == 'tool')
-        self.assertIn(source['id'], tool_text)
-        self.assertIn('Full source documents', tool_text)
+        self.assertNotIn(source['id'], tool_text)
+        self.assertNotIn('Full source documents', tool_text)
         self.assertNotIn('C999', tool_text)
+
+    def test_plar_download_keeps_metadata_artifacts_without_model_source_documents(self):
+        """Community prose archives stay auditable but cannot start a read loop."""
+        summary_path = Path(self.temp.name) / 'full-summary.json'
+        description_path = Path(self.temp.name) / 'full-description.txt'
+        sav_path = Path(self.temp.name) / 'original.sav'
+        summary_path.write_text('{"Description": ["ARCHIVED_ONLY"]}', encoding='utf-8')
+        description_path.write_text('ARCHIVED_ONLY', encoding='utf-8')
+        sav_path.write_text('{"Summary": {"ID": "' + 'a' * 24 + '"}}', encoding='utf-8')
+        registry = ToolRegistry()
+        registry.register(ToolSpec('plar_get_experiment_file', 'Read source', {'type': 'object'},
+            lambda _rt, _args: {
+                'summary_id': 'a' * 24,
+                'sav_path': str(sav_path),
+                'full_summary_path': str(summary_path),
+                'full_description_path': str(description_path),
+                'source_summary': {'title': '原始实验', 'description_preview': '短预览'},
+            }))
+        call = {'id': 'source', 'type': 'function', 'function': {
+            'name': 'plar_get_experiment_file', 'arguments': '{}'}}
+        agent, fake = self.agent([
+            reply('', calls=[call], finish='tool_calls'),
+            reply('已取得原始电路文件；正文按需使用窄正文读取器。'),
+        ], registry)
+        result = agent.handle(user_text='读取这个实验文件')
+        self.assertEqual(result['status'], 'completed')
+        with agent.db.connect() as db:
+            titles = [row['title'] for row in db.execute(
+                'SELECT title FROM documents WHERE session_id=?', (result['session_id'],))]
+        self.assertIn('plar_get_experiment_file: full full_summary_path', titles)
+        self.assertIn('plar_get_experiment_file: full full_description_path', titles)
+        tool_messages = [row['message'] for row in agent.db.messages(result['session_id'])
+                         if row['message'].get('role') == 'tool']
+        self.assertTrue(tool_messages)
+        self.assertNotIn('Full source documents (not additional findings):',
+                          tool_messages[0]['content'])
+        # Paths remain server artifacts for operators, while the model receives
+        # the bounded tool result and can use plar_read_body explicitly.
+        self.assertTrue(any(event['kind'] == 'artifact' and event['data']['label'] == 'full_description_path'
+                            for event in agent.db.events(result['session_id'])))
+
+    def test_web_search_is_never_exposed_or_executed(self):
+        search = mock.Mock(side_effect=AssertionError('web_search must be globally disabled'))
+        registry = ToolRegistry()
+        registry.register(ToolSpec('web_search', 'Search', {
+            'type': 'object', 'properties': {'query': {'type': 'string'}},
+            'required': ['query'],
+        }, search))
+        first = {'id': 'search-1', 'type': 'function', 'function': {
+            'name': 'web_search', 'arguments': '{"query":"unrelated"}'}}
+        agent, fake = self.agent([
+            reply('', calls=[first], finish='tool_calls'),
+            reply('没有找到与问题足够相关的外部资料；以下结论仅依据本地证据。'),
+        ], registry)
+        result = agent.handle(user_text='查找这个问题的最新资料')
+        self.assertEqual(result['status'], 'completed')
+        search.assert_not_called()
+        self.assertFalse(any(event['kind'] == 'search_stopped'
+                             for event in agent.db.events(result['session_id'])))
+        self.assertNotIn('web_search', {
+            tool['function']['name'] for tool in fake.requests[1][1]['tools']
+        })
 
     def test_community_final_reply_uses_bound_user_id_once_not_comment_id(self):
         from types import SimpleNamespace
@@ -600,28 +757,25 @@ class SessionAgentTests(unittest.TestCase):
         self.assertEqual(agent.db.get_task(rid)['status'], 'cancelled')
         self.assertFalse(any(e['kind'] == 'answer' for e in agent.db.events(sid)))
 
-    def test_repeated_tools_stay_enabled_and_can_continue_after_review(self):
+    def test_repeated_tools_stay_enabled_without_review_continuation(self):
         tools = ToolRegistry()
         executed = mock.Mock(return_value={'voltage': 5})
         tools.register(ToolSpec('measure', 'Measure', {'type': 'object'}, executed))
         def call(cid, args='{}'):
             return {'id': cid, 'type': 'function', 'function': {'name': 'measure', 'arguments': args}}
         outputs = [reply('', calls=[call('m' + str(i))], finish='tool_calls') for i in range(3)]
-        outputs += [reply('Need a second point'), reply('', calls=[call('new', '{"point":2}')], finish='tool_calls'), reply('Measured both points')]
+        outputs += [reply('', calls=[call('new', '{"point":2}')], finish='tool_calls'),
+                    reply('Measured both points')]
         agent, fake = self.agent(outputs, tools)
-        fake.final_reviews = iter([
-            {'outcome': 'continue', 'answer': '第二个测点尚未取得，继续测量。'},
-            {'outcome': 'completed', 'answer': 'Measured both points'},
-        ])
         result = agent.handle(user_text='Measure both points')
         self.assertEqual(result['status'], 'completed')
         self.assertEqual(executed.call_count, 4, 'Live tool calls are not blindly memoized or skipped')
         self.assertTrue(fake.requests[3][1]['tools'])
         self.assertFalse(fake.requests[3][1]['thinking'])
-        self.assertTrue(fake.requests[5][1]['tools'])
+        self.assertTrue(fake.requests[4][1]['tools'])
         self.assertEqual(len([e for e in agent.db.events(result['session_id']) if e['kind'] == 'answer']), 1)
         self.assertTrue(any(e['kind'] == 'loop_recovery' for e in agent.db.events(result['session_id'])))
-        self.assertIn('read_context(document_id=', json.dumps(fake.requests[5][0]))
+        self.assertNotIn('read_context(document_id=', json.dumps(fake.requests[4][0]))
 
     def test_identical_live_queries_with_new_results_do_not_trigger_recovery(self):
         tools = ToolRegistry()
@@ -646,7 +800,7 @@ class SessionAgentTests(unittest.TestCase):
             result = agent.handle(user_text='这是啥啊')
         investigate.assert_not_called()
         self.assertEqual(result['status'], 'completed')
-        self.assertEqual([opts['thinking'] for _, opts in fake.requests], [True, False])
+        self.assertEqual([opts['thinking'] for _, opts in fake.requests], [True])
         self.assertTrue(all(not opts.get('tools') for _, opts in fake.requests))
         self.assertTrue(any(e['kind'] == 'tool_calls_deferred' for e in agent.db.events(result['session_id'])))
 
@@ -694,7 +848,7 @@ class SessionAgentTests(unittest.TestCase):
         self.assertEqual(result['status'], 'completed')
         self.assertEqual(len([e for e in agent.db.events(result['session_id']) if e['kind'] == 'answer']), 1)
 
-    def test_archived_json_page_is_not_double_escaped_for_the_model(self):
+    def test_archived_json_page_is_not_available_to_the_model(self):
         agent, fake = self.agent([])
         sid = agent.db.session('readable-context')
         source = '{"R1":{"resistance_ohm":10},"label":"测点"}'
@@ -704,12 +858,12 @@ class SessionAgentTests(unittest.TestCase):
         fake.replies = iter([reply('', calls=[call], finish='tool_calls'), reply('R1 is 10 ohm')])
         result = agent.handle(user_text='Read archived resistance', session_id=sid)
         page = next(m['content'] for m in fake.requests[1][0] if m['role'] == 'tool')
-        self.assertIn(source, page)
-        self.assertIn('next_offset=' + str(len(source)), page)
+        self.assertNotIn(source, page)
+        self.assertIn('not enabled or exposed', page)
         saved = agent.db.get_tool_outcome(sid, result['task_id'], 'page1')
-        self.assertEqual(json.loads(saved['full_json'])['data']['text'], source)
+        self.assertFalse(json.loads(saved['full_json'])['ok'])
 
-    def test_same_solver_failure_with_different_parameters_requests_review_then_can_continue(self):
+    def test_same_solver_failure_can_be_retried_by_the_same_agent(self):
         tools = ToolRegistry()
         execute = mock.Mock(side_effect=[RuntimeError('Transient trace failed (rc=3, completed_steps=0, time_s=0.0)')
                                         for _ in range(3)] + [{'measurements': {'v': 3}}])
@@ -718,15 +872,13 @@ class SessionAgentTests(unittest.TestCase):
             return {'id': 'failure' + str(i), 'type': 'function', 'function': {
                 'name': 'circuit_analyze', 'arguments': json.dumps({'path': '/revision/' + str(i), 'dt': 0.01 / (i + 1)})}}
         agent, fake = self.agent([*[reply(calls=[call(i)], finish='tool_calls') for i in range(3)],
-                                 reply('Solver failed; inspect the circuit constraints'),
-                                 reply(calls=[call(3)], finish='tool_calls'), reply('Measured 3 V')], tools)
-        fake.final_reviews = iter([{'outcome': 'continue', 'answer': '存在可验证的修正，继续同一任务。'},
-                                   {'outcome': 'completed', 'answer': 'Measured 3 V'}])
+                                 reply(calls=[call(3)], finish='tool_calls'),
+                                 reply('Measured 3 V')], tools)
         result = agent.handle(user_text='Verify the circuit')
         self.assertEqual(execute.call_count, 4)
         self.assertTrue(fake.requests[3][1]['tools'])
         self.assertFalse(fake.requests[3][1]['thinking'])
-        self.assertTrue(fake.requests[5][1]['tools'])
+        self.assertTrue(fake.requests[4][1]['tools'])
         self.assertEqual(result['status'], 'completed')
         self.assertEqual(len([e for e in agent.db.events(result['session_id']) if e['kind'] == 'answer']), 1)
 
@@ -800,7 +952,8 @@ class JournalTests(unittest.TestCase):
         self.assertEqual(tail["text"], source[-30:])
         self.assertEqual(tail["total_chars"], len(source))
         self.assertIn(original_id, compacted)
-        self.assertIn("read_context", compacted)
+        self.assertNotIn("read_context", compacted)
+        self.assertIn("operator audit", compacted)
 
 
 class TransportTests(unittest.TestCase):
@@ -835,6 +988,21 @@ class TransportTests(unittest.TestCase):
         body = post.call_args.args[0]
         self.assertNotIn("max_tokens", body)
         self.assertEqual(body["chat_template_kwargs"], {"enable_thinking": True})
+
+    def test_explicit_none_omits_configured_max_tokens_for_unbounded_thinking(self):
+        config = LLMConfig(max_output_tokens=4096)
+        client = VLLMClient(config)
+        with mock.patch.object(client, "_stream_lines", return_value=self.response([
+                {"choices": [{"delta": {"content": "configured"}, "finish_reason": "stop"}]}
+        ])) as configured:
+            client.chat([{"role": "user", "content": "question"}], thinking=True)
+        self.assertEqual(configured.call_args.args[0]["max_tokens"], 4096)
+        with mock.patch.object(client, "_stream_lines", return_value=self.response([
+                {"choices": [{"delta": {"content": "unbounded"}, "finish_reason": "stop"}]}
+        ])) as unbounded:
+            client.chat([{"role": "user", "content": "question"}], thinking=True,
+                        max_tokens=None)
+        self.assertNotIn("max_tokens", unbounded.call_args.args[0])
 
     def test_filtered_or_aborted_stream_cannot_be_executed_as_a_tool(self):
         for finish in ("content_filter", "abort", "unknown"):

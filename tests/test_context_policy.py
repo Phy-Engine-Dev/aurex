@@ -199,7 +199,7 @@ class ContextPolicyTests(unittest.TestCase):
         result = budget.summarize('original facts ' * 600, title='Conversation checkpoint')
         self.assertEqual(len(self.client.calls), 4)
         self.assertIn(near_budget, result)
-        self.assertEqual(result.count('[Full original:'), 1)
+        self.assertEqual(result.count('[Complete original archived for operator audit'), 1)
         self.assertNotIn('NOT SUMMARIZED', result)
         self.assertFalse(any(kind == 'compaction_recovered' for kind, _ in self.events))
 
@@ -240,7 +240,8 @@ class ContextPolicyTests(unittest.TestCase):
         result = self.budget(auto_compact=False, prune=True, prune_keep_tool_results=1).messages('system', [])
         old = next(m for m in result if m.get('tool_call_id') == 'old')
         new = next(m for m in result if m.get('tool_call_id') == 'new')
-        self.assertIn('read_context', old['content'])
+        self.assertNotIn('read_context', old['content'])
+        self.assertEqual(json.loads(old['content'])['retrieval'], 'audit_only_no_reread')
         self.assertEqual(new['content'], 'fresh evidence')
         self.assertEqual(self.db.messages(self.sid), before)
         self.assertFalse(self.client.calls)
@@ -307,7 +308,9 @@ class ContextPolicyTests(unittest.TestCase):
         self.client.config = replace(self.client.config, enable_thinking=False, max_output_tokens=None)
         budget = self.budget(tool_output_tokens=256, summary_thinking=True)
         self.assertEqual(budget.document('ordinary source', 'x' * 400), 'x' * 400)
-        self.assertIn('read_context', budget.document('tool', 'x' * 400, kind='tool'))
+        compact = budget.document('tool', 'x' * 400, kind='tool')
+        self.assertNotIn('read_context', compact)
+        self.assertEqual(json.loads(compact)['retrieval'], 'audit_only_no_reread')
         self.assertTrue(all(kw['thinking'] for _, kw in self.client.calls))
         self.assertTrue(all(kw['max_tokens'] == 512 for _, kw in self.client.calls))
         self.assertFalse(self.client.config.enable_thinking)
@@ -326,13 +329,11 @@ class ContextPolicyTests(unittest.TestCase):
         projected = json.loads(output)
         self.assertEqual(projected['source_document_id'], source_id)
         self.assertEqual(projected['tool_result_document_id'], result_id)
-        self.assertEqual(projected['tool_result_document_id_usage'], 'diagnostics_only_never_read_context_source')
+        self.assertEqual(projected['tool_result_document_id_usage'], 'operator_audit_only')
         self.assertNotIn('document_id', projected)
-        self.assertEqual(projected['continue_source_only']['document_id'], source_id)
-        self.assertNotEqual(projected['continue_source_only']['document_id'], result_id)
-        excerpt = projected.get('verbatim_excerpt')
-        if excerpt is not None:
-            self.assertEqual(projected['continue_source_only']['offset'], excerpt['source_offset_end'])
+        self.assertNotIn('continue_source_only', projected)
+        self.assertEqual(projected['retrieval'],
+                         'legacy_archived_page_not_available_as_an_agent_tool')
 
     def test_interface_projection_preserves_exact_connectivity_fields(self):
         port = {'id': 'input-uuid', 'ref': 'C152', 'label': '', 'direction': 'input',
@@ -362,6 +363,48 @@ class ContextPolicyTests(unittest.TestCase):
             self.assertEqual(saved[field], port[field])
         self.assertIn('bit significance', evidence['interface_records'][0]['scope'])
 
+    def test_circuit_projection_keeps_control_contract_without_renderer_payload(self):
+        data = {
+            'controls_only': True,
+            'controls': [{'id': 'SW', 'kind': 'spst', 'value_name': 'closed',
+                          'current': 0, 'allowed': [0, 1],
+                          'source_model_id': 'Simple Switch',
+                          'primitive_component_ids': ['SW']}],
+            'circuit_path': '/immutable/design.circuit.json',
+            'artifact': {'netlist_path': '/immutable/netlist.json',
+                         'camera_path': '/immutable/camera-view.json'},
+            'camera': {'source': 'not-rendered', 'image_generated': False,
+                       'position': [1, 2, 3], 'warnings': ['with_image=false']},
+            'netlist': {'nodes': [{'id': 'N1', 'connections': [
+                {'component': 'SW', 'pin': 0}], 'total_connections': 1}],
+                        'components': [{'id': 'SW', 'ref': 'C1',
+                                        'type': 'Simple Switch',
+                                        'position': [.2, .3, 0],
+                                        'rotation': [0, 0, 180],
+                                        'pins': [{'pin': 0, 'node': 'N1'}]}]},
+        }
+        full = json.dumps({'ok': True, 'data': data}, ensure_ascii=False)
+        result_id, _ = self.db.tool_outcome(self.sid, 'run', 'controls-spatial',
+                                            'circuit_inspect', full, True)
+        client = Client(LLMConfig(context_length=8192, max_output_tokens=512))
+        budget = ContextBudget(client, self.db, self.sid, 'run', 8192,
+                               lambda *x: None,
+                               policy=ContextPolicyConfig(safety_tokens=128,
+                                                          summary_max_tokens=4096))
+        projected = json.loads(budget.tool_document(
+            'Tool circuit_inspect', full, document_id=result_id,
+            tool_name='circuit_inspect'))
+        row = projected['sections']['/data/controls']['rows'][0]['value']
+        self.assertEqual(row['id'], 'SW')
+        self.assertEqual(row['allowed'], [0, 1])
+        self.assertEqual(projected['fields']['/data/circuit_path'], data['circuit_path'])
+        self.assertNotIn('/data/camera', projected['fields'])
+        self.assertNotIn('/data/netlist/nodes', projected['sections'])
+        self.assertNotIn('/data/netlist/components', projected['sections'])
+        self.assertNotIn('/data/artifact', projected['fields'])
+        self.assertEqual(projected['retrieval'], 'audit_only_no_reread')
+        self.assertFalse('full_presentation_document_id' in projected)
+
     def test_exact_node_projection_keeps_page_cursor_and_selected_components(self):
         components = [{'id': f'dff-{i}', 'ref': f'C{148 + i}', 'type': 'D Flipflop',
                        'pins': [{'pin': 0, 'node': f'N{i}'}, {'pin': 3, 'node': 'N24'}],
@@ -381,23 +424,23 @@ class ContextPolicyTests(unittest.TestCase):
             document_id=result_id, tool_name='circuit_inspect'))
         self.assertEqual(projected['fields']['/data/node_query']['next_offset'], 8)
         self.assertEqual(projected['fields']['/data/pagination']['next_offset'], 8)
-        rows = projected['sections']['/data/netlist/components']
+        rows = projected['sections']['/data/components']
         self.assertEqual(rows['shown_rows'], 8)
         self.assertEqual([row['value']['ref'] for row in rows['rows']], [row['ref'] for row in components])
 
-    def test_batch_circuit_projection_keeps_each_query_self_contained_when_catalog_is_pruned(self):
+    def test_batch_circuit_projection_preserves_exact_selected_fields_byte_for_byte(self):
         results = [{
             'query': f'C{i}', 'ok': True, 'component_ids': [f'uuid-{i}'],
             'components': [{'id': f'uuid-{i}', 'ref': f'C{i}',
-                            'type': 'Resistor', 'label': f'R{i}'}],
+                            'type': 'Logic Output', 'label': f'OUT{i}',
+                            'pins': [{'pin': 0, 'node': f'N{i}',
+                                      'total_connections': 2, 'connected': True}],
+                            'properties': {'高电平': 3.0}}],
             'nodes': [], 'match_count': 1, 'has_more': False,
         } for i in range(1, 7)]
-        data = {'batch': True, 'query_count': len(results), 'results': results,
-                'component_catalog': [
-                    {'id': f'uuid-{i}', 'ref': f'C{i}', 'type': 'Resistor',
-                     'label': f'R{i}', 'properties': {'large': 'x' * 5000},
-                     'pins': [{'pin': 0, 'node': f'N{i}'}]}
-                    for i in range(1, 7)]}
+        data = {'batch': True, 'query_count': len(results),
+                'selected_fields': ['identity', 'pins', 'properties.高电平'],
+                'results': results}
         full = json.dumps({'ok': True, 'data': data})
         result_id, _ = self.db.tool_outcome(
             self.sid, 'run', 'batch-circuit', 'circuit_query_many', full, True)
@@ -406,14 +449,17 @@ class ContextPolicyTests(unittest.TestCase):
             policy=ContextPolicyConfig(safety_tokens=128, summary_max_tokens=4096))
         projected = json.loads(budget.tool_document('Tool circuit_query_many', full,
             document_id=result_id, tool_name='circuit_query_many'))
-        section = projected['sections']['/data/results']
-        self.assertTrue(section['self_contained_query_identities'])
-        self.assertEqual(section['shown_rows'], 6)
-        rows = [entry['value'] for entry in section['rows']]
+        self.assertEqual(projected, json.loads(full))
+        rows = projected['data']['results']
         self.assertEqual([row['query'] for row in rows], [f'C{i}' for i in range(1, 7)])
         self.assertEqual([row['components'][0]['id'] for row in rows],
                          [f'uuid-{i}' for i in range(1, 7)])
-        self.assertTrue(all(row['components'][0]['type'] == 'Resistor' for row in rows))
+        self.assertTrue(all(row['components'][0]['properties'] == {'高电平': 3.0}
+                            for row in rows))
+        self.assertTrue(all('低电平' not in row['components'][0]['properties']
+                            for row in rows))
+        self.assertTrue(all(row['components'][0]['pins'][0]['node'] == f'N{i}'
+                            for i, row in enumerate(rows, 1)))
 
     def test_circuit_projection_keeps_compact_measured_trace_summary_before_large_rows(self):
         trace_summary = {
@@ -457,6 +503,35 @@ class ContextPolicyTests(unittest.TestCase):
         projected = json.loads(budget.tool_document('Tool circuit_create', full,
             document_id=result_id, tool_name='circuit_create'))
         self.assertEqual(projected['fields']['/data/component_manifest'], manifest)
+
+    def test_circuit_projection_keeps_native_edit_manifest(self):
+        manifest = [{
+            'id': 'R1', 'type': 'resistor', 'nodes': ['in', 'gnd'],
+            'params': {'r': 1000.0}, 'position': [0.2, 0.0, 0.0],
+            'rotation': [0.0, 0.0, 180.0], 'pin_labels': ['1', '2'],
+        }]
+        data = {'native_component_manifest': manifest,
+                'circuit_path': '/tmp/design.circuit.json',
+                'netlist': {'components': [
+                    {'id': 'R1', 'type': 'Resistor',
+                     'properties': {'电阻': 1000, 'blob': 'x' * 1200}}
+                ]}}
+        full = json.dumps({'ok': True, 'data': data})
+        result_id, _ = self.db.tool_outcome(self.sid, 'run', 'native-manifest',
+                                             'circuit_edit', full, True)
+        budget = ContextBudget(self.client, self.db, self.sid, 'run', 8192,
+                               lambda *x: None,
+                               policy=ContextPolicyConfig(safety_tokens=128,
+                                                          summary_max_tokens=2048))
+        projected = json.loads(budget.tool_document('Tool circuit_edit', full,
+                                                     document_id=result_id,
+                                                     tool_name='circuit_edit'))
+        if '/data/native_component_manifest' in projected['fields']:
+            self.assertEqual(projected['fields']['/data/native_component_manifest'], manifest)
+        else:
+            section = projected['sections']['/data/native_component_manifest']
+            self.assertEqual(section['rows'][0]['value'], manifest[0])
+            self.assertTrue(section['edit_contract'])
 
     def test_checkpoint_machine_evidence_keeps_exact_node_pages_and_exceptional_pin(self):
         pages = [

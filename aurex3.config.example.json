@@ -8,7 +8,7 @@
     "context_length": 90112,
     "max_output_tokens": null,
     "enable_thinking": true,
-    "reasoning_effort": null,
+    "reasoning_effort": "medium",
     "max_images": 2,
     "image_max_side": 1024,
     "compact_at_ratio": 0.8,
@@ -59,6 +59,8 @@
     "dry_run": true,
     "bootstrap_lookback_sec": 0,
     "poll_interval_sec": 15,
+    "community_max_related_post_comments": 16,
+    "community_max_related_user_messages": 32,
     "notifications_enabled": true,
     "context_db_enabled": true,
     "targets": []

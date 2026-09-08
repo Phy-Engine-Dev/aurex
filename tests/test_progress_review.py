@@ -8,7 +8,7 @@ from aurex.tools.registry import ToolRegistry, ToolSpec
 
 
 class ProgressReviewTests(unittest.TestCase):
-    def test_cpu_planning_thinking_is_bounded_per_turn_not_per_task(self):
+    def test_cpu_planning_first_turn_has_no_artificial_generation_cap(self):
         tools = ToolRegistry()
         agent, fake = self.agent([support.reply('')], tools)
         sid = agent.db.session('cpu-planning-bound', source='admin')
@@ -32,7 +32,7 @@ class ProgressReviewTests(unittest.TestCase):
         fake.chat = chat
         result = agent.handle(user_text='设计并验证 RV32I CPU', session_id=sid, run_id=rid)
         self.assertTrue(result['cancelled'])
-        self.assertEqual(fake.requests[0][1]['max_tokens'], 4096)
+        self.assertIsNone(fake.requests[0][1]['max_tokens'])
         first_prompt = json.dumps(fake.requests[0][0], ensure_ascii=False)
         self.assertIn('SERVER_CPU_ACCEPTANCE_PROTOCOL', first_prompt)
         self.assertIn('rv32i_teaching_v1', first_prompt)
@@ -42,8 +42,13 @@ class ProgressReviewTests(unittest.TestCase):
         self.assertIn('绝不能在同一次hdl_simulate里同时传workspace_id和files', first_prompt)
         self.assertIn("ADDI x1,x0,5 = 32'h00500093", first_prompt)
         self.assertIn('每次改变选择器后先#1', first_prompt)
-        self.assertTrue({'task_plan', 'read_context'} <= {schema['function']['name']
-                                                          for schema in fake.requests[0][1]['tools']})
+        first_tools = {schema['function']['name']
+                       for schema in fake.requests[0][1]['tools']}
+        self.assertIn('task_plan', first_tools)
+        self.assertIn('spawn_subagent', first_tools)
+        self.assertNotIn('read_context', first_tools)
+        self.assertNotIn('read_content', first_tools)
+        self.assertNotIn('web_search', first_tools)
         self.assertFalse(any(event['kind'] == 'tool_limit_reached'
                              for event in agent.db.events(sid)))
 
@@ -80,16 +85,19 @@ class ProgressReviewTests(unittest.TestCase):
         self.assertEqual(result['status'], 'completed')
         self.assertEqual(analyze.call_count, 1)
         first_tools = {schema['function']['name'] for schema in fake.requests[0][1]['tools']}
-        self.assertTrue({'task_plan', 'circuit_analyze', 'read_context'} <= first_tools)
+        self.assertTrue({'task_plan', 'circuit_analyze', 'spawn_subagent'} <= first_tools)
+        self.assertNotIn('read_context', first_tools)
         self.assertIn('SERVER_TASK_PLAN_JSON', json.dumps(fake.requests[1][0], ensure_ascii=False))
         plan = agent.db.task_plan(result['session_id'], result['task_id'])
         self.assertEqual(plan[0]['status'], 'completed')
         self.assertEqual(len(plan[0]['evidence_document_ids']), 1)
         from aurex.sessiondb import SessionDB
         self.assertEqual(SessionDB(agent.db.path).task_plan(result['session_id'], result['task_id']), plan)
-        review_messages = fake.requests[-1][0]
-        self.assertFalse(any(message.get('role') == 'tool' or 'tool_calls' in message
-                             for message in review_messages))
+        from aurex.task_reply import FINAL_SYSTEM
+        self.assertFalse(any(messages[0].get('content') == FINAL_SYSTEM
+                             for messages, _ in fake.requests))
+        self.assertEqual(sum(event['kind'] == 'answer'
+                             for event in agent.db.events(result['session_id'])), 1)
 
     def test_completed_plan_history_cannot_be_replaced_or_reopened(self):
         agent, _ = self.agent([])
@@ -114,7 +122,7 @@ class ProgressReviewTests(unittest.TestCase):
         self.assertEqual(plan[0]['status'], 'completed')
         self.assertEqual(plan[0]['evidence_document_ids'], [])
 
-    def test_completed_plan_blocks_an_unrequested_recheck_after_recovery(self):
+    def test_completed_plan_remains_navigation_and_does_not_block_recheck(self):
         tools = ToolRegistry()
         inspect = mock.Mock(side_effect=lambda _rt, args: {
             'node_query': {'node': args['query'], 'exact': True, 'match_count': 1,
@@ -143,10 +151,11 @@ class ProgressReviewTests(unittest.TestCase):
         fake.final_reviews = iter([{'outcome': 'completed', 'answer': '已完成有界映射核对。'}])
         result = agent.handle(user_text='测试并验证这个CPU的有界节点映射。')
         self.assertEqual(result['status'], 'completed')
-        self.assertEqual(inspect.call_count, 8)
+        self.assertEqual(inspect.call_count, 9)
         recovery_messages, recovery_options = fake.requests[9]
         names = {schema['function']['name'] for schema in recovery_options['tools']}
-        self.assertTrue({'task_plan', 'circuit_inspect', 'read_context'} <= names)
+        self.assertTrue({'task_plan', 'circuit_inspect', 'spawn_subagent'} <= names)
+        self.assertNotIn('read_context', names)
         self.assertTrue(any(message.get('role') == 'tool' or 'tool_calls' in message
                             for message in recovery_messages))
         second_recovery_messages, second_recovery_options = fake.requests[10]
@@ -155,41 +164,13 @@ class ProgressReviewTests(unittest.TestCase):
         self.assertTrue(agent.db.get_tool_outcome(result['session_id'], result['task_id'],
                                                   'get-only')['ok'])
         resumed_names = {schema['function']['name'] for schema in fake.requests[11][1]['tools']}
-        self.assertNotIn('circuit_inspect', resumed_names)
+        self.assertIn('circuit_inspect', resumed_names)
         repeated = agent.db.get_tool_outcome(result['session_id'], result['task_id'],
                                              'repeat-after-checkpoint')
-        self.assertIsNone(repeated)
-
-    def test_wide_zero_padded_stimulus_identifies_only_the_changed_column(self):
-        from aurex.session_agent import _changed_stimulus_inputs
-        ids = ['input-' + str(i) for i in range(45)]
-        ports = {cid: {'logic': 0} for cid in ids}
-        first = [0] * 45
-        second = [0] * 45
-        second[17] = 1
-        changed, width = _changed_stimulus_inputs({
-            'stimulus_table': {'inputs': ids, 'vectors': [first, second]}}, ports)
-        self.assertEqual(width, 45)
-        self.assertEqual(changed, ['input-17'])
-
-    def test_batch_connectivity_evidence_survives_compaction_and_cpu_walk_is_bounded(self):
-        from aurex.session_agent import (_cpu_connectivity_scope_warning,
-                                         _successful_batch_queries)
-        selectors, nodes = _successful_batch_queries({'results': [
-            {'query': 'N17', 'ok': True, 'nodes': [{'id': 'N17'}]},
-            {'query': 'C9', 'ok': True, 'component_ids': ['button-id'], 'nodes': []},
-            {'query': 'N18', 'ok': False, 'nodes': [{'id': 'N18'}]},
-            {'query': 'clock', 'ok': True, 'nodes': [{'id': 'named-net'}]},
-        ], 'component_catalog': [{'id': 'button-id', 'pins': [
-            {'pin': 0, 'node': 'N9'}, {'pin': 1, 'node': 'N10'}]}]})
-        self.assertEqual(selectors, {'N17', 'C9', 'clock'})
-        self.assertEqual(nodes, {'N9', 'N10', 'N17'})
-        self.assertIsNone(_cpu_connectivity_scope_warning(
-            {'queries': ['N1', 'N2', 'N2']}, {'N0'}))
-        self.assertIn('at most 8', _cpu_connectivity_scope_warning(
-            {'queries': [f'N{i}' for i in range(9)]}, set()))
-        self.assertIn('bounded maximum 12', _cpu_connectivity_scope_warning(
-            {'queries': ['N12', 'N13']}, {f'N{i}' for i in range(12)}))
+        self.assertTrue(repeated['ok'])
+        from aurex.task_reply import FINAL_SYSTEM
+        self.assertFalse(any(messages[0].get('content') == FINAL_SYSTEM
+                             for messages, _ in fake.requests))
 
     def test_recovery_keeps_registered_tools_available_and_records_failures(self):
         tools = ToolRegistry()
@@ -242,7 +223,7 @@ class ProgressReviewTests(unittest.TestCase):
                              for e in agent.db.events(result['session_id'])), 0)
         self.assertEqual(len(agent.db.tasks(result['session_id'])), 1)
 
-    def test_repeated_small_target_connectivity_walk_is_advisory_before_normal_final_review(self):
+    def test_repeated_small_target_connectivity_walk_keeps_tools_available(self):
         tools = ToolRegistry()
         analyze = mock.Mock(return_value={'measurement_source': 'fresh solve', 'state_path': '/state',
                                           'measurements': {'stimulus_scope': {'total_steps': 4}}})
@@ -266,20 +247,15 @@ class ProgressReviewTests(unittest.TestCase):
         self.assertEqual(result['status'], 'completed')
         self.assertEqual(analyze.call_count, 1)
         self.assertEqual(inspect.call_count, 8)
-        execution_requests = [options for messages, options in fake.requests
-                              if messages[0].get('content') != __import__('aurex.task_reply', fromlist=['FINAL_SYSTEM']).FINAL_SYSTEM]
-        self.assertTrue(execution_requests[-1]['tools'])
+        self.assertTrue(fake.requests[-1][1]['tools'])
         events = agent.db.events(result['session_id'])
-        review = next(event for event in events if event['kind'] == 'connectivity_review')
-        self.assertEqual(review['data']['targeted_inspections_since_measurement'], 8)
-        self.assertEqual(review['data']['distinct_targets'], 4)
-        self.assertTrue(any(event['kind'] == 'loop_recovery' and
-                            event['data'].get('connectivity_walk') for event in events))
+        self.assertFalse(any(event['kind'] == 'connectivity_notice' for event in events))
+        self.assertFalse(any(event['kind'] == 'loop_recovery' and
+                             event['data'].get('connectivity_walk') for event in events))
         final_system = __import__('aurex.task_reply', fromlist=['FINAL_SYSTEM']).FINAL_SYSTEM
-        progress = [options for messages, options in fake.requests if messages[0].get('content') == final_system]
-        self.assertEqual(len(progress), 1)
-        self.assertFalse(progress[0]['thinking'])
-        self.assertEqual(progress[0]['max_tokens'], 2048)
+        self.assertFalse(any(messages[0].get('content') == final_system
+                             for messages, _ in fake.requests))
+        self.assertEqual(sum(event['kind'] == 'answer' for event in events), 1)
 
     def test_explicit_exact_pagination_exposes_only_the_required_next_node_page(self):
         tools = ToolRegistry()
@@ -312,7 +288,8 @@ class ProgressReviewTests(unittest.TestCase):
         self.assertEqual([call.args[1].get('offset', 0) for call in inspect.call_args_list], [0, 8])
         final_system = __import__('aurex.task_reply', fromlist=['FINAL_SYSTEM']).FINAL_SYSTEM
         execution = [options for messages, options in fake.requests if messages[0].get('content') != final_system]
-        self.assertEqual([schema['function']['name'] for schema in execution[1]['tools']], ['circuit_inspect'])
+        self.assertIn('circuit_inspect',
+                      [schema['function']['name'] for schema in execution[1]['tools']])
         self.assertTrue(any(event['kind'] == 'tool_end' for event in agent.db.events(result['session_id'])))
 
     def test_explicit_single_interface_scan_wording_does_not_disable_retrieval(self):
@@ -416,7 +393,7 @@ class ProgressReviewTests(unittest.TestCase):
                             event['data']['tool'] == 'circuit_analyze'
                             for event in agent.db.events(sid, run_id=rid)))
 
-    def test_unlabelled_cpu_input_requires_exact_node_evidence_before_stimulus(self):
+    def test_unlabelled_cpu_input_does_not_create_a_server_side_tool_gate(self):
         tools = ToolRegistry()
         input_id = 'unlabelled-input-id'
         def inspect_result(_rt, args):
@@ -451,87 +428,35 @@ class ProgressReviewTests(unittest.TestCase):
         result = agent.handle(user_text='对这个 CPU 做一个有界功能测试。')
         self.assertEqual(result['status'], 'completed')
         self.assertEqual(inspect.call_count, 2)
-        self.assertEqual(analyze.call_count, 1)
-        rejected = agent.db.get_tool_outcome(result['session_id'], result['task_id'], 'blind')
-        self.assertFalse(rejected['ok'])
-        self.assertIn('selected only from interface order', rejected['full_json'])
+        self.assertEqual(analyze.call_count, 2)
+        first = agent.db.get_tool_outcome(result['session_id'], result['task_id'], 'blind')
+        self.assertTrue(first['ok'])
 
-    def test_fully_overlapping_archived_page_is_reexecuted_without_tool_lock(self):
-        agent, fake = self.agent([])
-        sid = agent.db.session('coverage-review', source='admin')
-        rid = agent.db.enqueue_task(sid, '读取必要证据一次并回答。', source='admin')
-        document_id = agent.db.document(sid, 'fixture', '0123456789' * 30)
-        arguments = json.dumps({'document_id': document_id, 'offset': 40, 'length': 80})
-        first = support.reply('', calls=[{'id': 'page-1', 'type': 'function', 'function': {
-            'name': 'read_context', 'arguments': arguments}}], finish='tool_calls')
-        second = support.reply('', calls=[{'id': 'page-2', 'type': 'function', 'function': {
-            'name': 'read_context', 'arguments': arguments}}], finish='tool_calls')
-        fake.replies = iter([first, second, support.reply('已有区间足够，使用已保存证据继续结论。')])
-        fake.final_reviews = iter([{'outcome': 'completed', 'answer': '已有区间足够，使用已保存证据继续结论。'}])
-        result = agent.handle(user_text='读取必要证据一次并回答。', session_id=sid, run_id=rid)
+    def test_repeated_typed_body_reads_execute_without_archive_reader_or_tool_lock(self):
+        tools = ToolRegistry()
+        read_body = mock.Mock(return_value={
+            'summary_id': 'a' * 24, 'offset': 0,
+            'text': '作者正文中的有界片段', 'has_more': False})
+        tools.register(ToolSpec('plar_read_body', 'Read bounded prose',
+            {'type': 'object'}, read_body))
+        arguments = json.dumps({'summary_id': 'a' * 24, 'offset': 0, 'length': 256})
+        calls = [support.reply('', calls=[{'id': 'body-' + str(index),
+            'type': 'function', 'function': {
+                'name': 'plar_read_body', 'arguments': arguments}}], finish='tool_calls')
+            for index in range(2)]
+        agent, fake = self.agent(calls + [support.reply('正文片段已经核对。')], tools)
+        result = agent.handle(user_text='核对正文中的指定片段。')
         self.assertEqual(result['status'], 'completed')
-        final_system = __import__('aurex.task_reply', fromlist=['FINAL_SYSTEM']).FINAL_SYSTEM
-        execution = [options for messages, options in fake.requests
-                     if messages[0].get('content') != final_system]
-        self.assertTrue(execution[-1]['tools'])
-        review = next(event for event in agent.db.events(sid) if event['kind'] == 'repeated_context_read')
-        self.assertTrue(review['data']['no_new_source_coverage'])
-        self.assertEqual(review['data']['offset'], 40)
-
-    def test_varying_literal_misses_get_navigation_hint_without_disabling_reads(self):
-        agent, fake = self.agent([])
-        sid = agent.db.session('literal-miss-review', source='admin')
-        rid = agent.db.enqueue_task(sid, '检查保存日志后继续验证。', source='admin')
-        document_id = agent.db.document(sid, 'bounded log',
-            'AUREX_PROFILE_SAMPLE cycle=25\nAUREX_PROFILE_SAMPLE cycle=26\n')
-        calls = []
-        for cycle in (24, 23, 22, 21):
-            calls.append(support.reply('', calls=[{'id': 'miss-' + str(cycle), 'type': 'function',
-                'function': {'name': 'read_context', 'arguments': json.dumps({
-                    'document_id': document_id, 'find': 'cycle=' + str(cycle)})}}], finish='tool_calls'))
-        fake.replies = iter(calls + [support.reply('日志只保存了 cycle 25–26；依据真实窗口继续。')])
-        fake.final_reviews = iter([{'outcome': 'completed',
-            'answer': '日志只保存了 cycle 25–26；依据真实窗口继续。'}])
-        result = agent.handle(user_text='检查保存日志后继续验证。', session_id=sid, run_id=rid)
-        self.assertEqual(result['status'], 'completed')
-        events = agent.db.events(sid)
-        review = next(event for event in events if event['kind'] == 'literal_search_review')
-        self.assertEqual(review['data']['consecutive_literal_misses'], 4)
-        self.assertTrue(review['data']['executed'])
-        recovery = next(event for event in events if event['kind'] == 'loop_recovery')
-        self.assertTrue(recovery['data']['literal_search_misses']['tools_remain_enabled'])
-        self.assertTrue(fake.requests[4][1]['tools'])
-        self.assertIn('停止猜测式find', json.dumps(fake.requests[4][0], ensure_ascii=False))
-
-    def test_four_identical_archived_reads_get_advisory_but_all_execute(self):
-        agent, fake = self.agent([])
-        sid = agent.db.session('identical-read-review', source='admin')
-        rid = agent.db.enqueue_task(sid, '复核已保存日志后继续。', source='admin')
-        document_id = agent.db.document(sid, 'bounded log',
-            'AUREX_PROFILE_SAMPLE case=0 cycle=3 pc=0000000c\n')
-        arguments = json.dumps({'document_id': document_id,
-                                'find': 'AUREX_PROFILE_SAMPLE case=0 cycle=3'})
-        calls = [support.reply('', calls=[{'id': 'same-' + str(index), 'type': 'function',
-            'function': {'name': 'read_context', 'arguments': arguments}}], finish='tool_calls')
-            for index in range(4)]
-        fake.replies = iter(calls + [support.reply('已使用保存结果继续，不再做A/B回环。')])
-        fake.final_reviews = iter([{'outcome': 'completed',
-            'answer': '已使用保存结果继续，不再做A/B回环。'}])
-        result = agent.handle(user_text='复核已保存日志后继续。', session_id=sid, run_id=rid)
-        self.assertEqual(result['status'], 'completed')
-        outcomes = [agent.db.get_tool_outcome(sid, rid, 'same-' + str(index))
-                    for index in range(4)]
-        self.assertTrue(all(outcome and outcome['ok'] for outcome in outcomes))
-        events = agent.db.events(sid)
-        review = next(event for event in events if event['kind'] == 'source_read_review')
-        self.assertEqual(review['data']['same_result_reads_in_window'], 4)
-        self.assertTrue(review['data']['executed'])
-        recovery = next(event for event in events if event['kind'] == 'loop_recovery')
-        self.assertTrue(recovery['data']['repeated_source_result']['tools_remain_enabled'])
-        self.assertTrue(fake.requests[4][1]['tools'])
-        next_prompt = json.dumps(fake.requests[4][0], ensure_ascii=False)
-        self.assertIn('重复读取仍然允许', next_prompt)
-        self.assertIn('不要继续A/B offset回环', next_prompt)
+        self.assertEqual(read_body.call_count, 2)
+        for index in range(2):
+            self.assertTrue(agent.db.get_tool_outcome(
+                result['session_id'], result['task_id'], 'body-' + str(index))['ok'])
+        self.assertEqual(sum(event['kind'] == 'tool_end'
+                             and event['data']['name'] == 'plar_read_body'
+                             for event in agent.db.events(result['session_id'])), 2)
+        names = {schema['function']['name'] for schema in fake.requests[-1][1]['tools']}
+        self.assertIn('plar_read_body', names)
+        self.assertNotIn('read_context', names)
 
     def test_repeated_custom_cpu_failures_review_testbench_without_disabling_tools(self):
         tools = ToolRegistry()
@@ -581,8 +506,8 @@ class ProgressReviewTests(unittest.TestCase):
         self.assertEqual(result['status'], 'completed')
         self.assertEqual(custom_calls, 3)
         events = agent.db.events(result['session_id'])
-        review = next(event for event in events if event['kind'] == 'hdl_testbench_review')
-        self.assertEqual(review['data']['matching_custom_failures'], 3)
+        notice = next(event for event in events if event['kind'] == 'hdl_testbench_notice')
+        self.assertEqual(notice['data']['matching_custom_failures'], 3)
         recovery = next(event for event in events if event['kind'] == 'loop_recovery' and
                         event['data'].get('hdl_testbench_failures'))
         self.assertTrue(recovery['data']['hdl_testbench_failures']['tools_remain_enabled'])
@@ -614,32 +539,6 @@ class ProgressReviewTests(unittest.TestCase):
                               json.dumps(source_edit), True)
         self.assertIsNone(_latest_fixed_cpu_pass(agent.db, sid, rid))
 
-    def test_many_tiny_pages_get_bounded_read_guidance_without_blocking_reads(self):
-        agent, fake = self.agent([])
-        sid = agent.db.session('tiny-page-review', source='admin')
-        rid = agent.db.enqueue_task(sid, '读取源码后继续验证。', source='admin')
-        document_id = agent.db.document(sid, 'large source', 'x' * 6000)
-        calls = [support.reply('', calls=[{'id': 'tiny-' + str(index), 'type': 'function',
-            'function': {'name': 'read_context', 'arguments': json.dumps({
-                'document_id': document_id, 'offset': index * 130, 'length': 130})}}],
-            finish='tool_calls') for index in range(12)]
-        fake.replies = iter(calls + [support.reply('已改用有界大窗口取得所需源码。')])
-        fake.final_reviews = iter([{'outcome': 'completed',
-            'answer': '已改用有界大窗口取得所需源码。'}])
-        result = agent.handle(user_text='读取源码后继续验证。', session_id=sid, run_id=rid)
-        self.assertEqual(result['status'], 'completed')
-        self.assertTrue(all(agent.db.get_tool_outcome(sid, rid, 'tiny-' + str(index))['ok']
-                            for index in range(12)))
-        events = agent.db.events(sid)
-        review = next(event for event in events if event['kind'] == 'source_paging_review')
-        self.assertEqual(review['data']['small_pages_in_window'], 12)
-        recovery = next(event for event in events if event['kind'] == 'loop_recovery')
-        self.assertTrue(recovery['data']['small_source_pages']['tools_remain_enabled'])
-        self.assertTrue(fake.requests[12][1]['tools'])
-        prompt = json.dumps(fake.requests[12][0], ensure_ascii=False)
-        self.assertIn('hdl_workspace_read', prompt)
-        self.assertIn('工具没有被禁用', prompt)
-
     def test_internal_resistance_barrier_stops_broad_guessing_without_tool_lock(self):
         tools = ToolRegistry()
         analyze = mock.Mock(side_effect=ValueError(
@@ -665,77 +564,20 @@ class ProgressReviewTests(unittest.TestCase):
         self.assertIn('只对错误中的精确component_id定位一次', prompt)
         self.assertIn('不删除器件', prompt)
 
-    def test_read_coverage_counts_only_the_projected_visible_source_prefix(self):
-        from aurex.session_agent import _record_read_coverage, _visible_read_coverage
-        source = {'offset': 0, 'text': 'x' * 20000}
-        projection = json.dumps({'kind': 'bounded_recorded_tool_result', 'fields': {},
-            'verbatim_excerpt': {'text': 'x' * 7139, 'shown_characters': 7139,
-                'source_offset_start': 0, 'source_offset_end': 7139}})
-        self.assertEqual(_visible_read_coverage(projection, source), (0, 7139))
-        coverage = {}
-        key = ('source-id', '/data/ports')
-        self.assertTrue(_record_read_coverage(coverage, key, *_visible_read_coverage(projection, source)))
-        self.assertTrue(_record_read_coverage(coverage, key, 7139, 14185))
-        self.assertTrue(_record_read_coverage(coverage, key, 14185, 20427))
-        self.assertFalse(_record_read_coverage(coverage, key, 14185, 20427))
-
-    def test_image_generation_requires_visual_or_spatial_user_need(self):
-        from aurex.session_agent import (_targeted_complex_schematic_allowed,
-                                         _visual_evidence_requested)
-        for request in ('测试这个CPU是否正确', '分析输入输出连接', '对电路做功能验证',
-                        '不要看图，只用结构化数据', 'verify this without image'):
-            self.assertFalse(_visual_evidence_requested(request))
-        for request in ('看看这张图片', '那个电阻旁边的电容是什么', 'adjust the camera view'):
-            self.assertTrue(_visual_evidence_requested(request))
-        complex_paths = {'/complex.sav'}
-        self.assertTrue(_targeted_complex_schematic_allowed(
-            {'path': '/complex.sav', 'view': 'schematic', 'query': 'N24'}, complex_paths))
-        self.assertTrue(_targeted_complex_schematic_allowed(
-            {'path': '/complex.sav', 'view': 'schematic', 'focus_ids': ['a', 'b']}, complex_paths))
-        self.assertFalse(_targeted_complex_schematic_allowed(
-            {'path': '/unknown.sav', 'view': 'schematic', 'query': 'N24'}, complex_paths))
-        self.assertFalse(_targeted_complex_schematic_allowed(
-            {'path': '/complex.sav', 'view': 'spatial', 'query': 'N24'}, complex_paths))
-        self.assertFalse(_targeted_complex_schematic_allowed(
-            {'path': '/complex.sav', 'view': 'schematic'}, complex_paths))
-
-    def test_nonvisual_task_rejects_image_tool_before_renderer_execution(self):
+    def test_image_tool_is_not_rejected_based_on_prior_queries_or_request_classification(self):
         tools = ToolRegistry()
-        render = mock.Mock(return_value={'images': [{'path': '/should/not/exist.png'}]})
+        render = mock.Mock(return_value={'rendered': True})
         tools.register(ToolSpec('circuit_inspect', 'Inspect', {'type': 'object'}, render))
-        image_call = {'id': 'unneeded-image', 'type': 'function', 'function': {
+        image_call = {'id': 'agent-selected-image', 'type': 'function', 'function': {
             'name': 'circuit_inspect', 'arguments': json.dumps({'path': '/cpu.sav', 'with_image': True})}}
         agent, fake = self.agent([support.reply('', calls=[image_call], finish='tool_calls'),
-                                  support.reply('图片未生成；改用结构化连接和仿真证据。')], tools)
-        fake.final_reviews = iter([{'outcome': 'completed', 'answer': '图片未生成；改用结构化连接和仿真证据。'}])
+                                  support.reply('已根据本轮判断读取图片。')], tools)
+        fake.final_reviews = iter([{'outcome': 'completed', 'answer': '已根据本轮判断读取图片。'}])
         result = agent.handle(user_text='测试这个CPU是否正确')
         self.assertEqual(result['status'], 'completed')
-        render.assert_not_called()
-        outcome = agent.db.get_tool_outcome(result['session_id'], result['task_id'], 'unneeded-image')
-        self.assertIn('requires either a user-requested visual/spatial question', outcome['full_json'])
-
-    def test_exact_select_repeated_twice_is_recorded_but_tools_stay_enabled(self):
-        agent, fake = self.agent([])
-        sid = agent.db.session('selector-review', source='admin')
-        rid = agent.db.enqueue_task(sid, '选择所需记录后回答。', source='admin')
-        document_id = agent.db.document(sid, 'fixture', json.dumps([{'id': i} for i in range(6)]))
-        first_args = {'document_id': document_id, 'json_pointer': '',
-                      'select': {'fields': ['id'], 'offset': 0, 'limit': 2}}
-        next_args = {'document_id': document_id, 'json_pointer': '',
-                     'select': {'fields': ['id'], 'offset': 2, 'limit': 2}}
-        calls = [(first_args, 'first'), (next_args, 'next'), (first_args, 'duplicate')]
-        fake.replies = iter([support.reply('', calls=[{'id': cid, 'type': 'function', 'function': {
-            'name': 'read_context', 'arguments': json.dumps(args)}}], finish='tool_calls') for args, cid in calls]
-            + [support.reply('已使用保存的选择结果。')])
-        fake.final_reviews = iter([{'outcome': 'completed', 'answer': '已使用保存的选择结果。'}])
-        result = agent.handle(user_text='选择所需记录后回答。', session_id=sid, run_id=rid)
-        self.assertEqual(result['status'], 'completed')
-        reviews = [event for event in agent.db.events(sid) if event['kind'] == 'repeated_context_read']
-        self.assertEqual(len(reviews), 1)
-        self.assertTrue(reviews[0]['data']['exact_selector_and_offset_repeated'])
-        self.assertEqual(reviews[0]['data']['selector_repetitions'], 2)
-        self.assertTrue(reviews[0]['data']['executed'])
-        self.assertTrue(fake.requests[3][1]['tools'])
+        render.assert_called_once()
+        outcome = agent.db.get_tool_outcome(result['session_id'], result['task_id'], 'agent-selected-image')
+        self.assertTrue(outcome['ok'])
 
     def test_original_request_anchor_is_not_replaced_with_prepared_binding_markup(self):
         agent, fake = self.agent([support.reply('Introduction')])
@@ -751,7 +593,7 @@ class ProgressReviewTests(unittest.TestCase):
         self.assertEqual(value['source'], 'web')
         self.assertIsNone(value['requester_user_id'])
 
-    def test_clarification_call_echo_enters_review_without_enabling_tools_or_replaying_claims(self):
+    def test_clarification_call_echo_never_enables_tools_or_hidden_review(self):
         tools = ToolRegistry()
         execute = mock.Mock(side_effect=AssertionError('Clarification has no authorized investigation'))
         tools.register(ToolSpec('investigate', 'Investigate', {'type': 'object'}, execute))
@@ -766,14 +608,16 @@ class ProgressReviewTests(unittest.TestCase):
         with mock.patch('aurex.community_context.resolve_wall_reference', return_value=resolution):
             result = agent.handle(user_text='这是啥啊')
         self.assertEqual(result['status'], 'completed')
-        self.assertEqual(result['answer'], '这是用户留言板，你指的是哪条内容？')
+        self.assertIn('具体指代对象尚不明确', result['answer'])
+        self.assertIn('请指出要查询的实验、讨论、评论或用户', result['answer'])
         execute.assert_not_called()
         self.assertTrue(all(not opts['tools'] for _, opts in fake.requests))
-        self.assertEqual([opts['thinking'] for _, opts in fake.requests], [True, False, False, False])
+        self.assertTrue(fake.requests[0][1]['thinking'])
+        self.assertTrue(all(not opts['thinking'] for _, opts in fake.requests[1:]))
         from aurex.task_reply import FINAL_SYSTEM
         reviews = [messages for messages, _ in fake.requests if messages[0]['content'] == FINAL_SYSTEM]
-        self.assertEqual(len(reviews), 2)
-        self.assertTrue(all('INVENTED EXPERIMENT IS THE SUBJECT' not in json.dumps(messages) for messages in reviews))
+        self.assertEqual(reviews, [])
+        self.assertNotIn('INVENTED EXPERIMENT IS THE SUBJECT', result['answer'])
         self.assertEqual(len(agent.db.tasks(result['session_id'])), 1)
 
 

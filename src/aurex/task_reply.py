@@ -1,4 +1,4 @@
-"""Independent thinking for a task's sole final answer and at-most-once posting.
+"""Deterministic finalization and at-most-once posting for one task.
 
 No entry point is registered as a model tool. Task identity/targets are immutable
 server metadata. The community ReplyID is the requester user ID, not a comment ID.
@@ -98,6 +98,39 @@ def _defer(scope, *, blocked: bool, reason: str) -> dict:
     return {'outcome': 'blocked' if blocked else 'continue', 'answer': reason,
             'task_id': scope['task_id'], 'review_id': None, 'state': 'context_blocked' if blocked else 'review_retry',
             'needs_attention': blocked}
+
+
+def finalize_review_blocked(runtime, answer: str, db, session_id: str, run_id: str,
+                            *, review_document_id: str | None = None) -> dict:
+    """Persist one server-owned blocked final answer without another model turn.
+
+    A reviewer may keep returning ``continue`` when a solver/import problem is
+    not actionable. Re-entering the execution agent in that case creates an
+    unbounded loop. The second continuation is therefore converted into one
+    honest, idempotent blocked reply; delivery still goes through the normal
+    exactly-once publication receipt path.
+    """
+    scope = _scope(runtime, session_id)
+    text = str(answer or '').strip() or '当前任务未能完成，已取得的证据不足以继续可靠验证。'
+    if not text.startswith('任务未完成'):
+        text = '任务未完成：' + text
+    mention = publishing.requester_mention(scope, user=getattr(runtime, 'user', None))
+    if mention:
+        text = mention + ' ' + text
+    account = getattr(unwrap_user(runtime.user), 'user_id', None) if getattr(runtime, 'user', None) else None
+    with publishing._operation_lock(runtime.cache_dir, _lock_id(runtime.task_id)):
+        old = _existing(runtime, scope)
+        if old:
+            return _result(old)
+        document_id = review_document_id or db.document(
+            session_id, 'Forced blocked final review after continuation cap', text)
+        review_id = uuid.uuid4().hex
+        with publishing._db(runtime.cache_dir) as store:
+            now = time.time()
+            store.execute('INSERT INTO task_final_answers VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)',
+                (run_id, review_id, session_id, account, scope['binding_sha256'], 'reviewed', text,
+                 document_id, None, None, now, now, 'blocked'))
+    return _result(_existing(runtime, scope))
 
 
 def _model_json(text: str):
@@ -292,6 +325,80 @@ def finalize_short_community_answer(runtime, draft: str, client, db, session_id:
             'tool_evidence_count': len(evidence), 'thinking': False,
             'fallback': fallback_reason, 'agent_feedback_loop': False})
         return _result(_existing(runtime, scope))
+
+
+def finalize_direct_answer(runtime, draft: str, db, session_id: str, run_id: str,
+                           emit, *, outcome: str = 'completed') -> dict:
+    """Persist the execution agent's one final answer without a second reviewer.
+
+    The execution loop already owns task reasoning and evidence selection. A
+    second model used as a completion gate can turn a finished task into a
+    reviewer ``continue`` loop. Finalization is deterministic: clean model
+    routing markup, attach the immutable server mention, write the exactly-once
+    ledger row, and let ``post_reviewed_reply`` handle delivery receipts.
+
+    ``review_id`` remains the historical ledger column name for compatibility;
+    it is an opaque final-answer receipt ID, not approval from another model.
+    """
+    if run_id != runtime.task_id:
+        raise ToolError('最终回复必须绑定同一个持久化任务ID。')
+    if outcome not in {'completed', 'blocked'}:
+        raise ToolError('direct final answer outcome must be completed or blocked')
+    _cancel(runtime)
+    scope = _scope(runtime, session_id)
+    with publishing._operation_lock(runtime.cache_dir, _lock_id(runtime.task_id)):
+        old = _existing(runtime, scope)
+        if old:
+            return _result(old)
+        candidate = _clean_short_public_answer(draft, scope)
+        if not candidate:
+            candidate = '当前已取得的证据不足以形成更具体的结论。'
+
+        # Publication is an explicit external action. Never turn a missing or
+        # ambiguous publication receipt into a completed public claim merely
+        # because the execution model produced a confident draft.
+        final_outcome = outcome
+        publication_note = ''
+        if scope.get('explicit_publish_requested') and not publishing.runtime_dry_run(runtime, scope):
+            try:
+                receipt = publishing.publication_authorization(
+                    runtime.cache_dir, session_id, task_id=runtime.task_id)
+            except publishing.PublicationError as exc:
+                receipt = {'state': 'not_authorized', 'error': str(exc)}
+            state = receipt.get('state') if isinstance(receipt, dict) else None
+            if state != 'published':
+                final_outcome = 'blocked'
+                publication_note = (
+                    '外部发布尚未取得成功回执，不能声称已发布；已保留本地验证结果，'
+                    '不会自动重复提交。'
+                )
+        if publication_note and publication_note not in candidate:
+            candidate = candidate.rstrip() + '\n\n' + publication_note
+
+        mention = publishing.requester_mention(scope, user=getattr(runtime, 'user', None))
+        answer = mention + ' ' + candidate if mention else candidate
+        account = (getattr(unwrap_user(runtime.user), 'user_id', None)
+                   if getattr(runtime, 'user', None) else None)
+        document_id = db.document(session_id, 'Direct final answer', json.dumps({
+            'draft': str(draft or ''),
+            'answer_without_server_mention': candidate,
+            'outcome': final_outcome,
+            'publication_note': publication_note,
+        }, ensure_ascii=False))
+        review_id = uuid.uuid4().hex
+        with publishing._db(runtime.cache_dir) as store:
+            now = time.time()
+            store.execute('INSERT INTO task_final_answers VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)',
+                (run_id, review_id, session_id, account, scope['binding_sha256'], 'reviewed',
+                 answer, document_id, None, None, now, now, final_outcome))
+        emit('direct_finalized', {
+            'review_id': review_id,
+            'outcome': final_outcome,
+            'document_id': document_id,
+            'agent_feedback_loop': False,
+            'external_reviewer': False,
+        })
+    return _result(_existing(runtime, scope))
 
 
 def review_final_answer(runtime, draft: str, client, db, session_id: str, run_id: str, emit,
@@ -522,8 +629,8 @@ def finalize_timeout_reply(runtime, timeout_sec: int) -> dict:
     reply after the execution deadline has cancelled further agent/tool work.
     Existing ambiguous or completed delivery state is never overwritten.
     """
-    if type(timeout_sec) is not int or not 1 <= timeout_sec <= 1800:
-        raise ToolError('任务超时秒数必须是1到1800之间的整数。')
+    if type(timeout_sec) is not int or timeout_sec <= 0:
+        raise ToolError('任务超时秒数必须是正整数。')
     scope = publishing.task_action_scope(runtime.cache_dir, task_id=runtime.task_id,
                                          session_id=getattr(runtime, 'session_id', None))
     answer = f'当前任务到达时间上限{timeout_sec}s，已经停止，请简化问题。'
@@ -561,7 +668,7 @@ def post_reviewed_reply(runtime, review_id: str, *, _timeout_delivery: bool = Fa
     with publishing._operation_lock(runtime.cache_dir, _lock_id(runtime.task_id)):
         row = _existing(runtime, scope)
         if not row or row['review_id'] != review_id:
-            raise ToolError('最终回复没有匹配当前任务的独立思考审核记录。')
+            raise ToolError('最终回复没有匹配当前任务的唯一持久化记录。')
         if row['state'] in {'replied', 'local_delivered', 'unknown'}:
             return _result(row)
         if row['state'] == 'replying':

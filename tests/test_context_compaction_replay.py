@@ -55,10 +55,26 @@ class ReplayTests(unittest.TestCase):
             return db.execute('SELECT content FROM documents WHERE id=?', (did,)).fetchone()[0]
 
     def test_large_tool_is_machine_projection_not_per_tool_LLM(self):
-        data = {'state_path': '/immutable/result.pe-state.json', 'statistics': {'components': 39, 'wires': 55},
+        data = {'state_path': '/immutable/result.pe-state.json',
+            'circuit_path': '/immutable/design.circuit.json',
+            'statistics': {'components': 39, 'wires': 55, 'nodes': 47,
+                           'component_types': {'Logic Input': 9, 'Gate': 30}},
+            'camera': {'saved_raw': {'large': 'camera ' * 2000},
+                       'warnings': ['renderer metadata']},
+            'netlist': {'components': [{'id': f'uuid-{i}', 'ref': f'C{i}',
+                'type': 'Gate', 'properties': {'large': 'x' * 1000},
+                'native': {'pl_source': {'assumptions': ['long'] * 20}}}
+                for i in range(39)], 'nodes': []},
             'measurements': {'transient': {'actual_stop_s': .01, 'completed_steps': 100,
                 'requested_step_s': .0001, 'digital_propagation': {'per_tr_step': 3,
-                'completed_propagation_steps': 300}}, 'components': []}, 'untrusted_prose': 'wrong guess ' * 9000}
+                'completed_propagation_steps': 300}},
+                'component_scope': {'total': 39, 'shown': 8, 'omitted': 31,
+                    'complete_state_path': '/immutable/result.pe-state.json',
+                    'read_more': 'long repeated instruction ' * 100},
+                'components': [{'id': f'uuid-{i}', 'type': 'Gate',
+                    'digital': [i % 2], 'pl_source': {'source_ref': f'C{i}',
+                    'assumptions': ['large repeated import note'] * 30}}
+                    for i in range(8)]}, 'untrusted_prose': 'wrong guess ' * 9000}
         _, did, _, raw = self.tool('circuit_analyze', data)
         before = self.db.messages(self.sid)
         result = self.budget.tool_document('analysis', raw, document_id=did, tool_name='circuit_analyze')
@@ -67,10 +83,33 @@ class ReplayTests(unittest.TestCase):
         self.assertEqual(projected['full_result_sha256'], hashlib.sha256(raw.encode()).hexdigest())
         self.assertEqual(projected['fields']['/data/state_path'], data['state_path'])
         self.assertEqual(projected['fields']['/data/measurements/transient']['completed_steps'], 100)
+        self.assertEqual(projected['fields']['/data/statistics'],
+                         {'components': 39, 'wires': 55, 'nodes': 47})
+        self.assertEqual(projected['fields']['/data/measurements/component_scope'],
+                         {'total': 39, 'shown': 8, 'omitted': 31})
+        self.assertNotIn('/data/netlist/components', projected['sections'])
+        self.assertNotIn('/data/netlist/nodes', projected['sections'])
+        self.assertNotIn('/data/camera', projected['fields'])
+        self.assertNotIn('/data/measurements/components', projected['sections'])
+        self.assertEqual(projected['projection_contract'],
+                         'aurex.circuit-analysis-result.v2; solve evidence only; netlist/renderer/import metadata omitted')
         self.assertEqual(self.document(did), raw)
         self.assertEqual(self.db.messages(self.sid), before)
-        self.assertLessEqual(self.client.count([{'role': 'user', 'content': result}]), 4096)
+        self.assertLessEqual(self.client.count([{'role': 'user', 'content': result}]), 1536)
         self.assertEqual(self.client.calls, [])
+
+    def test_circuit_failure_projection_keeps_actionable_error(self):
+        data = {'error': "stimulus[0] targets 'digital_output', not digital_input",
+                'type': 'ToolError',
+                'netlist': {'components': [{'native': {'large': 'x' * 10000}}]}}
+        _, did, _, raw = self.tool('circuit_analyze', data, ok=False)
+        result = json.loads(self.budget.tool_document(
+            'analysis failure', raw, document_id=did,
+            tool_name='circuit_analyze'))
+        self.assertFalse(result['fields']['/ok'])
+        self.assertEqual(result['fields']['/data/error'], data['error'])
+        self.assertEqual(result['fields']['/data/type'], 'ToolError')
+        self.assertNotIn('/data/netlist/components', result['sections'])
 
     def test_non_json_display_uses_raw_outcome_and_retains_source_documents(self):
         data = {'id': 'source-doc', 'offset': 9, 'total_chars': 90000, 'text': 'verbatim ' * 9000,
@@ -81,7 +120,12 @@ class ReplayTests(unittest.TestCase):
             tool_name='read_context', tool_args={'document_id': 'source-doc', 'json_pointer': '/module/ports'}))
         self.assertEqual(result['fields']['/data/id'], 'source-doc')
         self.assertEqual(result['fields']['/data/offset'], 9)
-        self.assertEqual(result['requested_source']['json_pointer'], '/module/ports')
+        self.assertEqual(result['legacy_requested_source']['json_pointer'], '/module/ports')
+        self.assertEqual(result['legacy_source_request']['json_pointer'], '/module/ports')
+        self.assertEqual(result['retrieval'],
+                         'legacy_archived_page_not_available_as_an_agent_tool')
+        self.assertEqual(result['tool_result_document_id_usage'], 'operator_audit_only')
+        self.assertNotIn('requested_source', result)
         self.assertEqual(result['presentation_source_documents']['state_path']['document_id'], 'native-state-doc')
         self.assertEqual(self.document(result['full_presentation_document_id']), presentation)
         self.assertTrue(data['text'].startswith(result['verbatim_excerpt']['text']))
@@ -90,14 +134,16 @@ class ReplayTests(unittest.TestCase):
     def test_projection_keeps_discovered_IDs_without_ranges_or_invention(self):
         ports = [{'id': f'input-{i:032x}', 'ref': 'C' + str(i + 1), 'direction': 'input', 'label': None,
                   'position': [i, 2, 3], 'statistics': {'large': 'x' * 1000}} for i in range(45)]
-        _, did, _, raw = self.tool('circuit_inspect', {'ports': ports, 'total_inputs': 45, 'total_outputs': 0,
+        _, did, _, raw = self.tool('circuit_inspect', {'interface_only': True,
+                                                   'ports': ports, 'total_inputs': 45, 'total_outputs': 0,
                                                    'total_ports': 45, 'offset': 0, 'has_more': False})
         projected = json.loads(self.budget.tool_document('ports', raw, document_id=did))
         rows = projected['sections']['/data/ports']
         self.assertEqual(rows['shown_rows'], 45)
-        self.assertEqual([r['value']['id'] for r in rows['rows']], [p['id'] for p in ports])
+        id_column = rows['columns'].index('id')
+        self.assertEqual([r[id_column] for r in rows['rows']], [p['id'] for p in ports])
         self.assertEqual(rows['omitted_rows'], 0)
-        self.assertFalse(any(r['full_row'] for r in rows['rows']))
+        self.assertTrue(rows['columnar_exact_values'])
         self.assertEqual(self.client.calls, [])
 
     def test_HDL_tool_success_never_hides_failed_simulation(self):

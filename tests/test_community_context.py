@@ -43,7 +43,9 @@ class CommunityContextTests(unittest.TestCase):
         self.assertEqual(out["original"]["body"], body)
         self.assertFalse(out["text_truncated"])
         self.assertFalse(out["comments_incomplete"])
-        self.assertEqual(len(out["comments"]), 21)
+        self.assertEqual(len(out["comments"]), 16)
+        self.assertEqual([item["id"] for item in out["comments"]], [str(i) for i in range(4, 20)])
+        self.assertEqual(out["chat"]["selection"]["count_limit"], 16)
 
     def test_raw_comments_persist_and_rehydrate(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -53,7 +55,11 @@ class CommunityContextTests(unittest.TestCase):
             with mock.patch("aurex.community_context.plar.get_user_by_id", return_value={"User": {"ID": "wall"}}):
                 build_mention_context(object(), target_type="User", target_id="wall", comments=[raw], context_db=db)
                 out = build_mention_context(object(), target_type="User", target_id="wall", comments=[], context_db=db)
-            self.assertEqual(out['source_archive']['inline_fallback']['scanned_comments_original'][0]['Flags'], [1])
+            stored = db.get_target_context(target_key='User:wall', take=10)
+            self.assertEqual(stored['comments'][0]['raw']['Flags'], [1])
+            self.assertNotIn('inline_fallback', out['source_archive'])
+            self.assertNotIn('document_id', out['source_archive'])
+            self.assertNotIn('retrieval', out['source_archive'])
             self.assertNotIn('raw', out['comments'][0])
             self.assertEqual(out["chat"]["scope"], "user_wall")
 
@@ -96,6 +102,8 @@ class CommunityContextTests(unittest.TestCase):
         self.assertGreater(len(json.dumps(archives['doc-id'], ensure_ascii=False)), 12000)
         self.assertEqual(archives['doc-id']['scanned_comments_original'][0]['Content'], comments[0]['Content'])
         self.assertNotIn('inline_fallback', out['source_archive'])
+        self.assertNotIn('document_id', out['source_archive'])
+        self.assertNotIn('retrieval', out['source_archive'])
 
     def test_summary_author_and_comment_authors_are_separate_and_nested_summary_is_unwrapped(self):
         summary = {'Data': {'Summary': {'Subject': '原作者实验', 'Description': '完整正文', 'Image': 0,
@@ -176,6 +184,80 @@ class CommunityContextTests(unittest.TestCase):
             self.assertNotIn(key, out['user_profile'])
         self.assertNotIn('opaque-linked-account-id', json.dumps(out))
         self.assertEqual(archived[0]['user_profile_api_response'], {'User': original})
+
+    def test_original_projection_never_falls_back_to_circuit_content_or_nested_state(self):
+        sid = 'abcdef123456789012345678'
+        huge_circuit = '{"Elements":[' + '"wire",' * 200000 + ']}'
+        summary = {'Data': {'Summary': {
+            'ID': sid, 'Subject': '只有标题', 'Description': {'Content': huge_circuit},
+            'Content': huge_circuit,
+            'User': {'ID': 'creator', 'Nickname': '作者', 'Secrets': huge_circuit},
+            'Settings': {'StatusSave': huge_circuit}, 'Tags': ['电学'],
+            'Images': ([{'URL': 'https://example.org/' + 'x' * 3000}] +
+                       [{'URL': f'https://example.org/{index}.jpg'} for index in range(20)])}}}
+        with mock.patch('aurex.community_context.plar.get_summary', return_value=summary):
+            out = build_mention_context(object(), target_type='Experiment', target_id=sid,
+                                        comments=[], download_images=False)
+        self.assertIsNone(out['original']['body'])
+        self.assertEqual(out['original']['author'], {
+            'user_id': 'creator', 'nickname': '作者', 'source': 'GetSummary.Summary.User'})
+        self.assertEqual(out['original']['classification_and_state_raw'], {'Tags': ['电学']})
+        self.assertEqual(len(out['images']), 1)
+        self.assertEqual(out['images'][0]['url'], 'https://example.org/0.jpg')
+        encoded = json.dumps(out, ensure_ascii=False)
+        self.assertNotIn('Elements', encoded)
+        self.assertNotIn('StatusSave', encoded)
+        self.assertNotIn('Secrets', encoded)
+
+    def test_no_trigger_scan_is_target_specific_and_never_activates_all_history(self):
+        records = [{'ID': f'c{index}', 'Timestamp': 1700000000000 + index,
+                    'Content': f'完整-{index}'} for index in range(100)]
+        with mock.patch('aurex.community_context.plar.get_summary', return_value={'Data': {'Description': '正文'}}):
+            post = build_mention_context(object(), target_type='Experiment',
+                target_id='abcdef123456789012345678', comments=records, download_images=False)
+        with mock.patch('aurex.community_context.plar.get_user_by_id', return_value={'User': {'ID': 'wall'}}):
+            wall = build_mention_context(object(), target_type='User', target_id='wall',
+                                         comments=records, download_images=False)
+        self.assertEqual([item['id'] for item in post['comments']], [f'c{i}' for i in range(84, 100)])
+        self.assertEqual([item['id'] for item in wall['comments']], [f'c{i}' for i in range(68, 100)])
+        self.assertEqual(post['chat']['selection']['excluded'], 84)
+        self.assertEqual(wall['chat']['selection']['excluded'], 68)
+        for result in (post, wall):
+            for item in result['comments']:
+                self.assertNotIn('raw', item)
+                self.assertNotIn('replies', item)
+            self.assertNotIn('inline_fallback', result['source_archive'])
+
+    def test_trigger_scan_prioritizes_reply_chain_and_requester_with_whole_text_budget(self):
+        sid = 'abcdef123456789012345678'
+        base = 1700000000000
+        records = []
+        for index in range(72):
+            author = 'requester' if index % 2 == 0 else 'background'
+            records.append({'ID': f'c{index}', 'TargetID': sid, 'TargetType': 'Experiment',
+                            'UserID': author, 'Timestamp': base + index,
+                            'Content': (f'comment-{index}-' + '甲' * 3990 + f'-end-{index}')})
+        trigger = {'ID': 'trigger', 'TargetID': sid, 'TargetType': 'Experiment',
+                   'UserID': 'requester', 'Timestamp': base + 100,
+                   'ReplyCommentID': 'c1', 'Content': '@aurex 请分析'}
+        captured = []
+        with mock.patch('aurex.community_context.plar.get_summary', return_value={'Data': {'Description': '正文'}}):
+            out = build_mention_context(object(), target_type='Experiment', target_id=sid,
+                comment=trigger, comments=records, archive_sink=lambda title, text: captured.append(text) or 'audit-id',
+                download_images=False)
+        ids = [item['id'] for item in out['comments']]
+        self.assertIn('trigger', ids)
+        self.assertIn('c1', ids)
+        self.assertLessEqual(len(ids), 16)
+        self.assertLessEqual(sum(len(item['text']) for item in out['comments'] if item['id'] != 'trigger'), 24_000)
+        self.assertEqual(out['chat']['selection']['text_character_limit'], 24_000)
+        for item in out['comments']:
+            if item['id'].startswith('c'):
+                self.assertTrue(item['text'].endswith(item['id'].removeprefix('c')))
+        self.assertGreater(out['chat']['selection']['omitted_due_text_character_limit'], 0)
+        self.assertTrue(captured)
+        self.assertNotIn('document_id', out['source_archive'])
+        self.assertNotIn('retrieval', out['source_archive'])
 
     def wall_reference_fixture(self):
         return {'target': {'type': 'User', 'id': 'wall'}, 'trigger': {'id': 'c'},

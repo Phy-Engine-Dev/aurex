@@ -79,6 +79,9 @@ class QueryPaginationTests(unittest.TestCase):
         jsonschema.validate({"category": "Experiment", "sort": "Popularity", "skip": 24, "seen_ids": ["a"]}, schema)
         for term in ("Default", "from_skip", "Popularity", "skip", "seen_ids"):
             self.assertIn(term, PLAR_QUERY_TOOL["description"])
+        for contract in ("cannot provide or prove", "popularity/ranking formula",
+                         "must not be used to infer an internal algorithm"):
+            self.assertIn(contract, PLAR_QUERY_TOOL["description"])
         with self.assertRaises(jsonschema.ValidationError):
             jsonschema.validate({"category": "Experiment", "seen_ids": "a"}, schema)
 

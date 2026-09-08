@@ -245,6 +245,13 @@ class TaskControlHTTPTests(unittest.TestCase):
         conn.request("POST",path,json.dumps(value),headers)
         response=conn.getresponse();result=json.loads(response.read());status=response.status;conn.close()
         return status,result
+    def get_request(self,path,*,auth=True):
+        conn=http.client.HTTPConnection("127.0.0.1",self.server.server_port,timeout=3)
+        headers={}
+        if auth:headers["Authorization"]="Bearer test-task-control"
+        conn.request("GET",path,headers=headers)
+        response=conn.getresponse();result=json.loads(response.read());status=response.status;conn.close()
+        return status,result
     def test_cancel_endpoint_then_queued_worker_does_not_call_agent(self):
         code,result=self.request("/api/sessions/web/cancel",{"run_id":self.rid})
         self.assertEqual(code,200);self.assertEqual(result["status"],"cancelled")
@@ -302,6 +309,53 @@ class TaskControlHTTPTests(unittest.TestCase):
             self.assertFalse(response['previous_context_reused'])
             self.assertEqual(self.db.get_task(response['task_id'])['source'], 'web')
             self.assertEqual(self.db.messages(response['session_id']), [])
+
+    def test_subagent_trace_is_parent_scoped_bounded_and_hides_private_messages(self):
+        child='1'*32
+        self.db.create_subagent(self.sid,self.rid,child,'核对一个节点',{
+            'private_handoff':'must not be returned by the Web API'})
+        self.db.subagent_message(child,{'role':'assistant','content':'PRIVATE_REASONING'})
+        self.db.subagent_event(child,'model_start',{'step':1,'thinking':True})
+        document_id,message_id=self.db.subagent_tool_outcome(
+            child,child+':1:0:measure','circuit_inspect',
+            encode({'ok':True,'data':{'voltage':4.98}}),True)
+        self.db.update_subagent_tool_message(child,message_id,'voltage=4.98')
+        report={'child_id':child,'status':'completed','conclusion':'实测约 4.98 V',
+                'key_evidence':[document_id],'limitations':[],'next_action':'交还主 Agent'}
+        self.db.finish_subagent(child,'completed',report)
+
+        status,rows=self.get_request('/api/sessions/web/tasks/web-run/subagents')
+        self.assertEqual(status,200)
+        self.assertEqual(len(rows),1)
+        self.assertEqual(rows[0]['objective'],'核对一个节点')
+        self.assertEqual(rows[0]['report']['conclusion'],'实测约 4.98 V')
+        self.assertNotIn('context',rows[0])
+        status,trace=self.get_request('/api/sessions/web/tasks/web-run/subagents/'+child)
+        self.assertEqual(status,200)
+        self.assertEqual(trace['subagent']['id'],child)
+        self.assertEqual(trace['events'][0]['kind'],'model_start')
+        self.assertEqual(trace['tool_outcomes'][0]['document_id'],document_id)
+        self.assertNotIn('messages',trace)
+        self.assertNotIn('PRIVATE_REASONING',json.dumps(trace))
+        self.assertNotIn('private_handoff',json.dumps(trace))
+
+    def test_subagent_api_rejects_cross_session_parent_and_child_combinations(self):
+        child='2'*32
+        self.db.create_subagent(self.sid,self.rid,child,'owned by web',{})
+        other=self.db.session('other')
+        other_run=self.db.begin(other,'other task','other-run')
+        other_child='3'*32
+        self.db.create_subagent(other,other_run,other_child,'owned by other',{})
+        for path in (
+            '/api/sessions/other/tasks/web-run/subagents',
+            '/api/sessions/web/tasks/other-run/subagents',
+            '/api/sessions/web/tasks/web-run/subagents/'+other_child,
+            '/api/tasks/web-run/subagents',
+        ):
+            with self.subTest(path=path):
+                status,result=self.get_request(path)
+                self.assertEqual(status,404)
+                self.assertIn('error',result)
 
 class DurableFIFOTests(unittest.TestCase):
     def setUp(self):
@@ -450,6 +504,37 @@ assert(sid==='fresh-session'&&selectedTask==='fresh-task','New request kept disp
 const submitted=fetchCalls.find(row=>row.path==='/api/requests');
 assert(!('session_id' in JSON.parse(submitted.options.body)),'UI submitted the previous context');
 assert(fetchCalls.some(row=>row.path.includes('/fresh-session/events?after=0&run_id=fresh-task')),'Fresh timeline not loaded');
+""")
+
+    def test_subagents_render_as_one_foldable_parent_scoped_trace_each(self):
+        self.run_ui(r"""
+fetchCalls.length=0;
+const child='11111111111111111111111111111111';
+fetchHook=(path)=>{
+ if(path==='/api/sessions')return response([{id:'S',title:'Parent',status:'running',active_run_id:'R',updated:1}]);
+ if(path==='/api/sessions/S/events?after=0&run_id=R')return response([]);
+ if(path==='/api/sessions/S/tasks/R/subagents')return response([{id:child,objective:'核对输出节点',status:'completed'}]);
+ if(path==='/api/sessions/S/tasks/R/subagents/'+child)return response({
+  subagent:{id:child,depth:1,objective:'核对输出节点',status:'completed',report:{status:'completed',conclusion:'输出为高电平',key_evidence:['doc1'],limitations:[],next_action:'交还主 Agent'}},
+  events:[{id:1,kind:'tool_end',created:1,data:{name:'circuit_inspect',ok:true}}],
+  tool_outcomes:[{name:'circuit_inspect',ok:true,call_id:child+':1:0:x',document_id:'doc1',created:1}],
+  messages:[{data:{reasoning:'PRIVATE_CHILD_REASONING'}}]
+ });
+ return response([]);
+};
+await select('S','R');
+assert(subagentGroups.size===1,'Child did not get one foldable panel');
+const panel=subagentGroups.get(child);
+assert(panel.box.className.includes('subagent'),'Child trace is not a dedicated foldable region');
+assert(panel.heading.textContent.includes('已完成')&&panel.heading.textContent.includes('核对输出节点'),'Objective/status missing');
+assert(panel.eventBody.textContent.includes('circuit_inspect'),'Child events missing');
+assert(panel.toolBody.textContent.includes('doc1'),'Child tool evidence missing');
+assert(panel.reportBody.textContent.includes('输出为高电平'),'Compact report missing');
+assert(!JSON.stringify($('timeline')).includes('PRIVATE_CHILD_REASONING'),'Private child reasoning leaked into the UI');
+await subagents();
+assert(subagentGroups.size===1,'Polling duplicated the child panel');
+assert(fetchCalls.some(row=>row.path==='/api/sessions/S/tasks/R/subagents'),'UI did not use a session-scoped child endpoint');
+assert(!fetchCalls.some(row=>row.path==='/api/tasks/R/subagents'),'UI used the cross-session task-only endpoint');
 """)
 
 if __name__=="__main__":unittest.main()

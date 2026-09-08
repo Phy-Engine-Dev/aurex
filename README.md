@@ -9,13 +9,11 @@
 运行主机需要 Linux、Podman、两张编号为 GPU 1/2 的 V100 16 GiB、NVIDIA 容器运行时、Python 3.10+、CMake 与能编译 C++20 的 Clang 或 GCC。用于渲染电路图的 Cairo 系统库也必须可用。以下命令在仓库根目录执行：
 
 ```bash
-git clone --recurse-submodules -b aurex3 https://github.com/Phy-Engine-Dev/aurex.git aurex3
+git clone -b aurex3 https://github.com/Phy-Engine-Dev/aurex.git aurex3
 cd aurex3
 python3 -m venv .venv
 .venv/bin/python -m pip install --upgrade pip
 .venv/bin/python -m pip install -r requirements.txt
-git submodule update --init --recursive
-
 # 构建多模态 Qwen 服务；它使用 GPU 1、2，不能与开发 vllm 容器同时运行。
 bash scripts/aurex-vllm.sh start
 bash scripts/aurex-vllm.sh status
@@ -62,7 +60,7 @@ bash scripts/aurex-web.sh stop           # 停止服务，不删数据库、缓�
 
 ## 编译 Phy-Engine
 
-Phy-Engine 是唯一的 Git 子模块，固定跟踪 `Phy-Engine-Dev/Phy-Engine` 的 `aurex` 分支。首次构建或引擎代码更新后执行：
+Phy-Engine 源码直接内置在 `third-parties/Phy-Engine`，不再使用 Git 子模块，也不需要单独初始化。首次构建或引擎代码更新后执行：
 
 ```bash
 cmake -S third-parties/Phy-Engine/src -B .aurex/cache/phy-engine-build \
@@ -82,34 +80,30 @@ cmake --build .aurex/cache/phy-engine-build \
 
 | 项目 | 数量/来源 | 用途 | 是否需要联网下载 |
 |---|---:|---|---|
-| `Phy-Engine` | 1 个 Git 子模块，分支 `aurex` | 求解、HDL 转 PLSAV、SVG/PNG 电路图 | 首次 `git submodule update` 需要；构建不再拉取源码 |
+| `Phy-Engine` | 1 份内置源码，基于上游 `aurex` 分支 | 求解、HDL 转 PLSAV、SVG/PNG 电路图 | 否 |
 | `physicsLab` | 1 份内置的 MIT 许可源码，固定 2.0.6 | 官方社区登录、读取、评论与发布 API | 否 |
 
 Phy-Engine 自带 4 份 C++ 源码依赖：Eigen、Abseil、fast_io、LevelDB；它们不是嵌套子模块。默认构建关闭 LevelDB。Aurex 将 PhysicsLab 官方 SDK 和官方发布传输代码放在仓库内，`requirements.txt` 不再依赖 PyPI 的 `physicsLab` 包；Python 仍需要 `requests`、`httpx`、Pillow 等通用运行时依赖。
 
 ## 定期更新与提交
 
-日常更新前先停止 Web，保留 `.aurex/`，再更新两个目标分支、构建并运行最小验证：
+日常更新前先停止 Web，保留 `.aurex/`，再更新 `aurex3` 分支、构建并运行最小验证。内置的 Phy-Engine 会随 Aurex 一起更新：
 
 ```bash
 bash scripts/aurex-web.sh stop
 git switch aurex3
 git pull --ff-only origin aurex3
-git submodule update --init --recursive
-git -C third-parties/Phy-Engine switch aurex
-git -C third-parties/Phy-Engine pull --ff-only origin aurex
 
 cmake --build .aurex/cache/phy-engine-build --target phyengine verilog2plsav circuit_view --parallel 2
 PYTHONPATH=src .venv/bin/python -m unittest tests.test_circuit_tools tests.test_physicslab_pe_coverage -v
 bash scripts/aurex-web.sh start
 ```
 
-同步上游前，应先在独立分支审阅差异并跑测试；不要对有本地改动的部署目录执行 `reset --hard`。向官方目标仓库提交时只推送 `aurex3` 与 `aurex`，不使用 `codex/*` 分支：
+同步 Phy-Engine 上游时，应在临时目录克隆 `Phy-Engine-Dev/Phy-Engine` 的 `aurex` 分支，审阅差异后再把源码更新到 `third-parties/Phy-Engine`，随后在 Aurex 仓库中统一构建、测试和提交。不要复制临时仓库的 `.git`，也不要对有本地改动的部署目录执行 `reset --hard`。向官方目标仓库提交时只推送 `aurex3`，不使用 `codex/*` 分支：
 
 ```bash
-git -C third-parties/Phy-Engine push origin aurex
-git add .gitmodules third-parties/Phy-Engine
-git commit -m "同步 Aurex 与 Phy-Engine aurex 分支"
+git add third-parties/Phy-Engine
+git commit -m "同步内置 Phy-Engine"
 git push origin aurex3
 ```
 
@@ -252,13 +246,13 @@ Icarus Verilog运行于bubblewrap隔离文件系统/PID/网络，限制每阶段
 
 `.aurex/cache/.publication/ledger.sqlite3` 持久化task范围、审核、不可变源/封面快照、发布及最终答复回执。创建提交采用**至多一次**语义：提交前先持久化状态，重启后不会重复创建；若提交结果不确定则保留unknown并要求人工核对，不能盲目重发。已取得社区ID后，封面上传/确认可从记录阶段继续；只有确认发布成功的回执才是发布成功证据。不要把这种流程说成外部服务的“恰好一次”保证。
 
-构建输出在 `.aurex/cache/phy-engine-build`，需要支持本引擎的C++编译器与系统Cairo库。首次使用可以自动构建；大量编译应与vLLM装载错开，避免宿主RAM压力。third-party改动另提供 `third-parties/phy-engine-aurex.patch`，便于在匹配的引擎基线应用；它也包含新增源文件。
+构建输出在 `.aurex/cache/phy-engine-build`，需要支持本引擎的C++编译器与系统Cairo库。首次使用可以自动构建；大量编译应与vLLM装载错开，避免宿主RAM压力。内置源码已经包含 Aurex 所需改动，不需要额外应用补丁。`third-parties/phy-engine-aurex.patch` 只用于在独立的上游干净检出中审阅或复现历史差异。
 
-补丁基线为 Phy-Engine `cdff6c17c3f7fb28154a8f3b776efad5cb0c8920`。当前部署已应用，不要重复执行。仅在该干净基线上复现时运行：
+补丁基线为 Phy-Engine `cdff6c17c3f7fb28154a8f3b776efad5cb0c8920`。当前内置源码已应用，不要在 Aurex 工作树内重复执行。仅在单独的 Phy-Engine 干净检出中复现时运行：
 
 ```bash
-git -C third-parties/Phy-Engine apply --check ../phy-engine-aurex.patch
-git -C third-parties/Phy-Engine apply ../phy-engine-aurex.patch
+git apply --check /path/to/aurex3/third-parties/phy-engine-aurex.patch
+git apply /path/to/aurex3/third-parties/phy-engine-aurex.patch
 cmake -S third-parties/Phy-Engine/src -B .aurex/cache/phy-engine-build \
   -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_COMPILER=clang++-21 \
   -DCMAKE_C_COMPILER=clang-21 -DPHY_ENGINE_USE_LEVELDB=OFF

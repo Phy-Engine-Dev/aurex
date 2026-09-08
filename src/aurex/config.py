@@ -252,13 +252,17 @@ class AgentConfig:
     max_plan_steps: int = 10
     max_tool_loops: int = 20
     max_final_chars: int = 2000
-    # Per-task execution ceiling.  Administrators may lower it, but a single
+    # Per-task execution ceiling. Administrators may lower it, but a single
     # request must never occupy the worker for more than 30 minutes.
     task_timeout_sec: int = 1800
     dry_run: bool = False
     poll_interval_sec: float = 15.0
     comment_take: int = 20
     comment_scan_pages: int = 3
+    # Active mention context is bounded by target kind.  Full comment scans
+    # remain an operator/audit concern and never enter the first model turn.
+    community_max_related_post_comments: int = 16
+    community_max_related_user_messages: int = 32
     bootstrap_lookback_sec: int = 600
     notifications_enabled: bool = True
     notification_category_ids: list[int] = field(default_factory=lambda: [3])
@@ -479,6 +483,22 @@ def load_config(path: str) -> AurexConfig:
     task_timeout_sec = agent_raw.get("task_timeout_sec", agent_defaults.task_timeout_sec)
     if type(task_timeout_sec) is not int or not 1 <= task_timeout_sec <= 1800:
         raise ConfigError("agent.task_timeout_sec must be an integer in 1..1800")
+    community_post_comments = agent_raw.get(
+        "community_max_related_post_comments",
+        agent_defaults.community_max_related_post_comments,
+    )
+    community_user_messages = agent_raw.get(
+        "community_max_related_user_messages",
+        agent_defaults.community_max_related_user_messages,
+    )
+    if (type(community_post_comments) is not int or
+            not 1 <= community_post_comments <= 100):
+        raise ConfigError(
+            "agent.community_max_related_post_comments must be an integer in 1..100")
+    if (type(community_user_messages) is not int or
+            not 1 <= community_user_messages <= 100):
+        raise ConfigError(
+            "agent.community_max_related_user_messages must be an integer in 1..100")
     agent = AgentConfig(
         mention_tag=str(agent_raw.get("mention_tag") or agent_defaults.mention_tag),
         require_mention=bool(
@@ -512,6 +532,8 @@ def load_config(path: str) -> AurexConfig:
         poll_interval_sec=float(agent_raw.get("poll_interval_sec") or 15.0),
         comment_take=int(agent_raw.get("comment_take") or 20),
         comment_scan_pages=int(agent_raw.get("comment_scan_pages") or 3),
+        community_max_related_post_comments=community_post_comments,
+        community_max_related_user_messages=community_user_messages,
         bootstrap_lookback_sec=int(
             agent_raw.get("bootstrap_lookback_sec")
             if "bootstrap_lookback_sec" in agent_raw

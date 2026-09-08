@@ -16,6 +16,15 @@ import httpx
 import requests
 
 
+# ``None`` is a meaningful OpenAI request choice: omit ``max_tokens`` and let
+# the server use the context window that remains after the prompt.  Keep a
+# private sentinel for callers that merely omit the argument and therefore want
+# the configured default.  Without this distinction, the agent's explicit
+# ``max_tokens=None`` on its first thinking turn silently fell back to the
+# historical 4096-token configuration limit.
+_DEFAULT_MAX_TOKENS = object()
+
+
 class ModelError(RuntimeError):
     pass
 
@@ -356,14 +365,16 @@ class VLLMClient:
             worker.join(timeout=self._CLEANUP_TIMEOUT)
 
     def chat(self, messages: list[dict], *, tools: list[dict] | None = None,
-             thinking: bool | None = None, max_tokens: int | None = None,
+             thinking: bool | None = None,
+             max_tokens: int | None | object = _DEFAULT_MAX_TOKENS,
              on_delta: Callable[[str, str], None] | None = None,
              on_tick: Callable[[], None] | None = None) -> ModelReply:
         payload = {'model': self.config.model, 'messages': messages,
                    'stream': True, 'stream_options': {'include_usage': True},
                    'temperature': self.config.temperature,
                    'chat_template_kwargs': self._template_kwargs(self.config.enable_thinking if thinking is None else thinking)}
-        requested_limit = max_tokens if max_tokens is not None else self.config.max_output_tokens
+        requested_limit = (self.config.max_output_tokens
+                           if max_tokens is _DEFAULT_MAX_TOKENS else max_tokens)
         if requested_limit is not None:
             payload['max_tokens'] = requested_limit
         if tools:

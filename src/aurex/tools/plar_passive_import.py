@@ -217,11 +217,11 @@ def import_element(el: dict, *, scene: dict) -> list[dict] | None:
                   "minimum": 0.0, "maximum": 1.0, "current": position_value,
                   "rated_resistance_ohm": rated, "minimum_segment_ohm": floor}
         # The official SDK names pins 0/1 l_low/r_low and pins 2/3 l_up/r_up.
-        # The two lower binding posts are duplicate contacts to the moving
-        # wiper; the two upper posts are the resistance-wire ends.  Two
-        # variable segments plus an ideal 0<->1 wiper link preserve all four
-        # terminals, including experiments that use either lower post.
+        # Saved branch statistics establish that 0/1 are the two resistance-
+        # wire ends and 2/3 are duplicate contacts to the moving wiper. In a
+        # public SEPIC save, PL0-PL2 is branch 1 and PL1-PL3 is branch 2.
+        # Shorting PL0 to PL1 instead would short the supply rails.
         append("resistor", (0, 2), {"r": r1}, "segment_left", common)
         append("resistor", (1, 3), {"r": r2}, "segment_right", common)
-        append("switch", (0, 1), {"closed": 1}, "wiper_link", common)
+        append("switch", (2, 3), {"closed": 1}, "wiper_link", common)
     return output

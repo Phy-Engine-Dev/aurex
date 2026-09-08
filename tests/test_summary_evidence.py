@@ -126,8 +126,10 @@ class SummaryEvidenceTests(unittest.TestCase):
             seen.append((scope, ledger, messages[-1]['content']))
             self.assertIs(scope['local_slice_only'], True)
             self.assertIs(scope['absence_from_slice_is_not_nonexecution'], True)
-            self.assertIn('Absence from this slice is not evidence of absence', messages[0]['content'])
-            self.assertIn('a later slice or generated summary must not overwrite them', messages[0]['content'])
+            self.assertIn('Missing from this local SOURCE_SLICE means unknown, not absent',
+                          messages[0]['content'])
+            self.assertIn('deterministic journal override generated narrative',
+                          messages[0]['content'])
             self.assertIsNone(ledger)
             # Deliberately force a reduction. Its source is generated text, but
             # the reducer must still see the same original execution records.
@@ -323,7 +325,10 @@ class SummaryEvidenceTests(unittest.TestCase):
             scope = block(messages, 'SOURCE_SLICE_REFERENCE')
             seen.append(scope)
             self.assertNotIn('MACHINE_RECORDED_EVIDENCE (program-built', messages[-1]['content'])
-            return ('local words ' * 120 if scope['source_reference']['reduction_depth'] == 0 else 'Short narrative.')
+            # Force the first-level chunk summaries over the 2048-token
+            # checkpoint target so this fixture exercises the reducer rather
+            # than depending on an old byte-based chunk heuristic.
+            return ('local words ' * 240 if scope['source_reference']['reduction_depth'] == 0 else 'Short narrative.')
         self.client.handler = reply
         result = self.budget.summarize('raw source ' * 24000, title='checkpoint')
         self.assertTrue(any(s['source_reference']['reduction_depth'] > 0 for s in seen))

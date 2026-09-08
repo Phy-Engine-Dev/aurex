@@ -20,12 +20,19 @@ from .tools.web_search import download_public_image
 _SECRET_KEYS = {"token", "authcode", "auth_code", "password", "authorization", "cookie", "device_token"}
 _TIME_KEYS = ("Timestamp", "Time", "CreationDate", "CreateTime", "CreatedAt", "Created", "ts_ms")
 _TEXT_KEYS = ("Description", "Content", "Text", "Body", "Message", "Introduction", "Markdown", "Html")
-_STATUS_KEYS = ("Category", "Type", "Tags", "ModelTags", "Visibility", "Settings", "Status", "State", "ExperimentStatus", "Management", "IsManaged", "Version", "Language", "CreationDate", "UpdateDate", "ParentID", "ParentCategory")
+_POST_PROSE_KEYS = ("Description",)
+_STATUS_SCALAR_KEYS = ("Category", "Type", "Visibility", "Status", "State", "ExperimentStatus",
+                       "Management", "IsManaged", "Version", "Language", "CreationDate", "UpdateDate",
+                       "ParentID", "ParentCategory")
+_STATUS_LIST_KEYS = ("Tags", "ModelTags")
 # Fields observed in GetUser's public identity/profile response. Signature is
 # copied verbatim, including any biography text or external links within it.
 # Account balances, subscription/binding state and opaque Socials identifiers
 # are not relevant default context for a wall mention and remain archive-only.
 _PUBLIC_PROFILE_KEYS = ('ID', 'Nickname', 'Signature', 'Verification', 'Avatar', 'AvatarRegion', 'Decoration')
+_MAX_ACTIVE_COMMENT_TEXT_CHARS = 24_000
+_MAX_IDENTITY_CHARS = 256
+_MAX_PROFILE_SIGNATURE_CHARS = 16_000
 
 
 def _safe(value: Any) -> Any:
@@ -61,6 +68,19 @@ def _text(obj: dict[str, Any], keys: tuple[str, ...] = _TEXT_KEYS) -> str:
         result = plar.best_effort_extract_text(value)
         if result:
             return result
+    return ""
+
+
+def _source_text(obj: dict[str, Any], keys: tuple[str, ...]) -> str:
+    """Read verified scalar/list text fields without traversing nested payloads."""
+    for key in keys:
+        value = obj.get(key)
+        if isinstance(value, str) and value:
+            return value
+        if isinstance(value, list) and all(isinstance(item, str) for item in value):
+            result = "\n".join(value)
+            if result:
+                return result
     return ""
 
 
@@ -117,8 +137,46 @@ def _comment_record(raw: dict[str, Any]) -> dict[str, Any]:
 def _person(value: Any, *, source: str) -> dict[str, Any] | None:
     if not isinstance(value, dict):
         return None
-    return {'user_id': _first(value, ('ID', 'UserID', 'id')),
-            'nickname': _first(value, ('Nickname', 'Name', 'nickname')), 'source': source}
+    user_id = _first(value, ('ID', 'UserID', 'id'))
+    nickname = _first(value, ('Nickname', 'Name', 'nickname'))
+    return {'user_id': str(user_id)[:_MAX_IDENTITY_CHARS] if user_id is not None else None,
+            'nickname': str(nickname)[:_MAX_IDENTITY_CHARS] if nickname is not None else None,
+            'source': source}
+
+
+def _compact_original_state(summary: dict[str, Any]) -> dict[str, Any]:
+    """Project only small scalar/list state; never replay arbitrary nested API JSON."""
+    result: dict[str, Any] = {}
+    for key in _STATUS_SCALAR_KEYS:
+        value = summary.get(key)
+        if value is None:
+            continue
+        if isinstance(value, (bool, int)):
+            result[key] = value
+        elif isinstance(value, float):
+            if value == value and value not in (float("inf"), float("-inf")):
+                result[key] = value
+        elif isinstance(value, str):
+            result[key] = value[:256]
+    for key in _STATUS_LIST_KEYS:
+        value = summary.get(key)
+        if isinstance(value, list):
+            result[key] = [str(item)[:128] for item in value[:64]
+                           if isinstance(item, (str, int, float)) and not isinstance(item, bool)]
+    return result
+
+
+def _compact_public_profile(profile: dict[str, Any] | None) -> dict[str, Any] | None:
+    if not isinstance(profile, dict):
+        return None
+    result: dict[str, Any] = {}
+    for key in _PUBLIC_PROFILE_KEYS:
+        value = profile.get(key)
+        if value is None or not isinstance(value, (str, int, float, bool)):
+            continue
+        limit = _MAX_PROFILE_SIGNATURE_CHARS if key == "Signature" else _MAX_IDENTITY_CHARS
+        result[key] = value[:limit] if isinstance(value, str) else value
+    return result
 
 
 def _compact_comment(record: dict[str, Any], *, relation: str) -> dict[str, Any]:
@@ -137,10 +195,46 @@ def _record_key(record: dict[str, Any]) -> str:
 def _related_comments(records: list[dict[str, Any]], trigger: dict[str, Any] | None,
                       *, requester_id: str | None, target_type: str, window_seconds: int,
                       max_related: int) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    count_omitted = 0
+    character_omitted = 0
+
+    def fit_candidates(candidates: list[tuple[dict[str, Any], str]], *, force_first: bool = False
+                       ) -> list[tuple[dict[str, Any], str]]:
+        nonlocal count_omitted, character_omitted
+        output: list[tuple[dict[str, Any], str]] = []
+        used = 0
+        for item, relation in candidates:
+            characters = len(item.get('text') or '')
+            if output and used + characters > _MAX_ACTIVE_COMMENT_TEXT_CHARS:
+                count_omitted += 1
+                character_omitted += characters
+                continue
+            if not output and characters > _MAX_ACTIVE_COMMENT_TEXT_CHARS and not force_first:
+                count_omitted += 1
+                character_omitted += characters
+                continue
+            output.append((item, relation))
+            used += characters
+        return output
+
     if trigger is None:
-        return [_compact_comment(x, relation='target_history_without_trigger') for x in records], {
-            'mode': 'no_trigger', 'selected': len(records), 'excluded': 0,
-            'warning': 'History is not asserted to be a single conversation.'}
+        # An admin/local task has no reply anchor. Never treat an entire wall or
+        # comment scan as one conversation: take a small newest-first window,
+        # apply the aggregate budget, then restore chronological display order.
+        window = records[-max_related:]
+        fitted = fit_candidates([(item, 'recent_target_history_without_trigger')
+                                 for item in reversed(window)])
+        selected_keys = {_record_key(item): relation for item, relation in fitted}
+        output = [_compact_comment(item, relation=selected_keys[_record_key(item)])
+                  for item in records if _record_key(item) in selected_keys]
+        return output, {
+            'mode': 'recent_target_history_without_trigger', 'selected': len(output),
+            'excluded': max(0, len(records) - len(output)),
+            'count_limit': max_related,
+            'text_character_limit': _MAX_ACTIVE_COMMENT_TEXT_CHARS,
+            'omitted_due_text_character_limit': count_omitted,
+            'omitted_text_characters': character_omitted,
+            'warning': 'Only a small recent window is active; history is not asserted to be a single conversation.'}
     by_id = {str(x['id']): x for x in records if x['id'] is not None}
     selected: dict[str, str] = {}
     trigger_key = _record_key(trigger)
@@ -160,24 +254,44 @@ def _related_comments(records: list[dict[str, Any]], trigger: dict[str, Any] | N
     # Same-wall proximity alone is not a thread. Keep recent messages from the
     # requester and replies to them; show other recent comments only as labeled
     # background, never as the referent of an ambiguous 'this'.
-    for item in reversed(recent):
-        key = _record_key(item)
-        if len(selected) >= max_related:
-            break
-        if key in selected:
-            continue
-        if requester_id and item['author_id'] == requester_id:
-            selected[key] = 'recent_message_by_requester_not_proven_reply_chain'
-        elif requester_id and item['reply_user_id'] == requester_id:
-            selected[key] = 'recent_reply_to_requester_account_not_proven_comment_chain'
-        elif target_type != 'User' or len(selected) < min(max_related, 5):
-            selected[key] = 'nearby_same_target_background_not_proven_same_conversation'
-    output = [_compact_comment(x, relation=selected[_record_key(x)]) for x in records if _record_key(x) in selected]
-    if not any(_record_key(x) == trigger_key for x in records):
-        output.append(_compact_comment(trigger, relation='trigger'))
+    recent_newest = list(reversed(recent))
+    priority_groups = (
+        (recent_newest, lambda item: bool(requester_id and item['author_id'] == requester_id),
+         'recent_message_by_requester_not_proven_reply_chain'),
+        (recent_newest, lambda item: bool(requester_id and item['reply_user_id'] == requester_id),
+         'recent_reply_to_requester_account_not_proven_comment_chain'),
+        (recent_newest, lambda item: target_type != 'User' or len(selected) < min(max_related, 5),
+         'nearby_same_target_background_not_proven_same_conversation'),
+    )
+    for items, predicate, relation in priority_groups:
+        for item in items:
+            key = _record_key(item)
+            if len(selected) >= max_related:
+                break
+            if key not in selected and predicate(item):
+                selected[key] = relation
+
+    relation_priority = {'trigger': 0, 'explicit_reply_comment_ancestor': 1,
+        'recent_message_by_requester_not_proven_reply_chain': 2,
+        'recent_reply_to_requester_account_not_proven_comment_chain': 3,
+        'nearby_same_target_background_not_proven_same_conversation': 4}
+    candidate_records = list(records)
+    if not any(_record_key(item) == trigger_key for item in candidate_records):
+        candidate_records.append(trigger)
+    ordered_for_budget = sorted(
+        ((item, selected.get(_record_key(item), 'trigger')) for item in candidate_records
+         if _record_key(item) in selected or _record_key(item) == trigger_key),
+        key=lambda pair: (relation_priority.get(pair[1], 99), -(pair[0].get('ts_ms') or 0)))
+    fitted = fit_candidates(ordered_for_budget, force_first=True)
+    fitted_keys = {_record_key(item): relation for item, relation in fitted}
+    output = [_compact_comment(item, relation=fitted_keys[_record_key(item)])
+              for item in candidate_records if _record_key(item) in fitted_keys]
     return output, {'mode': 'explicit_comment_ancestors_and_recent_same_target',
         'window_seconds': window_seconds, 'max_related_comments': max_related,
         'selected': len(output), 'excluded': max(0, len(records) - len(output)),
+        'text_character_limit': _MAX_ACTIVE_COMMENT_TEXT_CHARS,
+        'omitted_due_text_character_limit': count_omitted,
+        'omitted_text_characters': character_omitted,
         'warning': 'Reply user IDs and chronological proximity do not prove a reply thread. Older/unrelated comments are archived, not active instructions.'}
 
 
@@ -252,14 +366,23 @@ def resolve_wall_reference(context: dict[str, Any], *, user_text: str,
                       if required else 'No lexical reference gate; use normal task reasoning and tools as needed.')}
 
 
+_MAX_COVER_CANDIDATES = 8
+_MAX_COVER_URL_CHARS = 2048
+
+
 def _cover_images(summary: dict[str, Any], target_type: str, target_id: str) -> list[dict[str, Any]]:
     images: list[dict[str, Any]] = []
     for key in ("Cover", "CoverURL", "CoverUrl", "ImageURL", "ImageUrl", "Image", "Images"):
         value = summary.get(key)
         for entry in value if isinstance(value, list) else [value]:
             url = entry.get("URL") or entry.get("Url") or entry.get("url") if isinstance(entry, dict) else entry
-            if isinstance(url, str) and url.startswith(("https://", "http://")):
+            if (isinstance(url, str) and len(url) <= _MAX_COVER_URL_CHARS
+                    and url.startswith(("https://", "http://"))):
                 images.append({"url": url, "source": "summary." + key})
+                if len(images) >= _MAX_COVER_CANDIDATES:
+                    break
+        if len(images) >= _MAX_COVER_CANDIDATES:
+            break
     # PhysicsLab.web._api.get_avatar defines this CDN layout. Image=0 is a valid current cover index.
     index = summary.get("Image")
     if not images and target_type in ("Experiment", "Discussion") and isinstance(index, int) and index >= 0 and re.fullmatch(r"[0-9a-fA-F]{24}", target_id):
@@ -269,7 +392,7 @@ def _cover_images(summary: dict[str, Any], target_type: str, target_id: str) -> 
         images.append({"url": f"http://physics-static-cn.turtlesim.com/experiments/images/{part}/{index}.jpg!full",
                        "source": "summary.Image", "image_index": index})
     seen = set()
-    return [image for image in images if not (image["url"] in seen or seen.add(image["url"]))]
+    return [image for image in images if not (image["url"] in seen or seen.add(image["url"]))][:_MAX_COVER_CANDIDATES]
 
 
 def build_mention_context(
@@ -279,15 +402,17 @@ def build_mention_context(
     bot_user_id: str | None = None, requester_user_id: str | None = None,
     requester_nickname: str | None = None,
     archive_sink: Callable[[str, str], str] | None = None,
-    conversation_window_seconds: int = 86400, max_related_comments: int = 20,
+    conversation_window_seconds: int = 86400, max_related_comments: int | None = None,
+    max_related_post_comments: int = 16, max_related_user_messages: int = 32,
 ) -> dict[str, Any]:
     """Build JSON-compatible original post, cover, timeline and reply context.
 
     `comments` may reuse a runloop scan; omitted comments are fetched read-only with
     timestamp pagination. `archive_sink(title, text)` persists the full sanitized
-    API scan and returns a document ID; no source text is silently truncated.
-    Caller-provided requester/bot IDs are server metadata, never inferred from
-    embedded mentions. Without a sink the archive is returned explicitly inline.
+    API scan for operator audit only. Its document ID is intentionally absent from
+    the model-facing result. Caller-provided requester/bot IDs are server metadata,
+    never inferred from embedded mentions. Without a sink only archive hash/count
+    metadata is returned; raw history never falls back into active model context.
     """
     if target_type not in ("Experiment", "Discussion", "User"):
         raise ValueError("target_type must be Experiment, Discussion or User")
@@ -295,7 +420,13 @@ def build_mention_context(
         raise ValueError("target_id is empty")
     limit = min(500, max(1, int(max_comments)))
     window = max(0, int(conversation_window_seconds))
-    related_limit = min(100, max(1, int(max_related_comments)))
+    if max_related_comments is not None:
+        # Compatibility override for older callers. Production passes the two
+        # target-specific limits below.
+        related_limit = min(100, max(1, int(max_related_comments)))
+    else:
+        configured = max_related_user_messages if target_type == 'User' else max_related_post_comments
+        related_limit = min(100, max(1, int(configured)))
     errors: list[dict[str, str]] = []
     summary: dict[str, Any] = {}
     profile: dict[str, Any] | None = None
@@ -398,15 +529,15 @@ def build_mention_context(
     actual_nickname = requester_nickname if requester_user_id else (trigger['author_nickname'] if trigger else None)
     active, selection = _related_comments(all_records, trigger, requester_id=actual_requester,
         target_type=target_type, window_seconds=window, max_related=related_limit)
-    images = _cover_images(summary, target_type, target_id)
+    images = _cover_images(summary, target_type, target_id)[:1]
     if download_images and cache_dir:
-        for image in images[:4]:
+        for image in images:
             try:
                 image.update(download_public_image(image["url"], cache_dir=cache_dir))
             except Exception as exc:
                 image["download_error"] = type(exc).__name__
                 errors.append({"source": "cover_image", "error": type(exc).__name__})
-    classification = {key: summary[key] for key in _STATUS_KEYS if key in summary}
+    classification = _compact_original_state(summary)
     post_author = _person(summary.get('User'), source='GetSummary.Summary.User')
     wall_owner = (_person(profile, source='GetUser for target.id') or
                   {'user_id': target_id, 'nickname': None, 'source': 'server target.id; profile unavailable'}) if target_type == 'User' else None
@@ -443,8 +574,10 @@ def build_mention_context(
             'wall_owner': wall_owner, 'post_author': post_author,
             'bot': {'user_id': bot_user_id, 'source': 'server bot identity; recipient of mention, not requester'} if bot_user_id else None,
             'warnings': identity_warnings},
-        "original": {"title": _text(summary, ("Subject", "Title", "Name")) or None,
-                     "body": _text(summary) or None, "author": summary.get("User"),
+        "original": {"title": _source_text(summary, ("Subject", "Title", "Name")) or None,
+                     # Content can be a multi-megabyte serialized circuit. Only
+                     # the documented Description prose belongs in first context.
+                     "body": _source_text(summary, _POST_PROSE_KEYS) or None, "author": post_author,
                      "classification_and_state_raw": classification,
                      'source': 'GetSummary.Summary' if target_type != 'User' else 'not_applicable_user_wall'},
         "images": images,
@@ -459,7 +592,7 @@ def build_mention_context(
                  'selection': selection, 'excluded_records': excluded,
                  "reply_chain": [{"comment_id": x["id"], "reply_comment_id": x["reply_comment_id"], "reply_user_id": x["reply_user_id"]}
                                  for x in active if x["reply_comment_id"] or x["reply_user_id"]]},
-        "user_profile": {key: profile[key] for key in _PUBLIC_PROFILE_KEYS if key in profile} if profile else None,
+        "user_profile": _compact_public_profile(profile),
         'user_profile_projection': {'scope': 'public_identity_and_complete_signature',
             'full_api_response_in_source_archive': True,
             'account_balances_and_social_binding_identifiers_in_active_context': False} if target_type == 'User' else None,
@@ -476,16 +609,17 @@ def build_mention_context(
     archive_text = json.dumps(archive, ensure_ascii=False, allow_nan=False, separators=(',', ':'))
     archive_info = {'sha256': hashlib.sha256(archive_text.encode('utf-8')).hexdigest(),
         'bytes': len(archive_text.encode('utf-8')), 'scanned_comment_records': len(collected),
+        'active_comment_records': len(active),
+        'omitted_comment_records': max(0, len(all_records) - len(active)),
         'contains_complete_source_text': True, 'credentials_removed': True}
     if archive_sink is not None:
         document_id = archive_sink(f'Mention source archive {target_type}:{target_id}', archive_text)
         if not isinstance(document_id, str) or not document_id:
             raise ValueError('archive_sink did not return a persistent document ID')
-        result['source_archive'] = {**archive_info, 'document_id': document_id,
-            'retrieval': 'read_context(document_id); excluded records are provenance, not active conversation'}
+        result['source_archive'] = {**archive_info, 'persisted_for_operator_audit': True}
     else:
-        result['source_archive'] = {**archive_info, 'inline_fallback': archive,
-            'warning': 'Caller should supply archive_sink to avoid replaying unrelated raw history into a model.'}
+        result['source_archive'] = {**archive_info, 'persisted_for_operator_audit': False,
+            'warning': 'No archive sink was supplied; complete source history is intentionally absent from active model context.'}
     if context_db is not None:
         try:
             context_db.upsert_target_meta(target_key=f"{target_type}:{target_id}", target={**result["target"], "title": result["original"]["title"], "classification_and_state_raw": classification})

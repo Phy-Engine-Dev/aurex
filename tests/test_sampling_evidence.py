@@ -82,14 +82,19 @@ class SamplingEvidenceTests(unittest.TestCase):
         self.assertEqual(scope['archive_sampling_status'], 'unknown_from_tool_result')
         self.assertNotIn('archive_samples_reported', scope)
         self.assertNotIn('returned_component_rows', scope)
-        self.assertIn('archive sampling coverage is unknown, not zero', SUMMARY_PROMPT)
+        self.assertIn('Missing from this local SOURCE_SLICE means unknown, not absent',
+                      SUMMARY_PROMPT)
+        self.assertIn('interrupted/partial sampling is not exhaustive', SUMMARY_PROMPT)
 
     def test_projection_retains_original_component_scope(self):
         data = self.recorded_data() | {'long_log': 'unrelated ' * 8000}
         did, _, raw = self.tool('circuit_analyze', data)
         projected = json.loads(self.budget.tool_document('analysis', raw, document_id=did))
-        self.assertEqual(projected['fields']['/data/measurements/component_scope'], data['measurements']['component_scope'])
+        self.assertEqual(projected['fields']['/data/measurements/component_scope'],
+                         {'total': 768, 'shown': 8, 'omitted': 760})
         self.assertEqual(projected['fields']['/data/measurements/transient']['sample_count'], 10)
+        self.assertNotIn('/data/measurements/components', projected['sections'])
+        self.assertNotIn('complete_state_path', json.dumps(projected, ensure_ascii=False))
 
     def test_source_title_hash_declared_type_and_raw_tool_are_distinct(self):
         draft_raw = json.dumps({'schema':'test.design-note.v1', 'kind':'draft', 'body':'未验证猜测'})

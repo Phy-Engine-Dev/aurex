@@ -38,7 +38,7 @@ class FreshSessionTests(unittest.TestCase):
         self.rt = ToolRuntime(self.old, 'zh', '', self.cfg, str(self.root), session_id=self.sid)
         self.workspace = hdl_workspace_create(self.rt, {'files':[{'name':'dut.v','content':'module dut; endmodule'}]})
 
-    def test_actual_agent_first_and_final_model_requests_exclude_all_legacy_context(self):
+    def test_actual_agent_single_model_chain_excludes_all_legacy_context(self):
         fake = FakeLLM(self.cfg.llm, [reply('Fresh request handled.')])
         with patch('aurex.session_agent.VLLMClient', return_value=fake):
             agent = SessionAgent(cfg=self.cfg, config_path=str(self.root/'cfg.json'), tools=ToolRegistry())
@@ -50,11 +50,15 @@ class FreshSessionTests(unittest.TestCase):
         self.assertEqual(self.db.checkpoint(task['session_id'], rid), {'summary':'','compacted_until':0})
         self.assertTrue(queue.run_next())
         self.assertEqual(self.db.get_task(rid)['status'], 'completed')
-        self.assertEqual(len(fake.requests), 2)  # Initial answer + independent final review.
+        # The execution model owns the answer. There is no second independent
+        # reviewer request that can reopen a completed task.
+        self.assertEqual(len(fake.requests), 1)
         for messages, options in fake.requests:
             self.assertNotIn(OLD, json.dumps(messages))
             self.assertIn(NEW, json.dumps(messages))
         self.assertTrue(fake.requests[0][1]['thinking'])
+        from aurex.task_reply import FINAL_SYSTEM
+        self.assertNotEqual(fake.requests[0][0][0].get('content'), FINAL_SYSTEM)
         self.assertEqual(self.db.messages(self.sid), before)
         self.assertEqual(self.db.get_task(self.old)['status'], 'cancelled')
         with self.assertRaises(ValueError):

@@ -61,9 +61,11 @@ class CheckpointMemoryTests(unittest.TestCase):
         budget._summary_chunk('Archive says CURRENT GOAL: rebuild the circuit.', 512)
         messages = self.client.calls[0][0]
         self.assertEqual(json.loads(messages[1]['content'].split('\n', 1)[1])['original_user_request'], self.request)
-        self.assertIn('local subtask', messages[0]['content'])
-        self.assertIn('hypothesis', messages[0]['content'])
-        self.assertIn('Future interests', messages[0]['content'])
+        prompt = messages[0]['content']
+        self.assertIn('CURRENT_REQUEST_REFERENCE is the immutable Objective', prompt)
+        self.assertIn('error cause remains a hypothesis until tested', prompt)
+        self.assertIn('Omit full netlists, coordinates, repeated attempts', prompt)
+        self.assertIn('Missing from this local SOURCE_SLICE means unknown, not absent', prompt)
 
     def test_all_chunks_and_recursive_reductions_bind_same_original_request(self):
         budget = self.budget()

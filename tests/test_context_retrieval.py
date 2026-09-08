@@ -252,7 +252,7 @@ class RepeatedReadTests(unittest.TestCase):
                             for event in events))
         self.assertEqual(len(agent.db.tasks(result['session_id'])), 1)
 
-    def test_identical_narration_with_different_tools_requests_progress_review(self):
+    def test_identical_narration_with_different_tools_gets_same_agent_notice(self):
         tools = ToolRegistry()
         execute = mock.Mock(side_effect=lambda rt, args: {'measured': args['point']})
         tools.register(ToolSpec('probe', 'Probe', {'type': 'object', 'properties': {
@@ -269,8 +269,11 @@ class RepeatedReadTests(unittest.TestCase):
         self.assertEqual(result['status'],'completed');self.assertEqual(execute.call_count,3)
         self.assertTrue(fake.requests[3][1]['tools'])
         events=agent.db.events(result['session_id'])
-        self.assertEqual(sum(e['kind']=='assistant_repetition_review' for e in events),1)
+        self.assertEqual(sum(e['kind']=='assistant_repetition_notice' for e in events),1)
         self.assertTrue(any(e['kind']=='loop_recovery' for e in events))
+        from aurex.task_reply import FINAL_SYSTEM
+        self.assertFalse(any(messages[0].get('content') == FINAL_SYSTEM
+                             for messages, _ in fake.requests))
 
 
 if __name__ == '__main__':

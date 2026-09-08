@@ -16,6 +16,22 @@ from urllib.parse import urlparse, parse_qs
 from .sessiondb import SessionDB, encode
 
 
+def _public_subagent(row):
+    """Return the bounded operator summary, never the child's private handoff/history."""
+    keys = ('id', 'session_id', 'parent_run_id', 'depth', 'objective', 'status',
+            'report', 'deadline_at', 'created', 'updated')
+    return {key: row[key] for key in keys}
+
+
+def _public_subagent_trace(trace):
+    """Expose telemetry and evidence IDs without leaking child reasoning/messages."""
+    return {
+        'subagent': _public_subagent(trace['subagent']),
+        'events': trace['events'],
+        'tool_outcomes': trace['tool_outcomes'],
+    }
+
+
 class PersistentTaskQueue:
     """One durable FIFO for Web, administrator and trusted community requests.
 
@@ -284,6 +300,24 @@ def serve(*, cfg, config_path, agent, user=None, hostname=None, port=None, poll=
                 self.wfile.write(file.read_bytes())
                 return
             parts = route.path.strip('/').split('/')
+            if (len(parts) in {6, 7} and parts[:2] == ['api', 'sessions']
+                    and parts[3] == 'tasks' and parts[5] == 'subagents'):
+                sid, rid = parts[2], parts[4]
+                task = database.get_task(rid)
+                # Return the same result for an unknown task and a task owned by
+                # another session.  A crafted URL must not disclose that the
+                # foreign parent/child exists.
+                if not database.get(sid) or not task or task['session_id'] != sid:
+                    return self.respond({'error': 'Task not found in session'}, 404)
+                try:
+                    if len(parts) == 6:
+                        return self.respond([
+                            _public_subagent(row) for row in database.subagents(sid, rid)
+                        ])
+                    return self.respond(_public_subagent_trace(
+                        database.subagent_trace(sid, rid, parts[6])))
+                except ValueError:
+                    return self.respond({'error': 'Subagent not found in task'}, 404)
             if len(parts) >= 3 and parts[:2] == ['api', 'sessions']:
                 sid = parts[2]
                 if not database.get(sid):

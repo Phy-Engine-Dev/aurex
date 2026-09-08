@@ -128,7 +128,7 @@ class PassiveImportTests(unittest.TestCase):
         self.assertEqual([(c["type"], c["nodes"], c["params"]) for c in result], [
             ("resistor", ["N0", "N2"], {"r": 4.0}),
             ("resistor", ["N1", "N3"], {"r": 6.0}),
-            ("switch", ["N0", "N1"], {"closed": 1}),
+            ("switch", ["N2", "N3"], {"closed": 1}),
         ])
         self.assertEqual({c["interaction"]["control_id"] for c in result}, {"original"})
         self.assertEqual({c["interaction"]["role"] for c in result},
@@ -294,17 +294,17 @@ class NativePassiveImportTests(unittest.TestCase):
         element, scene = fixture("Slide Rheostat", 4,
             {"额定电阻": 10, "滑块位置": .4, "电阻1": 4, "电阻2": 6})
         result = self.solve(import_element(element, scene=scene) + [
-            {"id": "V", "type": "vdc", "nodes": ["N2", "gnd"], "params": {"v": 5}},
-            {"id": "V0", "type": "vdc", "nodes": ["N3", "gnd"], "params": {"v": 0}},
+            {"id": "V", "type": "vdc", "nodes": ["N0", "gnd"], "params": {"v": 5}},
+            {"id": "V0", "type": "vdc", "nodes": ["N1", "gnd"], "params": {"v": 0}},
         ])
-        self.assertAlmostEqual(result["original"]["voltage"][0], 3, delta=1e-8)
+        self.assertAlmostEqual(result["original"]["voltage"][1], 3, delta=1e-8)
 
     def test_slide_rheostat_moves_during_one_actual_transient(self):
         element, scene = fixture("Slide Rheostat", 4,
             {"额定电阻": 10, "滑块位置": .4, "电阻1": 4, "电阻2": 6})
         components = import_element(element, scene=scene) + [
-            {"id": "V", "type": "vdc", "nodes": ["N2", "gnd"], "params": {"v": 5}},
-            {"id": "V0", "type": "vdc", "nodes": ["N3", "gnd"], "params": {"v": 0}},
+            {"id": "V", "type": "vdc", "nodes": ["N0", "gnd"], "params": {"v": 5}},
+            {"id": "V0", "type": "vdc", "nodes": ["N1", "gnd"], "params": {"v": 0}},
         ]
         result = self.run_spec({"analysis": "tr", "tr_step": .1, "tr_stop": .3,
             "tr_sample_every": 1, "components": components,
@@ -312,7 +312,7 @@ class NativePassiveImportTests(unittest.TestCase):
                 {"time_s": .1, "set": {"original": .2}},
                 {"time_s": .2, "set": {"original": .8}},
             ]})
-        wiper = [next(c for c in point["components"] if c["id"] == "original")["voltage"][0]
+        wiper = [next(c for c in point["components"] if c["id"] == "original")["voltage"][1]
                  for point in result["transient"]["samples"]]
         self.assertAlmostEqual(wiper[0], 4, delta=1e-7)
         self.assertAlmostEqual(wiper[1], 1, delta=1e-7)
