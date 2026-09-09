@@ -1,12 +1,17 @@
 from __future__ import annotations
 
 import json
+import os
 import re
+import shutil
+import tempfile
 import time
+import zipfile
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 from urllib.error import HTTPError, URLError
-from urllib.parse import quote, urlencode
+from urllib.parse import quote, urlencode, urlsplit
 from urllib.request import Request, urlopen
 
 
@@ -22,7 +27,13 @@ class AurexWebClient:
         self.token = token
         self.timeout = timeout
 
-    def request(self, path: str, data: dict[str, Any] | None = None) -> Any:
+    def request(
+        self,
+        path: str,
+        data: dict[str, Any] | None = None,
+        *,
+        timeout: float | None = None,
+    ) -> Any:
         body = None if data is None else json.dumps(data, ensure_ascii=False).encode()
         headers = {"Accept": "application/json"}
         if body is not None:
@@ -32,7 +43,7 @@ class AurexWebClient:
         request = Request(self.base_url + path, data=body, headers=headers,
                           method="POST" if body is not None else "GET")
         try:
-            with urlopen(request, timeout=self.timeout) as response:
+            with urlopen(request, timeout=self.timeout if timeout is None else timeout) as response:
                 raw = response.read()
         except HTTPError as exc:
             raw = exc.read()
@@ -78,6 +89,148 @@ class AurexWebClient:
 
     def cancel(self, task_id: str) -> dict[str, Any]:
         return self.request("/api/tasks/" + quote(task_id, safe="") + "/cancel", {})
+
+    @staticmethod
+    def _export_target(destination: str | os.PathLike[str] | None, filename: str) -> Path:
+        if not filename or Path(filename).name != filename or not filename.endswith(".sqlite3.zip"):
+            raise WebAPIError("服务返回了无效的导出文件名")
+        if destination is None:
+            target = Path.cwd() / filename
+        else:
+            requested = Path(destination).expanduser()
+            target = requested / filename if requested.is_dir() else requested
+        parent = target.parent.resolve()
+        if not parent.is_dir():
+            raise WebAPIError("导出目标目录不存在")
+        target = parent / target.name
+        if target.exists() or target.is_symlink():
+            raise WebAPIError("导出目标已存在，不会覆盖")
+        return target
+
+    @staticmethod
+    def _install_export(source: Path, target: Path) -> None:
+        """Install a verified archive without ever replacing an existing path."""
+
+        try:
+            os.link(source, target, follow_symlinks=False)
+        except FileExistsError as exc:
+            raise WebAPIError("导出目标已存在，不会覆盖") from exc
+        except OSError:
+            # Some filesystems do not allow hard links.  O_EXCL preserves the
+            # same no-overwrite guarantee for the fallback copy.
+            try:
+                fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            except FileExistsError as exc:
+                raise WebAPIError("导出目标已存在，不会覆盖") from exc
+            try:
+                with os.fdopen(fd, "wb") as output, source.open("rb") as input_file:
+                    shutil.copyfileobj(input_file, output, length=1024 * 1024)
+                    output.flush()
+                    os.fsync(output.fileno())
+            except Exception:
+                try:
+                    target.unlink()
+                except OSError:
+                    pass
+                raise
+        try:
+            source.unlink()
+        except OSError:
+            # The caller's finally block makes another cleanup attempt.  The
+            # fully validated target is already installed at this point.
+            pass
+
+    @staticmethod
+    def _validate_export(path: Path) -> None:
+        try:
+            with zipfile.ZipFile(path, "r") as archive:
+                members = archive.infolist()
+                if len(members) != 1:
+                    raise WebAPIError("导出压缩包必须且只能包含一个 SQLite 文件")
+                member = members[0]
+                if (member.is_dir() or Path(member.filename).name != member.filename
+                        or not member.filename.endswith(".sqlite3")):
+                    raise WebAPIError("导出压缩包内的 SQLite 文件名无效")
+                if member.compress_type != zipfile.ZIP_DEFLATED:
+                    raise WebAPIError("服务返回的导出文件没有使用 DEFLATE 压缩")
+                if archive.testzip() is not None:
+                    raise WebAPIError("导出压缩包 CRC 校验失败")
+                with archive.open(member, "r") as sqlite_file:
+                    if sqlite_file.read(16) != b"SQLite format 3\x00":
+                        raise WebAPIError("导出压缩包内不是有效的 SQLite 数据库")
+        except WebAPIError:
+            raise
+        except (OSError, zipfile.BadZipFile, RuntimeError) as exc:
+            raise WebAPIError("服务返回了无效的导出压缩包") from exc
+
+    def export_session(
+        self,
+        session_id: str,
+        destination: str | os.PathLike[str] | None = None,
+    ) -> Path:
+        if destination is not None:
+            requested = Path(destination).expanduser()
+            if requested.is_symlink() or (requested.exists() and not requested.is_dir()):
+                raise WebAPIError("导出目标已存在，不会覆盖")
+        ticket = self.request(
+            "/api/sessions/" + quote(session_id, safe="") + "/export",
+            {},
+            timeout=max(self.timeout, 300.0),
+        )
+        if not isinstance(ticket, dict) or ticket.get("compressed") is not True:
+            raise WebAPIError("服务没有返回强制压缩的会话导出")
+        download_url = ticket.get("download_url")
+        filename = ticket.get("filename")
+        if not isinstance(download_url, str) or not isinstance(filename, str):
+            raise WebAPIError("服务返回了无效的导出票据")
+        parsed = urlsplit(download_url)
+        if (parsed.scheme or parsed.netloc or parsed.query or parsed.fragment
+                or not re.fullmatch(r"/api/session-exports/[A-Za-z0-9_-]{20,256}", parsed.path)):
+            raise WebAPIError("服务返回了不安全的导出下载地址")
+        target = self._export_target(destination, filename)
+
+        headers = {"Accept": "application/zip"}
+        if self.token:
+            headers["Authorization"] = "Bearer " + self.token
+        request = Request(self.base_url + parsed.path, headers=headers, method="GET")
+        temporary: Path | None = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                mode="w+b",
+                prefix="." + target.name + ".",
+                suffix=".part",
+                dir=target.parent,
+                delete=False,
+            ) as output:
+                temporary = Path(output.name)
+                os.chmod(temporary, 0o600)
+                try:
+                    with urlopen(request, timeout=max(self.timeout, 600.0)) as response:
+                        while True:
+                            chunk = response.read(1024 * 1024)
+                            if not chunk:
+                                break
+                            output.write(chunk)
+                except HTTPError as exc:
+                    raw = exc.read()
+                    try:
+                        detail = json.loads(raw).get("error")
+                    except Exception:
+                        detail = raw.decode(errors="replace") or str(exc)
+                    raise WebAPIError(str(detail)) from exc
+                except (URLError, TimeoutError, OSError) as exc:
+                    raise WebAPIError(str(exc)) from exc
+                output.flush()
+                os.fsync(output.fileno())
+            self._validate_export(temporary)
+            self._install_export(temporary, target)
+            return target
+        finally:
+            if temporary is not None:
+                try:
+                    temporary.unlink()
+                except OSError:
+                    pass
 
 
 _CONTROL = re.compile(r"[\x00-\x08\x0b-\x1f\x7f]")
@@ -183,8 +336,14 @@ class DashboardState:
             self.notice = "已刷新"
         elif command == "/publish" and argument:
             self.submit(argument, publish=True)
+        elif command in {"/export", "/exportsection"}:
+            if not self.session_id:
+                raise WebAPIError("当前没有选中的会话")
+            target = self.api.export_session(self.session_id, argument or None)
+            self.notice = "会话已导出：" + str(target)
         elif command == "/help":
-            self.notice = "/new 新会话  /session ID  /task ID  /cancel  /publish 问题  /refresh  /quit"
+            self.notice = ("/new 新会话  /session ID  /task ID  /cancel  /publish 问题  "
+                           "/export [路径]  /refresh  /quit")
         else:
             raise WebAPIError("未知或缺少参数的命令；输入 /help")
         return False

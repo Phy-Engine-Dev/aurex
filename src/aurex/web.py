@@ -8,6 +8,8 @@ import json
 import os
 import re
 import secrets
+import shutil
+import tempfile
 import threading
 import time
 import uuid
@@ -19,6 +21,7 @@ from urllib.parse import urlparse, parse_qs
 import plar
 
 from .sessiondb import SessionDB, encode
+from .session_export import export_session_archive
 
 
 _PHYSICSLAB_USER_ID = re.compile(r'[0-9a-fA-F]{24}')
@@ -285,11 +288,48 @@ def serve(*, cfg, config_path, agent, user=None, hostname=None, port=None, poll=
     profile_cache = {}
     profile_gate = threading.Lock()
     gate = threading.Lock()
+    export_gate = threading.Lock()
+    export_ticket_gate = threading.Lock()
+    export_tickets = {}
+    export_ticket_ttl_sec = 10 * 60
+    export_root = cache / 'session-exports'
+    if export_root.is_symlink():
+        raise ValueError('Session export directory must not be a symbolic link')
+    export_root.mkdir(mode=0o700, parents=True, exist_ok=True)
+    os.chmod(export_root, 0o700)
     queue = PersistentTaskQueue(
         database, agent, user=user, logger=logger, on_result=on_task_result,
         max_parallel_tasks=cfg.tracking.max_parallel_tasks)
     if enqueue_ready:
         enqueue_ready(queue.enqueue)
+
+    def cleanup_stale_export_directories():
+        # Run only after queue.start() has acquired the process-wide database
+        # lock.  A rejected second server must not remove the live server's
+        # in-flight download.
+        for stale in export_root.iterdir():
+            if not stale.name.startswith('.session-export-'):
+                continue
+            if stale.is_dir() and not stale.is_symlink():
+                shutil.rmtree(stale, ignore_errors=True)
+            else:
+                stale.unlink(missing_ok=True)
+
+    def remove_export_ticket(ticket):
+        directory = Path(ticket['directory'])
+        if directory.parent == export_root and directory.name.startswith('.session-export-'):
+            shutil.rmtree(directory, ignore_errors=True)
+
+    def cleanup_export_tickets(*, force=False):
+        now = time.monotonic()
+        expired = []
+        with export_ticket_gate:
+            for token, ticket in list(export_tickets.items()):
+                if force or (ticket['expires_at'] <= now and not ticket['downloading']):
+                    export_tickets.pop(token, None)
+                    expired.append(ticket)
+        for ticket in expired:
+            remove_export_ticket(ticket)
 
     def user_profile(user_id, *, required=False):
         """Resolve public profile data without treating a public ID as authentication."""
@@ -444,6 +484,79 @@ def serve(*, cfg, config_path, agent, user=None, hostname=None, port=None, poll=
                 raise ValueError('Expected a JSON object')
             return data
 
+        @staticmethod
+        def export_payload(token, ticket):
+            exported = ticket['export']
+            return {
+                'download_url': '/api/session-exports/' + token,
+                'filename': exported.filename,
+                'compressed': True,
+                'format': 'sqlite3.zip',
+                'captured_at': exported.captured_at,
+                'session_status': exported.session_status,
+                'sqlite_bytes': exported.sqlite_bytes,
+                'archive_bytes': exported.archive_bytes,
+                'estimated_logical_bytes': exported.estimated_logical_bytes,
+            }
+
+        def stream_session_export(self, principal, token):
+            cleanup_export_tickets()
+            with export_ticket_gate:
+                ticket = export_tickets.get(token)
+                if (ticket is None or ticket['principal_key'] != (
+                        principal['role'], principal['owner_id'])):
+                    ticket = None
+            if ticket is None or not self.require_session(principal, ticket['session_id']):
+                return self.respond({'error': 'Session export not found'}, 404)
+
+            with export_ticket_gate:
+                current = export_tickets.get(token)
+                if current is not ticket:
+                    return self.respond({'error': 'Session export not found'}, 404)
+                if ticket['downloading']:
+                    return self.respond({'error': 'Session export is already downloading'}, 409)
+                ticket['downloading'] = True
+
+            file = Path(ticket['export'].path).resolve()
+            directory = Path(ticket['directory']).resolve()
+            if (file.parent != directory or not file.is_file()
+                    or not file.name.endswith('.sqlite3.zip')):
+                with export_ticket_gate:
+                    export_tickets.pop(token, None)
+                remove_export_ticket(ticket)
+                return self.respond({'error': 'Session export is unavailable'}, 404)
+
+            completed = False
+            try:
+                size = file.stat().st_size
+                self.send_response(200)
+                self.send_header('Content-Type', 'application/zip')
+                self.send_header('Content-Disposition',
+                    'attachment; filename="' + ticket['export'].filename + '"')
+                self.send_header('Cache-Control', 'no-store')
+                self.send_header('X-Content-Type-Options', 'nosniff')
+                self.send_header('Content-Length', str(size))
+                self.end_headers()
+                with file.open('rb') as source:
+                    while block := source.read(1024 * 1024):
+                        self.wfile.write(block)
+                self.wfile.flush()
+                completed = True
+            except (BrokenPipeError, ConnectionResetError, OSError) as exc:
+                if logger:
+                    logger.debug('session export download interrupted: %s', type(exc).__name__)
+            finally:
+                dispose = False
+                with export_ticket_gate:
+                    if export_tickets.get(token) is ticket:
+                        if completed:
+                            export_tickets.pop(token, None)
+                            dispose = True
+                        else:
+                            ticket['downloading'] = False
+                if dispose:
+                    remove_export_ticket(ticket)
+
         def do_GET(self):
             route = urlparse(self.path)
             if route.path == '/health':
@@ -461,6 +574,11 @@ def serve(*, cfg, config_path, agent, user=None, hostname=None, port=None, poll=
             principal = self.principal()
             if not principal:
                 return self.respond({'error': 'Access token required'}, 401)
+            cleanup_export_tickets()
+            export_match = re.fullmatch(
+                r'/api/session-exports/([A-Za-z0-9_-]{40,100})', route.path)
+            if export_match:
+                return self.stream_session_export(principal, export_match.group(1))
             if route.path == '/api/me':
                 return self.respond({'role': principal['role'], 'admin_available': bool(admin_token),
                     'user_id': principal.get('user_id'),
@@ -619,6 +737,53 @@ def serve(*, cfg, config_path, agent, user=None, hostname=None, port=None, poll=
                         result = create_task(data, principal=principal, source='web')
                     return self.respond(result, 202)
                 parts = path.strip('/').split('/')
+                if len(parts) == 4 and parts[:2] == ['api', 'sessions'] and parts[3] == 'export':
+                    if data:
+                        raise ValueError('Session export accepts an empty JSON object')
+                    sid = parts[2]
+                    if not self.require_session(principal, sid):
+                        return self.respond({'error': 'Session not found'}, 404)
+                    cleanup_export_tickets()
+                    principal_key = (principal['role'], principal['owner_id'])
+                    with export_ticket_gate:
+                        existing = next(((token, ticket) for token, ticket in export_tickets.items()
+                            if ticket['session_id'] == sid
+                            and ticket['principal_key'] == principal_key), None)
+                    if existing:
+                        if existing[1]['downloading']:
+                            return self.respond({'error': 'Session export is already downloading'}, 409)
+                        return self.respond(self.export_payload(*existing))
+                    if not export_gate.acquire(blocking=False):
+                        return self.respond({'error': 'Another session export is being prepared'}, 429)
+                    directory = None
+                    try:
+                        directory = Path(tempfile.mkdtemp(
+                            prefix='.session-export-', dir=export_root))
+                        os.chmod(directory, 0o700)
+                        exported = export_session_archive(
+                            database.path, sid, str(directory),
+                            include_private=principal['role'] == 'admin')
+                        token = secrets.token_urlsafe(32)
+                        ticket = {
+                            'session_id': sid,
+                            'principal_key': principal_key,
+                            'directory': str(directory),
+                            'export': exported,
+                            'expires_at': time.monotonic() + export_ticket_ttl_sec,
+                            'downloading': False,
+                        }
+                        with export_ticket_gate:
+                            export_tickets[token] = ticket
+                        directory = None
+                        return self.respond(self.export_payload(token, ticket), 201)
+                    except Exception as exc:
+                        if logger:
+                            logger.error('session export failed: %s', exc)
+                        return self.respond({'error': 'Unable to create a verified session export'}, 500)
+                    finally:
+                        if directory is not None:
+                            shutil.rmtree(directory, ignore_errors=True)
+                        export_gate.release()
                 if len(parts) == 4 and parts[:2] == ['api', 'tasks'] and parts[3] == 'cancel':
                     if data:
                         raise ValueError('Task cancellation accepts an empty JSON object')
@@ -653,6 +818,7 @@ def serve(*, cfg, config_path, agent, user=None, hostname=None, port=None, poll=
     server = ThreadingHTTPServer((hostname or cfg.tracking.hostname, port or cfg.tracking.port), Handler)
     try:
         queue.start()
+        cleanup_stale_export_directories()
         if retention_worker is not None:
             retention_worker.start()
         if poll:
@@ -670,3 +836,4 @@ def serve(*, cfg, config_path, agent, user=None, hostname=None, port=None, poll=
         queue.close()
         if retention_worker is not None:
             retention_worker.close()
+        cleanup_export_tickets(force=True)

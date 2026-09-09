@@ -1,5 +1,6 @@
 """Task stop and outcome journal regressions; no model or community calls."""
 from __future__ import annotations
+from io import BytesIO
 import http.client
 import json
 import os
@@ -10,6 +11,7 @@ import tempfile
 import threading
 import time
 import unittest
+import zipfile
 from dataclasses import replace
 from http.server import ThreadingHTTPServer
 from unittest import mock
@@ -259,6 +261,16 @@ class TaskControlHTTPTests(unittest.TestCase):
         conn.request("GET",path,headers=headers)
         response=conn.getresponse();result=json.loads(response.read());status=response.status;conn.close()
         return status,result
+    def raw_get_request(self,path,*,auth=True,cookie=None):
+        conn=http.client.HTTPConnection("127.0.0.1",self.server.server_port,timeout=10)
+        headers={}
+        if auth:headers["Authorization"]="Bearer test-task-control"
+        if cookie:headers["Cookie"]=cookie
+        conn.request("GET",path,headers=headers)
+        response=conn.getresponse();body=response.read();status=response.status
+        response_headers={key.lower():value for key,value in response.getheaders()}
+        conn.close()
+        return status,response_headers,body
     def login_user(self,cookie=None,user_id='a'*24):
         conn=http.client.HTTPConnection("127.0.0.1",self.server.server_port,timeout=3)
         headers={"Content-Type":"application/json"}
@@ -275,6 +287,119 @@ class TaskControlHTTPTests(unittest.TestCase):
         self.agent.handle.assert_not_called()
         self.assertEqual(self.db.get(self.sid)["status"],"cancelled")
         self.assertEqual(SessionDB(self.db.path).recover(),[])
+    def test_running_session_export_is_one_time_deflated_sqlite_and_does_not_touch_task(self):
+        self.db.run_status(self.rid,"running")
+        self.db.message(self.sid,self.rid,{"role":"user","content":"export evidence"})
+        self.db.event(self.sid,self.rid,"progress",{"step":1})
+        with self.db.connect() as db:
+            before={table:db.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+                    for table in ("events","artifacts")}
+
+        status,ticket=self.request("/api/sessions/web/export",{})
+        self.assertEqual(status,201)
+        self.assertTrue(ticket["compressed"])
+        self.assertEqual(ticket["format"],"sqlite3.zip")
+        self.assertEqual(ticket["session_status"],"running")
+        self.assertTrue(ticket["filename"].endswith(".sqlite3.zip"))
+        self.assertTrue(ticket["download_url"].startswith("/api/session-exports/"))
+
+        status,headers,payload=self.raw_get_request(ticket["download_url"])
+        self.assertEqual(status,200)
+        self.assertEqual(headers["content-type"],"application/zip")
+        self.assertIn("attachment",headers["content-disposition"])
+        self.assertEqual(int(headers["content-length"]),len(payload))
+        self.assertEqual(headers["cache-control"],"no-store")
+        with zipfile.ZipFile(BytesIO(payload),"r") as archive:
+            members=archive.infolist()
+            self.assertEqual(len(members),1)
+            self.assertEqual(members[0].compress_type,zipfile.ZIP_DEFLATED)
+            self.assertIsNone(archive.testzip())
+            raw=archive.read(members[0])
+        extracted=Path(self.temp.name)/"http-export.sqlite3"
+        extracted.write_bytes(raw)
+        with sqlite3.connect(extracted) as exported:
+            self.assertEqual(exported.execute("PRAGMA quick_check").fetchone()[0],"ok")
+            self.assertEqual(exported.execute("SELECT id,status FROM sessions").fetchone(),
+                             (self.sid,"running"))
+            self.assertEqual(exported.execute("SELECT COUNT(*) FROM sessions").fetchone()[0],1)
+            self.assertEqual(exported.execute("SELECT COUNT(*) FROM messages WHERE data LIKE '%export evidence%'").fetchone()[0],1)
+
+        self.assertEqual(self.db.get_task(self.rid)["status"],"running")
+        self.assertEqual(self.db.get(self.sid)["status"],"running")
+        with self.db.connect() as db:
+            after={table:db.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+                   for table in ("events","artifacts")}
+        self.assertEqual(after,before,"export created a journal event or downloadable artifact row")
+        status,_,body=self.raw_get_request(ticket["download_url"])
+        self.assertEqual(status,404,"a successfully downloaded ticket was reusable")
+        self.assertEqual(json.loads(body)["error"],"Session export not found")
+
+    def test_session_export_requires_owner_and_empty_cross_site_protected_post(self):
+        owner_cookie=self.login_user(user_id="a"*24)
+        foreign_cookie=self.login_user(user_id="b"*24)
+        status,created=self.request("/api/sessions",{"title":"private export"},
+                                    auth=False,cookie=owner_cookie)
+        self.assertEqual(status,201)
+        private_run=self.db.begin(created['id'],'owner export privacy','owner-export-run')
+        private_child='9'*32
+        self.db.create_subagent(created['id'],private_run,private_child,'公开目标',{
+            'private_handoff':'PRIVATE-HANDOFF-MARKER'})
+        self.db.subagent_message(private_child,{
+            'role':'assistant','content':'PRIVATE-REASONING-MARKER'})
+        private_document,private_message=self.db.subagent_tool_outcome(
+            private_child,private_child+':1:0:inspect','circuit_inspect',
+            encode({'ok':True,'data':{'secret':'PRIVATE-CHILD-TOOL-MARKER'}}),True)
+        self.db.update_subagent_tool_message(
+            private_child,private_message,'PRIVATE-CHILD-PROJECTION-MARKER')
+        path=f"/api/sessions/{created['id']}/export"
+        status,_=self.request(path,{},auth=False)
+        self.assertEqual(status,401)
+        status,_=self.request(path,{},auth=False,cookie=foreign_cookie)
+        self.assertEqual(status,404)
+        status,_=self.request(path,{"raw":True},auth=False,cookie=owner_cookie)
+        self.assertEqual(status,400)
+        status,_=self.request(path,{},auth=False,cookie=owner_cookie,
+                              origin="https://untrusted.example")
+        self.assertEqual(status,403)
+        status,ticket=self.request(path,{},auth=False,cookie=owner_cookie)
+        self.assertEqual(status,201)
+        status,_,body=self.raw_get_request(ticket["download_url"],auth=False,
+                                           cookie=foreign_cookie)
+        self.assertEqual(status,404)
+        self.assertEqual(json.loads(body)["error"],"Session export not found")
+        status,_,payload=self.raw_get_request(ticket["download_url"],auth=False,
+                                              cookie=owner_cookie)
+        self.assertEqual(status,200)
+        self.assertTrue(zipfile.is_zipfile(BytesIO(payload)))
+        with zipfile.ZipFile(BytesIO(payload)) as archive:
+            raw=archive.read(archive.namelist()[0])
+        self.assertNotIn(b'PRIVATE-HANDOFF-MARKER',raw)
+        self.assertNotIn(b'PRIVATE-REASONING-MARKER',raw)
+        self.assertNotIn(b'PRIVATE-CHILD-TOOL-MARKER',raw)
+        self.assertNotIn(b'PRIVATE-CHILD-PROJECTION-MARKER',raw)
+        extracted=Path(self.temp.name)/'owner-export.sqlite3'
+        extracted.write_bytes(raw)
+        with sqlite3.connect(extracted) as exported:
+            self.assertEqual(exported.execute(
+                'SELECT owner_id FROM sessions').fetchone()[0],'')
+            context=exported.execute(
+                'SELECT context FROM subagent_runs').fetchone()[0]
+            self.assertTrue(json.loads(context)['redacted'])
+            self.assertEqual(exported.execute(
+                'SELECT COUNT(*) FROM subagent_messages').fetchone()[0],1)
+            safe_message=json.loads(exported.execute(
+                'SELECT data FROM subagent_messages').fetchone()[0])
+            self.assertEqual(safe_message['tool_call_id'],private_child+':1:0:inspect')
+            self.assertIn('omitted',safe_message['content'])
+            safe_document=json.loads(exported.execute(
+                'SELECT content FROM documents WHERE id=?',(private_document,)).fetchone()[0])
+            self.assertTrue(safe_document['redacted'])
+            self.assertEqual(exported.execute('''SELECT COUNT(*)
+                FROM subagent_tool_outcomes t
+                JOIN subagent_messages m ON m.id=t.message_id AND m.subagent_id=t.subagent_id
+                JOIN documents d ON d.id=t.document_id AND d.session_id=t.session_id''').fetchone()[0],1)
+            metadata=dict(exported.execute('SELECT key,value FROM export_metadata'))
+            self.assertEqual(metadata['private_subagent_history_included'],'false')
     def test_cancel_ownership_auth_origin_and_schema_fail_closed(self):
         self.db.session("other")
         for path,body,options,expected in [
@@ -702,6 +827,22 @@ await $('stop').onclick();
 const call=fetchCalls.find(x=>x.path.endsWith('/cancel'));
 assert(JSON.parse(call.options.body).run_id==='R1','Stop targeted another run');
 assert($('status').textContent==='取消中'&&$('stop').disabled,'Stop request was presented as already stopped/completed');
+""")
+    def test_running_session_export_captures_clicked_session_across_async_navigation(self):
+        self.run_ui(r"""
+sid='A';selectedTask='R1';$('export-session').textContent='导出会话';controls({status:'running',active_run_id:'R1'});
+assert(!$('export-session').hidden,'A running session cannot be exported');
+let finishExport;
+fetchHook=(path,options)=>new Promise(resolve=>finishExport=resolve);
+const pending=$('export-session').onclick();
+assert($('export-session').disabled&&$('export-session').textContent==='压缩中…','Export preparation has no visible state');
+sid='B';selectedTask='R2';controls({status:'running',active_run_id:'R2'});
+finishExport(response({download_url:'/api/session-exports/ticket-A',filename:'a.sqlite3.zip',compressed:true,format:'sqlite3.zip'}));
+await pending;
+const call=fetchCalls.find(row=>row.path.endsWith('/export'));
+assert(call.path==='/api/sessions/A/export','Async navigation exported the newly selected session instead of the clicked one');
+assert(location.href==='/api/session-exports/ticket-A','The verified download ticket was not opened');
+assert(!$('export-session').disabled&&$('export-session').textContent==='导出会话','Export controls remained stuck after download started');
 """)
     def test_late_cancel_response_cannot_replace_new_session_controls(self):
         self.run_ui(r"""
