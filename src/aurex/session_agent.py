@@ -7,7 +7,6 @@ import io
 import json
 import os
 import re
-import threading
 import time
 from collections import deque
 from math import isfinite
@@ -19,9 +18,6 @@ from .contextdb import ContextDB
 from .sessiondb import SessionDB, encode
 from .tools.registry import ToolRuntime, ToolResult
 from .vllm_client import DegenerateGeneration, InvalidToolCall, VLLMClient
-
-
-_GPU = threading.RLock()
 
 
 class RunCancelled(RuntimeError):
@@ -493,9 +489,11 @@ class SessionAgent:
         rid = self.db.begin(sid, user_text, run_id or task_id, images=images)
         self.db.event(sid, rid, 'queued', {'message': visible})
         self.db.status(sid, 'queued')
-        # One active inference chain uses the TP2 model; other sessions retain a durable queue.
-        with _GPU:
-            return self._run(sid, rid, visible, context, user, images or [])
+        # Scheduler capacity is the single source of truth.  A module-global
+        # GPU lock would silently turn max_parallel_tasks>1 back into serial
+        # execution; every scheduled request already owns an independent
+        # SessionAgent and VLLMClient instance.
+        return self._run(sid, rid, visible, context, user, images or [])
 
     def _run(self, sid, rid, visible, context, user, image_paths):
         self.db.status(sid, 'running')

@@ -130,6 +130,8 @@ class SessionDB:
                     db.execute('ALTER TABLE runs ADD COLUMN ' + name + ' ' + declaration)
             db.execute("UPDATE runs SET original_user_request=prompt WHERE original_user_request=''")
             db.execute('CREATE INDEX IF NOT EXISTS runs_fifo ON runs(status,created,id)')
+            db.execute('CREATE INDEX IF NOT EXISTS runs_session_status '
+                       'ON runs(session_id,status,created,id)')
 
     @contextmanager
     def connect(self):
@@ -311,16 +313,38 @@ class SessionDB:
         with self.connect() as db:
             return db.execute("SELECT 1 FROM runs WHERE status IN ('queued','running','cancelling') LIMIT 1").fetchone() is not None
 
-    def claim_next_task(self) -> dict | None:
-        """Atomically claim global FIFO; at most one task can own the worker."""
+    def claim_next_task(self, max_parallel_tasks: int = 1) -> dict | None:
+        """Atomically claim FIFO work within a bounded parallel capacity.
+
+        Independent sessions may run together.  A session itself remains
+        serial so its aggregate status, context and external-action receipts
+        cannot be raced by sibling requests.
+        """
+        if (type(max_parallel_tasks) is not int or
+                not 1 <= max_parallel_tasks <= 64):
+            raise ValueError('max_parallel_tasks must be an integer in 1..64')
         with self.connect() as db:
             db.execute('BEGIN IMMEDIATE')
-            if db.execute("SELECT 1 FROM runs WHERE status IN ('running','cancelling') LIMIT 1").fetchone():
+            active = db.execute(
+                "SELECT COUNT(*) FROM runs WHERE status IN ('running','cancelling')"
+            ).fetchone()[0]
+            if active >= max_parallel_tasks:
                 return None
-            row = db.execute("SELECT * FROM runs WHERE status='queued' AND cancel_requested=0 ORDER BY created,id LIMIT 1").fetchone()
+            row = db.execute("""SELECT candidate.* FROM runs candidate
+                WHERE candidate.status='queued' AND candidate.cancel_requested=0
+                  AND NOT EXISTS (
+                    SELECT 1 FROM runs active
+                    WHERE active.session_id=candidate.session_id
+                      AND active.status IN ('running','cancelling'))
+                ORDER BY candidate.created,candidate.id LIMIT 1""").fetchone()
             if row is None:
                 return None
-            db.execute("UPDATE runs SET status='running',updated=? WHERE id=?", (time.time(), row['id']))
+            changed = db.execute(
+                "UPDATE runs SET status='running',updated=? "
+                "WHERE id=? AND status='queued' AND cancel_requested=0",
+                (time.time(), row['id'])).rowcount
+            if changed != 1:
+                return None
             self._session_status(db, row['session_id'])
             return self._task(db.execute('SELECT * FROM runs WHERE id=?', (row['id'],)).fetchone())
 

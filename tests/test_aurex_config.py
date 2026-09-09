@@ -14,6 +14,21 @@ from aurex.config import AurexConfig, ConfigError, load_config  # noqa: E402
 
 
 class TestResolvePath(unittest.TestCase):
+    def test_parallel_task_capacity_defaults_to_one_and_rejects_zero(self):
+        with tempfile.TemporaryDirectory() as td:
+            path = os.path.join(td, "aurex.json")
+            with open(path, "w", encoding="utf-8") as output:
+                output.write('{"tracking":{"max_parallel_tasks":3}}')
+            self.assertEqual(load_config(path).tracking.max_parallel_tasks, 3)
+            for invalid in (0, -1, True, 65, "2"):
+                with self.subTest(value=invalid):
+                    with open(path, "w", encoding="utf-8") as output:
+                        import json
+                        json.dump({"tracking": {"max_parallel_tasks": invalid}}, output)
+                    with self.assertRaises(ConfigError):
+                        load_config(path)
+        self.assertEqual(AurexConfig().tracking.max_parallel_tasks, 1)
+
     def test_task_timeout_defaults_to_1800_and_cannot_exceed_hard_cap(self):
         with tempfile.TemporaryDirectory() as td:
             path = os.path.join(td, "aurex.json")

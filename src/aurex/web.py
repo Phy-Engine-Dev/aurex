@@ -79,18 +79,33 @@ def _public_subagent_trace(trace):
 
 
 class PersistentTaskQueue:
-    """One durable FIFO for Web, administrator and trusted community requests.
+    """One durable bounded scheduler for all trusted request sources.
 
-    Enqueue never calls a model or publishes. A single worker claims from SQLite,
-    not from an in-memory list, so restarts preserve queue order and metadata.
+    Enqueue never calls a model or publishes. Workers claim atomically from
+    SQLite, not from an in-memory list, so restarts preserve order and metadata.
+    Different sessions can run in parallel; requests in one session are serial.
     """
-    def __init__(self, database, agent, *, user=None, logger=None, on_result=None):
+    def __init__(self, database, agent, *, user=None, logger=None, on_result=None,
+                 max_parallel_tasks=1):
+        if (type(max_parallel_tasks) is not int or
+                not 1 <= max_parallel_tasks <= 64):
+            raise ValueError('max_parallel_tasks must be an integer in 1..64')
         self.database, self.agent, self.user = database, agent, user
         self.logger, self.on_result = logger, on_result
+        self.max_parallel_tasks = max_parallel_tasks
         self.wake = threading.Event()
         self.stopping = threading.Event()
         self.thread = None
+        self.threads = []
         self.busy = threading.Event()
+        self._busy_count = 0
+        self._live_workers = 0
+        self._state_lock = threading.Lock()
+        # Make shutdown and the decision to claim the next durable task one
+        # linearizable operation.  Without this lock a worker can observe an
+        # unset stopping flag, lose the CPU to close(), and then turn a task
+        # that should survive the restart as queued into an interrupted run.
+        self._claim_lock = threading.Lock()
         self.lock_file = None
 
     def enqueue(self, session_id, original_user_request, **kwargs):
@@ -112,8 +127,8 @@ class PersistentTaskQueue:
         return rid
 
     def start(self):
-        if self.thread is not None:
-            raise RuntimeError('Task worker already started')
+        if self.threads:
+            raise RuntimeError('Task workers already started')
         # Recovery is only safe after excluding another scheduler for this database.
         import fcntl
         lock_file = open(self.database.path + '.worker.lock', 'a')
@@ -124,8 +139,40 @@ class PersistentTaskQueue:
             lock_file.close()
             raise
         self.lock_file = lock_file
-        self.thread = threading.Thread(target=self._loop, name='aurex-task-fifo', daemon=True)
-        self.thread.start()
+        self.threads = [threading.Thread(
+            target=self._loop, name=f'aurex-task-{index + 1}', daemon=True)
+            for index in range(self.max_parallel_tasks)]
+        self.thread = self.threads[0]
+        self._live_workers = 0
+        started = []
+        try:
+            for worker in self.threads:
+                with self._state_lock:
+                    self._live_workers += 1
+                try:
+                    worker.start()
+                except BaseException:
+                    with self._state_lock:
+                        self._live_workers -= 1
+                    raise
+                started.append(worker)
+        except BaseException:
+            with self._claim_lock:
+                self.stopping.set()
+                self.wake.set()
+            for worker in started:
+                if worker.is_alive():
+                    worker.join(5)
+            with self._state_lock:
+                # A worker that already claimed a task may still be finishing
+                # its safe boundary.  It remains the lock owner and the last
+                # worker's finally block releases the process-wide flock.
+                if self._live_workers == 0 and self.lock_file:
+                    self.lock_file.close()
+                    self.lock_file = None
+            self.threads = started
+            self.thread = started[0] if started else None
+            raise
 
     def wait_idle(self, timeout=None):
         deadline = None if timeout is None else time.monotonic() + max(0, timeout)
@@ -137,18 +184,36 @@ class PersistentTaskQueue:
 
     def close(self, *, wait=False, timeout=None):
         # In-flight tools stop only at their safe boundary; do not kill external writes.
-        self.stopping.set()
-        self.wake.set()
-        if wait and self.thread and self.thread is not threading.current_thread():
-            self.thread.join(timeout)
+        with self._claim_lock:
+            self.stopping.set()
+            self.wake.set()
+        if wait:
+            deadline = None if timeout is None else time.monotonic() + max(0, timeout)
+            for worker in self.threads:
+                if worker is threading.current_thread():
+                    continue
+                remaining = None if deadline is None else max(0, deadline - time.monotonic())
+                worker.join(remaining)
+
+    def _busy_enter(self):
+        with self._state_lock:
+            self._busy_count += 1
+            self.busy.set()
+
+    def _busy_exit(self):
+        with self._state_lock:
+            self._busy_count -= 1
+            if self._busy_count == 0:
+                self.busy.clear()
 
     def run_next(self):
-        if self.stopping.is_set():
-            return False
-        task = self.database.claim_next_task()
-        if task is None:
-            return False
-        self.busy.set()
+        with self._claim_lock:
+            if self.stopping.is_set():
+                return False
+            task = self.database.claim_next_task(self.max_parallel_tasks)
+            if task is None:
+                return False
+            self._busy_enter()
         sid, rid = task['session_id'], task['id']
         try:
             if self.database.cancel_requested(rid):
@@ -172,7 +237,10 @@ class PersistentTaskQueue:
             if self.logger:
                 self.logger.error('task %s failed: %s', rid, exc)
         finally:
-            self.busy.clear()
+            self._busy_exit()
+            # A completed slot may unblock a queued sibling from the same
+            # session; wake every scheduler worker promptly.
+            self.wake.set()
         return True
 
     def _loop(self):
@@ -187,9 +255,11 @@ class PersistentTaskQueue:
                 self.wake.wait(1)
                 self.wake.clear()
         finally:
-            if self.lock_file:
-                self.lock_file.close()
-                self.lock_file = None
+            with self._state_lock:
+                self._live_workers -= 1
+                if self._live_workers == 0 and self.lock_file:
+                    self.lock_file.close()
+                    self.lock_file = None
 
 
 def serve(*, cfg, config_path, agent, user=None, hostname=None, port=None, poll=True, logger=None,
@@ -197,11 +267,27 @@ def serve(*, cfg, config_path, agent, user=None, hostname=None, port=None, poll=
     database = SessionDB(cfg.resolve_path(cfg.tracking.database_path, config_path=config_path))
     cache = Path(cfg.resolve_path(cfg.storage.cache_dir, config_path=config_path)).resolve()
     cache.mkdir(parents=True, exist_ok=True)
+    retention_worker = None
+    if cfg.storage.history_retention_enabled:
+        from .history_retention import GIB, HistoryRetention, HistoryRetentionWorker
+        configured_history = cfg.resolve_path(cfg.storage.history_dir, config_path=config_path)
+        history_dir = configured_history or str(Path(database.path).parent / 'backups')
+        retention_worker = HistoryRetentionWorker(HistoryRetention(
+            history_dir,
+            database_path=database.path,
+            cache_dir=str(cache),
+            compress_at_bytes=int(cfg.storage.history_compress_at_gib * GIB),
+            delete_at_bytes=int(cfg.storage.history_delete_at_gib * GIB),
+            min_age_sec=cfg.storage.history_min_age_sec,
+            logger=logger,
+        ), cfg.storage.history_check_interval_sec)
     admin_token = os.environ.get(cfg.tracking.token_env, '').strip()
     profile_cache = {}
     profile_gate = threading.Lock()
     gate = threading.Lock()
-    queue = PersistentTaskQueue(database, agent, user=user, logger=logger, on_result=on_task_result)
+    queue = PersistentTaskQueue(
+        database, agent, user=user, logger=logger, on_result=on_task_result,
+        max_parallel_tasks=cfg.tracking.max_parallel_tasks)
     if enqueue_ready:
         enqueue_ready(queue.enqueue)
 
@@ -567,6 +653,8 @@ def serve(*, cfg, config_path, agent, user=None, hostname=None, port=None, poll=
     server = ThreadingHTTPServer((hostname or cfg.tracking.hostname, port or cfg.tracking.port), Handler)
     try:
         queue.start()
+        if retention_worker is not None:
+            retention_worker.start()
         if poll:
             from .runloop import run_forever, normalize_targets, default_state_path
             bot = threading.Thread(target=run_forever, kwargs=dict(
@@ -580,3 +668,5 @@ def serve(*, cfg, config_path, agent, user=None, hostname=None, port=None, poll=
     finally:
         server.server_close()
         queue.close()
+        if retention_worker is not None:
+            retention_worker.close()

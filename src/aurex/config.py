@@ -100,6 +100,14 @@ class OllamaModelConfig:
 class StorageConfig:
     cache_dir: str = ".aurex/cache"
     context_db_path: str = ""
+    # Empty derives a private sibling ``backups`` directory from the active
+    # tracking database.  This keeps temporary/test databases isolated.
+    history_dir: str = ""
+    history_retention_enabled: bool = True
+    history_compress_at_gib: float = 10.0
+    history_delete_at_gib: float = 20.0
+    history_check_interval_sec: int = 300
+    history_min_age_sec: int = 300
 
 
 @dataclass(frozen=True)
@@ -226,6 +234,9 @@ class TrackingConfig:
     hostname: str = "0.0.0.0"
     port: int = 4097
     token_env: str = "AUREX_WEB_TOKEN"
+    # The durable scheduler may run independent sessions concurrently.  Keep
+    # this at one for a single-sequence local vLLM deployment.
+    max_parallel_tasks: int = 1
 
 
 @dataclass(frozen=True)
@@ -415,9 +426,42 @@ def load_config(path: str) -> AurexConfig:
     executor = parse_model("executor", AurexConfig().executor)
 
     storage_raw = _as_dict(root.get("storage") or {}, where="storage")
+    storage_defaults = AurexConfig().storage
+    history_enabled = storage_raw.get(
+        "history_retention_enabled", storage_defaults.history_retention_enabled)
+    history_compress = storage_raw.get(
+        "history_compress_at_gib", storage_defaults.history_compress_at_gib)
+    history_delete = storage_raw.get(
+        "history_delete_at_gib", storage_defaults.history_delete_at_gib)
+    history_interval = storage_raw.get(
+        "history_check_interval_sec", storage_defaults.history_check_interval_sec)
+    history_min_age = storage_raw.get(
+        "history_min_age_sec", storage_defaults.history_min_age_sec)
+    if type(history_enabled) is not bool:
+        raise ConfigError("storage.history_retention_enabled must be a boolean")
+    for key, value in (("history_compress_at_gib", history_compress),
+                       ("history_delete_at_gib", history_delete)):
+        if type(value) not in {int, float} or not math.isfinite(value) or value <= 0:
+            raise ConfigError(f"storage.{key} must be a finite number > 0")
+    if history_delete < history_compress:
+        raise ConfigError(
+            "storage.history_delete_at_gib must be >= storage.history_compress_at_gib")
+    if type(history_interval) is not int or not 1 <= history_interval <= 86400:
+        raise ConfigError("storage.history_check_interval_sec must be an integer in 1..86400")
+    if type(history_min_age) is not int or not 0 <= history_min_age <= 604800:
+        raise ConfigError("storage.history_min_age_sec must be an integer in 0..604800")
+    history_dir = storage_raw.get("history_dir", storage_defaults.history_dir)
+    if not isinstance(history_dir, str):
+        raise ConfigError("storage.history_dir must be a string")
     storage = StorageConfig(
-        cache_dir=str(storage_raw.get("cache_dir") or AurexConfig().storage.cache_dir),
+        cache_dir=str(storage_raw.get("cache_dir") or storage_defaults.cache_dir),
         context_db_path=str(storage_raw.get("context_db_path") or ""),
+        history_dir=history_dir.strip(),
+        history_retention_enabled=history_enabled,
+        history_compress_at_gib=float(history_compress),
+        history_delete_at_gib=float(history_delete),
+        history_check_interval_sec=history_interval,
+        history_min_age_sec=history_min_age,
     )
 
     web_raw = _as_dict(root.get("web_search") or {}, where="web_search")
@@ -453,7 +497,16 @@ def load_config(path: str) -> AurexConfig:
     if reserve + policy.safety_tokens >= llm.context_length:
         raise ConfigError("context output reserve and safety_tokens must leave input space within llm.context_length")
     tracking_raw = _as_dict(root.get("tracking") or {}, where="tracking")
-    tracking = TrackingConfig(**{k: v for k, v in tracking_raw.items() if k in TrackingConfig.__dataclass_fields__})
+    max_parallel_tasks = tracking_raw.get(
+        "max_parallel_tasks", AurexConfig().tracking.max_parallel_tasks)
+    if (type(max_parallel_tasks) is not int or
+            not 1 <= max_parallel_tasks <= 64):
+        raise ConfigError(
+            "tracking.max_parallel_tasks must be an integer in 1..64")
+    tracking = TrackingConfig(**{
+        k: v for k, v in tracking_raw.items()
+        if k in TrackingConfig.__dataclass_fields__ and k != "max_parallel_tasks"
+    }, max_parallel_tasks=max_parallel_tasks)
 
     pe_raw = _as_dict(root.get("phy_engine") or {}, where="phy_engine")
     verilog2plsav_args = pe_raw.get("verilog2plsav_args")

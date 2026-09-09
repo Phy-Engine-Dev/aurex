@@ -8,6 +8,7 @@ import shutil
 import sqlite3
 import tempfile
 import threading
+import time
 import unittest
 from dataclasses import replace
 from http.server import ThreadingHTTPServer
@@ -443,6 +444,27 @@ class DurableFIFOTests(unittest.TestCase):
         self.assertEqual(self.db.claim_next_task()['id'],'b')
         self.db.finish_run('B','b','completed')
         self.assertEqual(self.db.claim_next_task()['id'],'c')
+
+    def test_parallel_claim_is_atomic_bounded_and_serial_per_session(self):
+        for rid,sid in [('a','same'),('b','same'),('c','other'),('d','third')]:
+            self.add(rid,sid)
+        claimed=[];errors=[]
+        def claim():
+            try:claimed.append(SessionDB(self.db.path).claim_next_task(2))
+            except Exception as exc:errors.append(exc)
+        threads=[threading.Thread(target=claim) for _ in range(8)]
+        for thread in threads:thread.start()
+        for thread in threads:thread.join(5)
+        self.assertFalse(errors)
+        actual=[row for row in claimed if row]
+        self.assertEqual(len(actual),2)
+        self.assertEqual({row['id'] for row in actual},{'a','c'})
+        self.assertEqual(len({row['session_id'] for row in actual}),2)
+        self.assertIsNone(self.db.claim_next_task(2))
+        self.db.finish_run('same','a','completed')
+        self.assertEqual(self.db.claim_next_task(2)['id'],'b')
+        with self.assertRaises(ValueError):self.db.claim_next_task(0)
+        with self.assertRaises(ValueError):self.db.claim_next_task(True)
     def test_metadata_roundtrip_immutable_and_trusted_community_identity(self):
         fields=dict(source='community',requester_user_id='actual-author',requester_nickname='Author',reply_id='comment1',
                     explicit_publish_requested=False,target={'type':'Experiment','id':'post1'},metadata={'dry_run':True})
@@ -491,6 +513,156 @@ class DurableFIFOTests(unittest.TestCase):
         self.assertTrue(queue.wait_idle(timeout=5))
         self.assertEqual(order,['web','community','unverified'])
         self.assertEqual(self.db.get_task('unverified')['status'],'needs_attention')
+
+    def test_parallel_workers_run_independent_sessions_and_bound_capacity(self):
+        from aurex.web import PersistentTaskQueue
+        entered=[];lock=threading.Lock();two_running=threading.Event();release=threading.Event()
+        def handle(**kw):
+            with lock:
+                entered.append(kw['run_id'])
+                if len(entered)==2:two_running.set()
+            release.wait(5)
+            self.db.finish_run(kw['session_id'],kw['run_id'],'completed')
+            return {'answer':'done'}
+        agent=mock.Mock();agent.handle.side_effect=handle
+        queue=PersistentTaskQueue(self.db,agent,max_parallel_tasks=2)
+        for rid,sid in [('one','A'),('two','B'),('three','C')]:
+            queue.enqueue(sid,'Task '+rid,task_id=rid)
+        queue.start()
+        self.addCleanup(lambda:(release.set(),queue.close(wait=True,timeout=5)))
+        self.assertTrue(two_running.wait(5))
+        with lock:self.assertEqual(set(entered),{'one','two'})
+        self.assertEqual(len([row for row in self.db.tasks() if row['status']=='running']),2)
+        release.set();self.assertTrue(queue.wait_idle(timeout=5))
+        self.assertEqual(set(entered[:2]),{'one','two'})
+        self.assertEqual(entered[2:],['three'])
+
+    def test_parallel_workers_never_overlap_sibling_requests_in_one_session(self):
+        from aurex.web import PersistentTaskQueue
+        first_entered=threading.Event();release=threading.Event();order=[]
+        def handle(**kw):
+            order.append(kw['run_id'])
+            if kw['run_id']=='first':
+                first_entered.set();release.wait(5)
+            self.db.finish_run(kw['session_id'],kw['run_id'],'completed')
+            return {'answer':'done'}
+        agent=mock.Mock();agent.handle.side_effect=handle
+        queue=PersistentTaskQueue(self.db,agent,max_parallel_tasks=2)
+        self.add('first','same');self.add('second','same')
+        queue.start()
+        self.addCleanup(lambda:(release.set(),queue.close(wait=True,timeout=5)))
+        self.assertTrue(first_entered.wait(5))
+        self.assertEqual(order,['first'])
+        self.assertEqual(self.db.get_task('second')['status'],'queued')
+        release.set();self.assertTrue(queue.wait_idle(timeout=5))
+        self.assertEqual(order,['first','second'])
+
+    def test_parallel_busy_count_wait_idle_and_close_cover_every_worker(self):
+        from aurex.web import PersistentTaskQueue
+        entered=threading.Event();lock=threading.Lock();active=set()
+        releases={'one':threading.Event(),'two':threading.Event()}
+        def handle(**kw):
+            with lock:
+                active.add(kw['run_id'])
+                if len(active)==2:entered.set()
+            releases[kw['run_id']].wait(5)
+            self.db.finish_run(kw['session_id'],kw['run_id'],'completed')
+            return {'answer':'done'}
+        agent=mock.Mock();agent.handle.side_effect=handle
+        queue=PersistentTaskQueue(self.db,agent,max_parallel_tasks=2)
+        queue.enqueue('A','one',task_id='one');queue.enqueue('B','two',task_id='two')
+        queue.start()
+        self.addCleanup(lambda:(releases['one'].set(),releases['two'].set(),queue.close(wait=True,timeout=5)))
+        self.assertTrue(entered.wait(5));self.assertTrue(queue.busy.is_set())
+        self.assertFalse(queue.wait_idle(timeout=0))
+        releases['one'].set()
+        deadline=time.monotonic()+5
+        while self.db.get_task('one')['status']!='completed' and time.monotonic()<deadline:
+            time.sleep(.01)
+        self.assertTrue(queue.busy.is_set(),'one worker clearing busy hid its active sibling')
+        self.assertFalse(queue.wait_idle(timeout=0))
+        releases['two'].set();self.assertTrue(queue.wait_idle(timeout=5))
+        self.assertFalse(queue.busy.is_set())
+        queue.close(wait=True,timeout=5)
+        self.assertTrue(all(not worker.is_alive() for worker in queue.threads))
+        self.assertIsNone(queue.lock_file)
+
+    def test_queue_capacity_rejects_zero_and_boolean(self):
+        from aurex.web import PersistentTaskQueue
+        for value in (0, -1, True, 65, '2'):
+            with self.subTest(value=value),self.assertRaises(ValueError):
+                PersistentTaskQueue(self.db,mock.Mock(),max_parallel_tasks=value)
+
+    def test_shutdown_and_claim_are_linearized_and_leave_later_work_queued(self):
+        from aurex.web import PersistentTaskQueue
+        claim_entered=threading.Event();release_claim=threading.Event()
+        handled=[]
+        original_claim=self.db.claim_next_task
+        def blocked_claim(capacity=1):
+            claim_entered.set()
+            release_claim.wait(5)
+            return original_claim(capacity)
+        self.db.claim_next_task=blocked_claim
+        def handle(**kw):
+            handled.append(kw['run_id'])
+            self.db.finish_run(kw['session_id'],kw['run_id'],'completed')
+            return {'answer':'done'}
+        queue=PersistentTaskQueue(self.db,mock.Mock(handle=handle))
+        queue.enqueue('A','first',task_id='first')
+        queue.enqueue('B','second',task_id='second')
+        queue.start()
+        self.addCleanup(lambda:(release_claim.set(),queue.close(wait=True,timeout=5)))
+        self.assertTrue(claim_entered.wait(5))
+        close_entered=threading.Event();closed=threading.Event()
+        def close_queue():
+            close_entered.set()
+            queue.close(wait=False)
+            closed.set()
+        closer=threading.Thread(target=close_queue)
+        closer.start()
+        # The first claim already owns the scheduling decision, so shutdown
+        # must wait for that short transaction rather than racing through it.
+        self.assertTrue(close_entered.wait(5))
+        self.assertFalse(closed.wait(.05))
+        release_claim.set()
+        self.assertTrue(closed.wait(5));closer.join(5)
+        queue.close(wait=True,timeout=5)
+        self.assertEqual(handled,['first'])
+        self.assertEqual(self.db.get_task('first')['status'],'completed')
+        self.assertEqual(self.db.get_task('second')['status'],'queued')
+
+    def test_partial_worker_start_failure_keeps_process_lock_until_started_worker_exits(self):
+        from aurex.web import PersistentTaskQueue
+        entered=threading.Event();release=threading.Event();errors=[]
+        def handle(**kw):
+            entered.set();release.wait(5)
+            self.db.finish_run(kw['session_id'],kw['run_id'],'completed')
+            return {'answer':'done'}
+        queue=PersistentTaskQueue(self.db,mock.Mock(handle=handle),max_parallel_tasks=2)
+        queue.enqueue('A','work',task_id='work')
+        original_start=threading.Thread.start
+        def fail_second(worker):
+            if worker.name=='aurex-task-2':
+                if not entered.wait(5):
+                    raise AssertionError('first worker did not start')
+                raise RuntimeError('synthetic thread start failure')
+            return original_start(worker)
+        def launch():
+            try:queue.start()
+            except Exception as exc:errors.append(exc)
+        with mock.patch.object(threading.Thread,'start',fail_second):
+            starter=threading.Thread(target=launch,name='test-starter')
+            starter.start()
+            self.assertTrue(entered.wait(5))
+            self.assertIsNotNone(queue.lock_file)
+            second=PersistentTaskQueue(SessionDB(self.db.path),mock.Mock())
+            with self.assertRaises(BlockingIOError):second.start()
+            release.set();starter.join(5)
+        self.assertEqual(len(errors),1)
+        self.assertIn('synthetic thread start failure',str(errors[0]))
+        self.assertTrue(all(not worker.is_alive() for worker in queue.threads))
+        self.assertIsNone(queue.lock_file)
+
     def test_second_worker_cannot_recover_live_owner(self):
         from aurex.web import PersistentTaskQueue
         entered=threading.Event();release=threading.Event()

@@ -55,6 +55,8 @@ curl --noproxy '*' http://127.0.0.1:8000/health
 
 普通用户只能读取和取消自己的任务；全局队列只显示他人的匿名占位、状态与排队位置。历史社区/CLI/管理员记录只对管理员可见。桌面端的会话、当前对话、全局队列为三个同级区域，任务栏可拖动或用方向键调宽并保存宽度；手机端通过“会话/队列”按钮打开全屏面板。
 
+任务调度并行度由 `tracking.max_parallel_tasks` 控制，必须是 `1..64` 的整数，`0`、布尔值及字符串都会拒绝加载。本机的 TP2 单序列 vLLM 配置使用 `1`；只有模型后端、GPU 与社区 API 确实支持并发时才调高。调高后仅不同会话可以并行，同一会话内的任务仍按顺序执行；SQLite 原子领取、唯一服务锁以及发布/回复的一次性回执约束保持不变。
+
 ```bash
 bash scripts/aurex-web.sh start          # 启动网页、队列与持续社区轮询
 bash scripts/aurex-web.sh status         # 健康检查
@@ -176,9 +178,9 @@ PYTHONPATH=src .venv/bin/python -m aurex cli --config .config/aurex3.json
 PYTHONPATH=src .venv/bin/python -m aurex
 ```
 
-CLI与Web是同一个Aurex v3前端：都连接唯一的常驻server、同一个持久化FIFO和社区轮询器。Web已运行时CLI直接附着；CLI先启动时会先拉起同一个后台Web server再附着，随后启动Web只会识别并复用它。因此两种启动顺序都不会创建第二个worker，退出CLI也不会中断server或当前队列。终端按服务、任务队列、会话、当前任务时间线、输入区分区，`Tab`切换区域、方向键选择、`Enter`进入；输入`/help`可查看新会话、切换会话/任务、取消、显式发布和退出命令。旧版`chat`、`console`、`run --once`以及手动`--poll`入口均不存在。
+CLI与Web是同一个Aurex v3前端：都连接唯一的常驻server、同一个持久化调度队列和社区轮询器。Web已运行时CLI直接附着；CLI先启动时会先拉起同一个后台Web server再附着，随后启动Web只会识别并复用它。因此两种启动顺序都不会创建第二个调度器，退出CLI也不会中断server或当前队列。终端按服务、任务队列、会话、当前任务时间线、输入区分区，`Tab`切换区域、方向键选择、`Enter`进入；输入`/help`可查看新会话、切换会话/任务、取消、显式发布和退出命令。旧版`chat`、`console`、`run --once`以及手动`--poll`入口均不存在。
 
-通知轮询只响应显式 `@aurex`，默认新部署 `bootstrap_lookback_sec=0`，避免重答历史消息。Web、CLI、通知机器人和管理员API共用持久化FIFO；同一目标/提问者可归入同一会话，但每次用户提交都是独立task（`runs.id`），同一会话也不会把新问题合并成旧任务。一次只运行一个TP2推理链，其它任务保留排队记录。
+通知轮询只响应显式 `@aurex`，默认新部署 `bootstrap_lookback_sec=0`，避免重答历史消息。Web、CLI、通知机器人和管理员API共用持久化调度队列；同一目标/提问者可归入同一会话，但每次用户提交都是独立task（`runs.id`），同一会话也不会把新问题合并成旧任务。默认 `max_parallel_tasks=1`，适配本机 TP2 单序列推理；其他部署可按后端能力增加不同会话的并发数。
 
 管理员使用 `POST /api/tasks` 提交原始请求，可指定已有 `session_id`；不指定则建立新会话。普通用户使用 `POST /api/requests`。`GET /api/me` 返回当前角色及白名单公开资料；`GET /api/tasks`、`GET /api/tasks/:id` 和取消端点均由服务端执行所有权检查。HTTP客户端不能传 `source`、`purpose`、`metadata` 或自定task ID；`source=admin` 由管理员端点确定。
 
@@ -298,6 +300,10 @@ cmake --build .aurex/cache/phy-engine-build \
 `llm.reasoning_effort` 默认 `null`，请求不传该字段而保留模板默认；可选 `low` / `medium` / `xhigh`。当前Qwen模板默认xhigh，medium仍开启思考而不额外注入xhigh提示，low要求简短思考；这是模板文本控制，不是硬token配额，也不是质量保证。它与 `enable_thinking`、上下文整理策略分别配置。
 
 `.aurex/aurex.sqlite3` 使用SQLite WAL，持久保存每个会话、排队请求（含图片路径）、原始消息、工具事件、原文、摘要和文件索引。Web重启会恢复排队请求；运行中被中断的请求标记 interrupted，并补齐工具调用的失败结果，以免恢复时协议不完整。已经执行但未返回的工具副作用视为未知，需要查现有文件后再续做。不会清空旧会话。
+
+磁盘历史保留与上面的模型上下文压缩互不相同。`storage.history_dir` 只管理该专用目录的直属备份快照，默认留空时从当前 `tracking.database_path` 推导为同目录的 `backups/`，避免测试数据库误碰生产历史；示例部署显式使用 `.aurex/backups`。服务启动后立即检查，之后默认每300秒检查一次：目录实际占用达到10 GiB时，按最旧优先把稳定超过5分钟的原始快照逐份原子压缩为 `.tar.gz`，逐文件校验内容一致后才删除源快照；压缩失败或快照在压缩期间变化时保留原件。压缩后仍达到20 GiB时，才按最旧优先删除已验证压缩包，刚降到20 GiB以下即停止，并始终保留最新一份快照。每个工作单元只处理一份快照，超水位时连续收敛，关服信号会在快照边界停止后续处理。
+
+保留器不会扫描或删除当前SQLite数据库/WAL、`.aurex/cache`、任务artifact，也不会触碰运行、排队或其他未完成任务的数据；历史目录与归档分别强制为 `0700`、`0600`。默认数据库同级 `backups/` 会自动初始化专用标记；其他自定义非空目录没有该标记时会拒绝启用，包含数据库/缓存、符号链接或挂载边界的快照也不会处理，防止误配普通目录。自动删除不可恢复，重要历史仍应另存独立备份。阈值和检查周期可在 `storage` 中配置：`history_retention_enabled`、`history_compress_at_gib`、`history_delete_at_gib`、`history_check_interval_sec`、`history_min_age_sec`，其中删除阈值必须不小于压缩阈值。
 
 流式推理使用可取消的异步HTTP读取，保持同步agent接口。工具解析器尚未吐出SSE不等于模型停止：不再用固定180秒静默读取超时结束任务。主线程每0.5秒检查取消；静默30秒后通过独立只读 `/v1/models` 做健康检查，每次最多5秒，连续3次失败才报告失联，期间新的SSE优先。健康探测不会重试或新建推理请求，也不能证明某条任务正在取得进展；服务健康但任务停滞时仍可人工取消。取消会关闭活动HTTP流，真正断流、缺少finish/`[DONE]`、不完整工具调用均保留为错误，而不是成功。
 

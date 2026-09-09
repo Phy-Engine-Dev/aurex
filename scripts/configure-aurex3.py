@@ -14,7 +14,7 @@ output = root / args.output
 if output.exists():
     raise SystemExit('Configuration already exists; refusing to overwrite it')
 cfg = json.loads((root / 'aurex3.config.example.json').read_text())
-for section, keys in [('storage', ['cache_dir', 'context_db_path']), ('tracking', ['database_path']),
+for section, keys in [('storage', ['cache_dir', 'context_db_path', 'history_dir']), ('tracking', ['database_path']),
                       ('phy_engine', ['cmake_source_dir', 'cmake_build_dir'])]:
     for key in keys:
         cfg[section][key] = str(root / cfg[section][key])

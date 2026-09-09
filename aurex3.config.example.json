@@ -38,8 +38,17 @@
       "verbatim": {"auto_compact": false, "prune": false, "prune_images": false}
     }
   },
-  "storage": {"cache_dir": ".aurex/cache", "context_db_path": ".aurex/community-context.json"},
-  "tracking": {"database_path": ".aurex/aurex.sqlite3", "hostname": "0.0.0.0", "port": 4097, "token_env": "AUREX_WEB_TOKEN"},
+  "storage": {
+    "cache_dir": ".aurex/cache",
+    "context_db_path": ".aurex/community-context.json",
+    "history_dir": ".aurex/backups",
+    "history_retention_enabled": true,
+    "history_compress_at_gib": 10,
+    "history_delete_at_gib": 20,
+    "history_check_interval_sec": 300,
+    "history_min_age_sec": 300
+  },
+  "tracking": {"database_path": ".aurex/aurex.sqlite3", "hostname": "0.0.0.0", "port": 4097, "token_env": "AUREX_WEB_TOKEN", "max_parallel_tasks": 1},
   "web_search": {"provider": "auto", "max_results": 5, "region": "cn-zh", "base_url": "", "api_key_env": "BRAVE_SEARCH_API_KEY", "timeout_sec": 20},
   "phy_engine": {
     "auto_build": true,
