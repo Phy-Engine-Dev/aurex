@@ -39,6 +39,8 @@ _CUSTOM_FAILURE_LINES = re.compile(
     r'(?im)^\s*(?:fail(?:ed)?\s*(?::|\b)|some\s+tests\s+failed\b)')
 _CUSTOM_NONZERO_ERRORS = re.compile(
     r'(?im)^\s*(?:total\s+)?errors?\s*[:=]\s*([1-9][0-9]*)\b')
+_CUSTOM_ICARUS_ERROR_LINES = re.compile(
+    r'(?m)^ERROR:\s+/work/[A-Za-z][A-Za-z0-9_-]{0,80}\.(?:v|sv):[0-9]+:')
 _LIMIT_LAUNCH = """import os,resource,sys
 resource.setrlimit(resource.RLIMIT_AS,(1073741824,1073741824))
 resource.setrlimit(resource.RLIMIT_CPU,(20,21))
@@ -356,6 +358,8 @@ def hdl_simulate(runtime: ToolRuntime, args: dict[str, Any]) -> dict[str, Any]:
         log = simulation.get('log', '')
         if _CUSTOM_FAILURE_LINES.search(log):
             reported_failure_markers.append('explicit_FAIL_line')
+        if _CUSTOM_ICARUS_ERROR_LINES.search(log):
+            reported_failure_markers.append('icarus_runtime_ERROR_line')
         counts = sorted({int(match) for match in _CUSTOM_NONZERO_ERRORS.findall(log)})
         if counts:
             reported_failure_markers.append('nonzero_error_count:' + ','.join(map(str, counts)))
@@ -445,7 +449,7 @@ def hdl_simulate(runtime: ToolRuntime, args: dict[str, Any]) -> dict[str, Any]:
 
 def register_hdl_tools(registry: ToolRegistry) -> None:
     registry.register(ToolSpec(
-        name="hdl_simulate", description="Compile/simulate local Verilog/SystemVerilog in a bounded offline sandbox. Prefer persistent workspace_id/workspace_revision after small exact edits; inline files remain supported. custom top is the testbench; design_top separately selects the design for report-based export (only source-role files, never testbench-role files). A custom testbench must use $fatal for every mismatch; runtime lines beginning FAIL/FAILED/SOME TESTS FAILED or a nonzero 'errors:' count force verified=false even if vvp exits 0. No filesystem/system/DPI calls or macros other than timescale. For a 32-bit CPU teaching subset select rv32i_teaching_v1; a trusted independent testbench verifies the exact interface: " + CONTRACT,
+        name="hdl_simulate", description="Compile/simulate local Verilog/SystemVerilog in a bounded offline sandbox. Prefer persistent workspace_id/workspace_revision after small exact edits; inline files remain supported. custom top is the testbench; design_top separately selects the design for report-based export (only source-role files, never testbench-role files). A custom testbench must use $fatal for every mismatch; Icarus runtime ERROR diagnostics, lines beginning FAIL/FAILED/SOME TESTS FAILED, or a nonzero 'errors:' count force verified=false even if vvp exits 0. No filesystem/system/DPI calls or macros other than timescale. For a 32-bit CPU teaching subset select rv32i_teaching_v1; a trusted independent testbench verifies the exact interface: " + CONTRACT,
         parameters={"type": "object", "additionalProperties": False, "required": ["profile"],
           "oneOf": [{"required": ["files"], "not": {"anyOf": [{"required": ["workspace_id"]}, {"required": ["workspace_revision"]}, {"required": ["design_top"]}]}},
                     {"required": ["workspace_id", "workspace_revision"], "not": {"required": ["files"]}}], "properties": {

@@ -791,8 +791,22 @@ def upload_experiment_cover(*, user: Any, cover: bytes, credential: dict[str, An
         raise PLARError("Invalid cover image size")
     if not all(isinstance(credential.get(k), str) and credential[k] for k in ("Policy", "Authorization")):
         raise PLARError("The server did not grant a cover upload slot; publication remains unconfirmed")
-    _official_call("UploadImage", lambda: official_publish_api.upload_image(
-        user, credential["Policy"], credential["Authorization"], cover))
+    # The official UPYUN upload endpoint is the one publication operation
+    # whose success envelope is ``{"code": 200}``, not the PhysicsLab API's
+    # usual ``{"Status": 200}``.  Treating it as a normal official call left
+    # every real Type-0 publication permanently in image_pending even though
+    # the image upload itself had succeeded.
+    try:
+        value = official_publish_api.upload_image(
+            user, credential["Policy"], credential["Authorization"], cover)
+    except Exception as error:
+        raise PublicationResponseError(
+            "UploadImage did not confirm success", "UploadImage:transport-unconfirmed"
+        ) from error
+    if not isinstance(value, dict) or value.get("code") != 200:
+        raise PublicationResponseError(
+            "UploadImage did not confirm success", "UploadImage:api-status-not-success"
+        )
 
 
 def confirm_original_experiment(user: Any, *, summary_id: str, image_counter: int = 1) -> None:

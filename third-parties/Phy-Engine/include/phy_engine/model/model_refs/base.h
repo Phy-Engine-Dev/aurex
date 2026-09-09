@@ -9,6 +9,7 @@
 #include <fast_io/fast_io_dsal/string.h>
 
 #include "concept.h"
+#include "logic_level.h"
 #include "operation.h"
 
 #include "../../circuits/MNA/mna.h"

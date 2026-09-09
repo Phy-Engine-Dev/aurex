@@ -649,6 +649,79 @@ class CircuitNativeTests(unittest.TestCase):
         self.assertFalse(rows[0][2]["numerical_equivalence_to_original"])
         self.assertIn("surrogate seed", " ".join(rows[0][2]["assumptions"]))
 
+    @staticmethod
+    def precision_rectifier_spec(*, protected_output=False):
+        output_node = "oaout" if protected_output else "out"
+        components = [
+            {"id": "V1", "type": "vdc", "nodes": ["vin", "gnd"],
+             "params": {"v": 1}},
+            {"id": "Rin", "type": "resistor", "nodes": ["vin", "neg"],
+             "params": {"r": 10}},
+            {"id": "Rg", "type": "resistor", "nodes": ["gnd", "pos"],
+             "params": {"r": 1}},
+            {"id": "D1", "type": "diode", "nodes": ["neg", "out"],
+             "params": {"is": 9.177923434724038e-6, "n": 2, "isr": 0,
+                        "nr": 2, "temp_c": 27, "ibv": .01, "bv": 40,
+                        "bv_set": 0, "area": 1}},
+            {"id": "OA", "type": "clamped_op_amp",
+             "nodes": ["pos", "neg", output_node, "gnd"],
+             "params": {"gain": 100, "min_v": -15, "max_v": 15}},
+            {"id": "Rf", "type": "resistor", "nodes": ["pos", "out"],
+             "params": {"r": 99}},
+        ]
+        if protected_output:
+            components.insert(-1, {
+                "id": "P", "type": "rated_protection",
+                "nodes": ["oaout", "out", "oaout", "gnd"],
+                "params": {"max_current_a": .12},
+            })
+        return {"components": components}
+
+    def test_clamped_op_amp_precision_rectifier_converges_to_exact_hard_clamp(self):
+        result = circuit_analyze(self.runtime, {
+            "spec": self.precision_rectifier_spec(), "analysis": "dc",
+            "g_min_siemens": 1e-12,
+        })
+        opamp = next(c for c in result["measurements"]["components"]
+                     if c["id"] == "OA")
+        raw = 100 * (opamp["voltage"][0] - opamp["voltage"][1])
+        expected = max(-15, min(raw, 15))
+        actual = opamp["voltage"][2] - opamp["voltage"][3]
+        self.assertAlmostEqual(actual, expected, places=10)
+        self.assertAlmostEqual(actual, -.48089245, places=7)
+
+        for rail in (15, 1000):
+            with self.subTest(symmetric_rail_v=rail):
+                saturated = circuit_analyze(self.runtime, {
+                    "spec": {"components": [
+                        {"id": "VP", "type": "vdc",
+                         "nodes": ["p", "gnd"], "params": {"v": 1}},
+                        {"id": "OA", "type": "clamped_op_amp",
+                         "nodes": ["p", "gnd", "out", "gnd"],
+                         "params": {"gain": 2000, "min_v": -rail,
+                                    "max_v": rail}},
+                        {"id": "RL", "type": "resistor",
+                         "nodes": ["out", "gnd"], "params": {"r": 1000}},
+                    ]}, "analysis": "dc",
+                })
+                row = next(c for c in saturated["measurements"]["components"]
+                           if c["id"] == "OA")
+                self.assertAlmostEqual(row["voltage"][2] - row["voltage"][3],
+                                       rail, places=9)
+
+    def test_protection_does_not_latch_on_unconverged_newton_probe(self):
+        result = circuit_analyze(self.runtime, {
+            "spec": self.precision_rectifier_spec(protected_output=True),
+            "analysis": "dc", "g_min_siemens": 1e-12,
+        })
+        protection = next(c for c in result["measurements"]["components"]
+                          if c["id"] == "P")["model_state"]
+        self.assertEqual(protection["broken"], 0)
+        self.assertEqual(protection["trip_mask"], 0)
+        self.assertAlmostEqual(abs(protection["current_a"]), .1048089245,
+                               places=7)
+        self.assertLess(abs(protection["current_a"]), .12)
+
     def test_native_rated_protection_trips_current_voltage_or_power_and_opens(self):
         def run(limits):
             result = circuit_analyze(self.runtime, {"spec": {"components": [

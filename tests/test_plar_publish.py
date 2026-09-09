@@ -17,7 +17,8 @@ from aurex.publishing import (PublicationError, approve_publication, authorize_s
     _chinese_text)
 from aurex.tools.plar_tools import plar_publish_experiment, PLAR_PUBLISH_EXPERIMENT_TOOL
 from aurex.tools.registry import ToolError
-from plar.api import submit_original_experiment, upload_experiment_cover, confirm_original_experiment
+from plar.api import (PublicationResponseError, confirm_original_experiment,
+                      submit_original_experiment, upload_experiment_cover)
 from plar.official_publish_api import hdl_source_carrier_status
 
 
@@ -416,13 +417,22 @@ class RawPublicationAPITests(unittest.TestCase):
 
     def test_cover_and_confirm_delegate_to_official_sdk_with_exact_image_slot(self):
         user = SimpleNamespace(token="t", auth_code="a")
-        with mock.patch("plar.api.official_publish_api.upload_image", return_value={"Status": 200}) as upload, \
+        with mock.patch("plar.api.official_publish_api.upload_image", return_value={"code": 200}) as upload, \
              mock.patch("plar.api.official_publish_api.confirm_experiment", return_value={"Status": 200}) as confirm:
             upload_experiment_cover(user=user, cover=b"jpeg",
                 credential={"Policy": "p", "Authorization": "a", "URL": "http://evil"})
             confirm_original_experiment(user, summary_id=SUMMARY_ID)
         upload.assert_called_once_with(user, "p", "a", b"jpeg")
         confirm.assert_called_once_with(user, SUMMARY_ID, 1)
+
+    def test_cover_rejects_physicslab_status_envelope_or_non_success_upyun_code(self):
+        user = SimpleNamespace(token="t", auth_code="a")
+        credential = {"Policy": "p", "Authorization": "a"}
+        for response in ({"Status": 200}, {"code": 403}, None):
+            with self.subTest(response=response), \
+                 mock.patch("plar.api.official_publish_api.upload_image", return_value=response), \
+                 self.assertRaises(PublicationResponseError):
+                upload_experiment_cover(user=user, cover=b"jpeg", credential=credential)
 
     def test_fixed_type3_submission_has_title_body_and_no_image_request(self):
         status = hdl_source_carrier_status()

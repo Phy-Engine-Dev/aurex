@@ -34,6 +34,15 @@ module b; reg [3:0] mem [2:3]; wire [3:0] x = mem[2]; endmodule
         with self.assertRaises(MemoryLoweringError):
             lower_unpacked_register_arrays(source)
 
+    def test_single_line_write_keeps_following_statement_token_separate(self):
+        source = ("module m(input clk,input [1:0] a,input [7:0] d,output [7:0] q);"
+                  "reg [7:0] mem [0:3];always @(posedge clk) mem[a]<=d;"
+                  "assign q=mem[a];endmodule")
+        lowered, metadata = lower_unpacked_register_arrays(source)
+        self.assertEqual(metadata, [{"name": "mem", "width": 8, "depth": 4}])
+        self.assertIn(" end assign q=", lowered)
+        self.assertNotIn("endassign", lowered)
+
     def test_no_array_is_byte_identical(self):
         source = "module m(input a, output q); assign q=a; endmodule\n"
         self.assertEqual(lower_unpacked_register_arrays(source), (source, []))

@@ -269,30 +269,20 @@ class TestPlarUploadSavTool(unittest.TestCase):
                 return {"summary_id": "a" * 24, "category": category_value}
 
             with mock.patch("aurex.tools.plar_tools.plar.upload_sav_as_experiment", side_effect=fake_upload):
-                out = plar_upload_sav(
-                    rt,
-                    {
-                        "sav_path": "/definitely/not/used.sav",
-                        "title": "RRR：为什么我们看到的天空是蓝色的",
-                        "introduction": "Intro",
-                        "category": "Experiment",
-                        "tags": ["物理"],
-                    },
-                )
+                with self.assertRaisesRegex(ToolError, "retired"):
+                    plar_upload_sav(
+                        rt,
+                        {
+                            "sav_path": "/definitely/not/used.sav",
+                            "title": "RRR：为什么我们看到的天空是蓝色的",
+                            "introduction": "Intro",
+                            "category": "Experiment",
+                            "tags": ["物理"],
+                        },
+                    )
 
-            self.assertEqual(calls[0]["category_value"], "Discussion")
-            self.assertEqual(calls[0]["sav_path"], staged)
-            self.assertTrue(out.get("published"))
-            self.assertEqual(out.get("category"), "Discussion")
-            self.assertEqual(out.get("discussion_id"), "a" * 24)
-            self.assertEqual(
-                out.get("discussion_tag"),
-                f"<discussion={'a' * 24}>RRR：为什么我们看到的天空是蓝色的</discussion>",
-            )
-            self.assertTrue("<discussion=" in str(out.get("reply_suggestion_zh") or ""))
-            self.assertTrue(bool(out.get("sav_archived")))
-            self.assertTrue(isinstance(out.get("sav_archive_name"), str) and out.get("sav_archive_name"))
-            self.assertTrue(os.path.isfile(os.path.join(td, "log", "published_sav", str(out.get("sav_archive_name") or ""))))
+            self.assertEqual(calls, [])
+            self.assertTrue(os.path.isfile(staged))
 
     def test_requires_staged_cache_sav(self):
         with tempfile.TemporaryDirectory() as td:

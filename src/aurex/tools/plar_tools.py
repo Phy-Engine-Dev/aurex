@@ -1070,6 +1070,15 @@ def _experiment_file_summary(downloaded: dict[str, Any], *, requested: str, cate
 
 
 def plar_upload_sav(runtime: ToolRuntime, args: dict[str, Any]) -> dict[str, Any]:
+    # Kept as an explicit compatibility tombstone so saved plans fail closed.
+    # The old uploader bypassed server-bound publication authorization,
+    # evidence validation, the 5,000-element policy, fixed cover generation and
+    # the one-shot ledger.  All external writes must use the modern command.
+    raise ToolError(
+        "plar_upload_sav has been retired; use plar_publish_experiment with "
+        "server-authorized task scope and verified evidence"
+    )
+
     user = _require_user(runtime)
     # Security: ignore any provided sav_path; only allow publishing the task-staged cache sav
     # created by `verilog_to_sav` under runtime.cache_dir/staged_sav/<task_id>.sav.
@@ -1318,7 +1327,7 @@ PLAR_EXPERIMENT_FILE_TOOL = {
 
 PLAR_UPLOAD_SAV_TOOL = {
     "name": "plar_upload_sav",
-    "description": "Upload the task-staged cached .sav to PhysicsLab and confirm it in Discussion.",
+    "description": "Retired compatibility command. Always fails closed; use plar_publish_experiment.",
     "parameters": {
         "type": "object",
         "properties": {

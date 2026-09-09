@@ -181,7 +181,7 @@ def import_element(el: dict, *, scene: dict) -> list[dict[str, Any]] | None:
                 "internal_reset_pullup": int(6 not in wired)},
                "behavioral_555", list(range(8)), common + [
                    "Trigger and threshold comparators update an SR latch; OUT is a finite-resistance driver and DIS is an open-collector discharge path.",
-                   "Unwired CTRL uses 2/3 VCC and unwired RESET uses the internal pull-up; actual externally wired pins remain authoritative.",
+                   "The physical 5k-5k-5k divider remains present when CTRL is wired, so a bypass capacitor settles to 2/3 VCC while a low-impedance external drive remains authoritative; unwired RESET uses the internal pull-up.",
                    "No undocumented delay, output saturation curve, thermal behavior or internal bipolar transistor network is invented.",
                ], extra_source={"engineering_defaults": {"output_resistance_ohm": 1e-3,
                    "discharge_on_resistance_ohm": 1e-3,

@@ -1,4 +1,5 @@
 import json
+import os
 from pathlib import Path
 import tempfile
 import unittest
@@ -27,6 +28,18 @@ class CommunityPolicyTests(unittest.TestCase):
                               selected.community_recent_comments), (48, 200, 30))
             save_config(cfg, str(path))
             self.assertEqual(load_config(str(path)).context, cfg.context)
+
+    def test_save_config_is_atomic_private_even_over_existing_public_file(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'config.json'
+            path.write_text('{}')
+            path.chmod(0o644)
+            expected = load_config(str(path))
+            save_config(expected, str(path))
+            self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+            self.assertFalse(any(name.startswith('.aurex-config-')
+                                 for name in os.listdir(directory)))
+            self.assertEqual(load_config(str(path)), expected)
 
     def test_zero_hours_is_allowed_and_unsafe_or_mistyped_retrieval_settings_are_rejected(self):
         self.assertEqual(parse_context_policy({'community_recent_hours': 0}).community_recent_hours, 0)

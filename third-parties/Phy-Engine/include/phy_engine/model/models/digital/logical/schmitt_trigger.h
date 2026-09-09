@@ -124,20 +124,29 @@ namespace phy_engine::model
             {
                 case ::phy_engine::model::digital_node_statement_t::false_state:
                 {
-                    if(v >= clip.Vth_high) { clip.last_out = ::phy_engine::model::digital_node_statement_t::true_state; }
+                    if(::phy_engine::model::logic_level::is_high(v, clip.Vth_low, clip.Vth_high))
+                    {
+                        clip.last_out = ::phy_engine::model::digital_node_statement_t::true_state;
+                    }
                     break;
                 }
                 case ::phy_engine::model::digital_node_statement_t::true_state:
                 {
-                    if(v <= clip.Vth_low) { clip.last_out = ::phy_engine::model::digital_node_statement_t::false_state; }
+                    if(::phy_engine::model::logic_level::is_low(v, clip.Vth_low, clip.Vth_high))
+                    {
+                        clip.last_out = ::phy_engine::model::digital_node_statement_t::false_state;
+                    }
                     break;
                 }
                 case ::phy_engine::model::digital_node_statement_t::indeterminate_state:
                 case ::phy_engine::model::digital_node_statement_t::high_impedence_state:
                 default:
                 {
-                    if(v >= clip.Vth_high) { clip.last_out = ::phy_engine::model::digital_node_statement_t::true_state; }
-                    else if(v <= clip.Vth_low)
+                    if(::phy_engine::model::logic_level::is_high(v, clip.Vth_low, clip.Vth_high))
+                    {
+                        clip.last_out = ::phy_engine::model::digital_node_statement_t::true_state;
+                    }
+                    else if(::phy_engine::model::logic_level::is_low(v, clip.Vth_low, clip.Vth_high))
                     {
                         clip.last_out = ::phy_engine::model::digital_node_statement_t::false_state;
                     }
@@ -186,4 +195,3 @@ namespace phy_engine::model
 
     static_assert(::phy_engine::model::defines::can_generate_pin_view<SCHMITT_TRIGGER>);
 }  // namespace phy_engine::model
-

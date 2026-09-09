@@ -39,8 +39,8 @@ namespace phy_engine::model
             if(n == nullptr) { return ::phy_engine::model::digital_node_statement_t::indeterminate_state; }
             if(n->num_of_analog_node == 0) { return n->node_information.dn.state; }
             double const v{n->node_information.an.voltage.real()};
-            if(v >= clip.Hl) { return ::phy_engine::model::digital_node_statement_t::true_state; }
-            if(v <= clip.Ll) { return ::phy_engine::model::digital_node_statement_t::false_state; }
+            if(::phy_engine::model::logic_level::is_high(v, clip.Ll, clip.Hl)) { return ::phy_engine::model::digital_node_statement_t::true_state; }
+            if(::phy_engine::model::logic_level::is_low(v, clip.Ll, clip.Hl)) { return ::phy_engine::model::digital_node_statement_t::false_state; }
             return ::phy_engine::model::digital_node_statement_t::indeterminate_state;
         };
 
@@ -86,4 +86,3 @@ namespace phy_engine::model
 
     static_assert(::phy_engine::model::defines::can_generate_pin_view<RESOLVE2>);
 }  // namespace phy_engine::model
-

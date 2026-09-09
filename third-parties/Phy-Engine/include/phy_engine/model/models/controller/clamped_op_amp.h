@@ -16,6 +16,10 @@ namespace phy_engine::model
         inline static constexpr fast_io::u8string_view identification_name{u8"OPAMP_CLAMP"};
         double mu{1e5}, Vmin{-15}, Vmax{15};
         double ac_gain{};
+        // Newton active-set probe. This does not replace the physical input
+        // or output and is never used by the final convergence equation.
+        double dc_limited_raw{};
+        bool dc_limiter_initialized{};
         pin pins[4]{{{u8"+"}}, {{u8"-"}}, {{u8"out"}}, {{u8"ref"}}};
         branch branches{};
     };
@@ -56,9 +60,25 @@ namespace phy_engine::model
         double const input=a.pins[0].nodes->node_information.an.voltage.real()-a.pins[1].nodes->node_information.an.voltage.real();
         double const raw=a.mu*input;
         if(!std::isfinite(raw)) return false;
-        double const output=std::clamp(raw,a.Vmin,a.Vmax);
-        a.ac_gain=(raw>=a.Vmin && raw<=a.Vmax && a.Vmin!=a.Vmax)?a.mu:0;
-        return clamped_op_amp_stamp(a,mna,a.ac_gain,output-a.ac_gain*input);
+        // A first Newton overshoot can otherwise switch off the feedback
+        // derivative and make a precision-rectifier loop alternate between
+        // opposite rails. Advance only the clamp-region probe; inside the
+        // linear region the exact equation is unchanged because its RHS is 0.
+        if(!a.dc_limiter_initialized)
+        {
+            a.dc_limited_raw=0;
+            a.dc_limiter_initialized=true;
+        }
+        double const max_output_probe_step=std::max(
+            {0.25,std::abs(a.Vmin)/32.0,std::abs(a.Vmax)/32.0,
+             (a.Vmax-a.Vmin)/32.0});
+        double const probe=std::clamp(raw,a.dc_limited_raw-max_output_probe_step,
+                                     a.dc_limited_raw+max_output_probe_step);
+        a.dc_limited_raw=probe;
+        double const output=std::clamp(probe,a.Vmin,a.Vmax);
+        a.ac_gain=(probe>=a.Vmin && probe<=a.Vmax && a.Vmin!=a.Vmax)?a.mu:0;
+        double const probe_input=a.mu==0 ? input : probe/a.mu;
+        return clamped_op_amp_stamp(a,mna,a.ac_gain,output-a.ac_gain*probe_input);
     }
     inline bool iterate_ac_define(model_reserve_type_t<clamped_op_amp>,clamped_op_amp const& a,MNA::MNA& mna,[[maybe_unused]] double omega) noexcept
     { return clamped_op_amp_stamp(a,mna,a.ac_gain,0); }

@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import math
 import os
+import tempfile
 from dataclasses import asdict, dataclass, field, replace
 from typing import Any
 
@@ -598,8 +599,29 @@ def load_config(path: str) -> AurexConfig:
 
 
 def save_config(cfg: AurexConfig, path: str) -> None:
-    os.makedirs(os.path.dirname(os.path.abspath(path)) or ".", exist_ok=True)
+    target = os.path.abspath(path)
+    parent = os.path.dirname(target) or "."
+    os.makedirs(parent, exist_ok=True)
     data = asdict(cfg)
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
-        f.write("\n")
+    fd, temporary = tempfile.mkstemp(prefix=".aurex-config-", suffix=".tmp", dir=parent)
+    try:
+        # Configuration contains the community password and API credentials.
+        # mkstemp starts at 0600 irrespective of the process umask; fchmod also
+        # documents and enforces that invariant on unusual platforms/filesystems.
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            fd = -1
+            json.dump(data, f, ensure_ascii=False, indent=2)
+            f.write("\n")
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(temporary, target)
+        os.chmod(target, 0o600)
+    except BaseException:
+        if fd >= 0:
+            os.close(fd)
+        try:
+            os.unlink(temporary)
+        except FileNotFoundError:
+            pass
+        raise

@@ -226,8 +226,8 @@ namespace phy_engine::model
                 return n->node_information.dn.state;
             }
             double const v{n->node_information.an.voltage.real()};
-            if(v >= m.Hl) { return ::phy_engine::verilog::digital::logic_t::true_state; }
-            if(v <= m.Ll) { return ::phy_engine::verilog::digital::logic_t::false_state; }
+            if(::phy_engine::model::logic_level::is_high(v, m.Ll, m.Hl)) { return ::phy_engine::verilog::digital::logic_t::true_state; }
+            if(::phy_engine::model::logic_level::is_low(v, m.Ll, m.Hl)) { return ::phy_engine::verilog::digital::logic_t::false_state; }
             return ::phy_engine::verilog::digital::logic_t::indeterminate_state;
         };
 

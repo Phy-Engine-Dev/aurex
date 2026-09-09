@@ -2,10 +2,10 @@
 
 The public PhysicsLab schema gives terminal order and a small number of
 editor parameters, but not the closed-source device equations.  These
-mappings therefore preserve every terminal and use the saved forward working
-point to parameterise PE's Shockley model.  The approximation and all defaults
-remain attached to every primitive as provenance; saved Statistics are never
-used as a fresh solve or as a fitted answer.
+mappings therefore preserve every terminal and use explicit catalog
+characteristics to parameterise PE's Shockley model.  The approximation and
+all defaults remain attached to every primitive as provenance; saved
+Statistics are never used as a fresh solve or as a fitted answer.
 """
 from __future__ import annotations
 
@@ -20,6 +20,13 @@ from .registry import ToolError
 _SDK = ("https://github.com/SekaiArendelle/physicslab/blob/"
         "fa95b96910dd0fd4e09cf27e24cefaf9b91798ad/"
         "physicslab/circuit/elements/")
+# PhysicsLab publishes a forward drop but no I/V-curve calibration current for
+# the families whose only current field is 额定电流.  Keep that field out of
+# the curve entirely: it belongs to plar_damage's overload protection.  A fixed
+# 1 A point is an explicit PE engineering default and preserves the catalog's
+# existing default-device characteristic without letting a safety rating scale
+# conductance.
+_RATED_DIODE_REFERENCE_CURRENT_A = 1.0
 _PIN_COUNTS = {
     "Basic Diode": 2,
     "Light-Emitting Diode": 2,
@@ -103,6 +110,24 @@ def _pn_params(forward_v: float, working_current: float, reverse_v: float,
         "saved_reverse_rating_v": reverse_v,
         "reverse_breakdown_enabled": bool(reverse_v > 0),
     }
+    return params, derivation
+
+
+def _rated_pn_params(forward_v: float, rated_current: float, reverse_v: float,
+                     cid: str) -> tuple[dict[str, float], dict[str, Any]]:
+    """Map a rated-current diode without treating its limit as a curve point."""
+    if rated_current <= 0:
+        raise ToolError(f"{cid}: diode rated current must be positive")
+    params, derivation = _pn_params(
+        forward_v, _RATED_DIODE_REFERENCE_CURRENT_A, reverse_v, cid)
+    reference_current = derivation.pop("saved_working_current_a")
+    derivation.update({
+        "kind": "shockley_forward_voltage_engineering_reference",
+        "saved_current_rating_a": rated_current,
+        "native_reference_current_a": reference_current,
+        "reference_current_source": "explicit_engineering_default",
+        "rating_used_only_by_damage_protection": True,
+    })
     return params, derivation
 
 
@@ -195,15 +220,30 @@ def import_element(el: dict, *, scene: dict) -> list[dict[str, Any]] | None:
     ]
     if kind in {"Basic Diode", "Light-Emitting Diode", "Photodiode"}:
         forward = _number(props, "前向压降", cid)
-        current_key = "工作电流" if kind == "Light-Emitting Diode" else "额定电流"
-        current = _number(props, current_key, cid)
+        if kind == "Light-Emitting Diode":
+            current = _number(props, "工作电流", cid)
+            rated_family = False
+        else:
+            current_rating = _number(props, "额定电流", cid)
+            rated_family = True
         reverse = (_number(props, "反向耐压", cid) if "反向耐压" in props
                    else _number(props, "击穿电压", cid, optional=True))
-        params, derivation = _pn_params(forward, current, reverse, cid)
-        assumptions = common + [
-            "PE uses a Shockley PN approximation anchored exactly at the saved forward-voltage/current working point; the original app equation is not public.",
-            "A zero/missing reverse-breakdown field disables native avalanche instead of inventing a threshold.",
-        ]
+        if rated_family:
+            params, derivation = _rated_pn_params(
+                forward, current_rating, reverse, cid)
+            curve_assumption = (
+                "The public schema exposes a forward drop and rated current, but no I/V calibration current. "
+                "PE therefore uses an explicit 1 A engineering reference at the saved forward drop; "
+                "the rating remains a separate damage limit and never rescales the I/V curve."
+            )
+        else:
+            params, derivation = _pn_params(forward, current, reverse, cid)
+            curve_assumption = (
+                "PE uses a Shockley PN approximation anchored exactly at the saved forward-voltage/working-current point; "
+                "the original app equation is not public."
+            )
+        assumptions = common + [curve_assumption,
+            "A zero/missing reverse-breakdown field disables native avalanche instead of inventing a threshold."]
         if kind == "Photodiode":
             assumptions += [
                 "The save contains sensitivity and response time but no illumination sample. This solve is the dark PN characteristic; no photocurrent is invented.",
@@ -232,10 +272,10 @@ def import_element(el: dict, *, scene: dict) -> list[dict[str, Any]] | None:
     elif kind == "Rectifier":
         forward = _number(props, "前向压降", cid)
         rated = _number(props, "额定电流", cid)
-        params, derivation = _pn_params(forward, rated, 0.0, cid)
+        params, derivation = _rated_pn_params(forward, rated, 0.0, cid)
         assumptions = common + [
             "Bridge convention is PL0/PL1 AC and PL2(+)/PL3(-), matching PE's documented full-bridge terminal order.",
-            "Four explicit PN primitives preserve the saved forward drop rather than using PE's unrelated default bridge diodes.",
+            "Four explicit PN primitives use the saved forward drop and a fixed 1 A PE engineering reference; the saved rated current is only a damage limit.",
         ]
         for role, a, b in (("a_to_plus", 0, 2), ("b_to_plus", 1, 2),
                            ("minus_to_a", 3, 0), ("minus_to_b", 3, 1)):

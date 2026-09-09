@@ -184,7 +184,11 @@ def _lower_one(source: str, memory: Memory) -> str:
                 + f" (({index_expr}) == {index}) {memory.element(index)} {assignment} {rhs};"
                 for position, index in enumerate(memory.indices)
             )
-            replacements.append((match.start(), semicolon + 1, f"begin {arms} end"))
+            # Preserve a lexical boundary after the replacement.  The source
+            # may legally put the next statement on the same line with no
+            # whitespace (``mem[i] <= d;assign q=...``); without this space the
+            # lowered block becomes the invalid token sequence ``endassign``.
+            replacements.append((match.start(), semicolon + 1, f"begin {arms} end "))
             skip_until = semicolon + 1
             continue
         if tail < len(masked) and masked[tail] == "[":

@@ -85,8 +85,8 @@ namespace phy_engine::model
             if(n == nullptr) { return ::phy_engine::model::digital_node_statement_t::indeterminate_state; }
             if(n->num_of_analog_node == 0) { return n->node_information.dn.state; }
             double const v{n->node_information.an.voltage.real()};
-            if(v >= m.Hl) { return ::phy_engine::model::digital_node_statement_t::true_state; }
-            if(v <= m.Ll) { return ::phy_engine::model::digital_node_statement_t::false_state; }
+            if(::phy_engine::model::logic_level::is_high(v, m.Ll, m.Hl)) { return ::phy_engine::model::digital_node_statement_t::true_state; }
+            if(::phy_engine::model::logic_level::is_low(v, m.Ll, m.Hl)) { return ::phy_engine::model::digital_node_statement_t::false_state; }
             return ::phy_engine::model::digital_node_statement_t::indeterminate_state;
         };
 

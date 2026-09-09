@@ -259,7 +259,6 @@ namespace phy_engine::model
     {
         if(!p.valid()) { return false; }
         p.transient = false;
-        p.latch_overload(p.overload_mask(true));
         rated_protection_stamp(p, mna);
         return true;
     }
@@ -284,7 +283,6 @@ namespace phy_engine::model
     {
         if(!p.valid()) { return false; }
         p.transient = true;
-        p.latch_overload(p.overload_mask(false));
         rated_protection_stamp(p, mna);
         return true;
     }
@@ -305,9 +303,17 @@ namespace phy_engine::model
         return true;
     }
 
-    inline bool check_convergence_define(model_reserve_type_t<rated_protection>, rated_protection const& p) noexcept
+    inline bool check_convergence_define(model_reserve_type_t<rated_protection>, rated_protection& p) noexcept
     {
-        return p.broken || p.overload_mask(!p.transient) == 0u;
+        if(p.broken) { return true; }
+        auto const mask{p.overload_mask(!p.transient)};
+        if(mask == 0u) { return true; }
+        // Newton iterates are numerical probes, not physical operating points.
+        // The circuit calls this only after its voltage/current delta test has
+        // accepted a stable candidate. Latch that real overload, reject this
+        // candidate once, and solve again with the now-open path.
+        p.latch_overload(mask);
+        return false;
     }
 
     inline constexpr pin_view generate_pin_view_define(model_reserve_type_t<rated_protection>, rated_protection& p) noexcept

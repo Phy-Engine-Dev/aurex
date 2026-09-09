@@ -26,6 +26,12 @@ namespace phy_engine::model
         bool internal_reset_pullup{true};
 
         bool latched_high{};
+        // A fixed TR time point may commit at most one causal SR-latch edge.
+        // Newton then re-solves the resulting topology without feeding an
+        // unconverged candidate voltage back into the latch.
+        bool tr_transition_available{true};
+        // Limits the state-commit hook to TR; DC/OP keep their original loop.
+        bool tr_iteration_active{};
         double trigger_threshold{};
         double threshold_threshold{};
         pin pins[8]{{{u8"vcc"}}, {{u8"dis"}}, {{u8"thr"}}, {{u8"ctrl"}},
@@ -170,17 +176,14 @@ namespace phy_engine::model
         ne555_conductance_stamp(timer, mna, 2, 7, input_g); // THR
         ne555_conductance_stamp(timer, mna, 4, 7, input_g); // TRIG
 
-        if(timer.internal_control)
-        {
-            // Weakly expose the internal 2/3-VCC divider at CTRL while the
-            // behavioral comparator continues to use the exact same ratio.
-            ne555_conductance_stamp(timer, mna, 3, 0, input_g);
-            ne555_conductance_stamp(timer, mna, 3, 7, input_g * .5);
-        }
-        else
-        {
-            ne555_conductance_stamp(timer, mna, 3, 7, input_g);
-        }
+        // A bipolar 555 always retains its three internal 5 kohm divider
+        // resistors.  Wiring CTRL does not remove that divider: a bypass
+        // capacitor must charge to 2/3 VCC, while a low-impedance external
+        // source may still override it.  The CTRL node sees one 5 kohm
+        // resistor to VCC and two series 5 kohm resistors to ground.
+        constexpr double divider_resistance{5000.0};
+        ne555_conductance_stamp(timer, mna, 3, 0, 1.0 / divider_resistance);
+        ne555_conductance_stamp(timer, mna, 3, 7, 1.0 / (2.0 * divider_resistance));
 
         if(timer.internal_reset_pullup)
         {
@@ -196,6 +199,7 @@ namespace phy_engine::model
                                   MNA::MNA& mna) noexcept
     {
         if(!timer.valid()) { return false; }
+        timer.tr_iteration_active = false;
         timer.latched_high = timer.desired_latch();
         ne555_input_stamp(timer, mna);
         ne555_branch_stamp(timer, mna, 0, 5, timer.output_r,
@@ -208,7 +212,32 @@ namespace phy_engine::model
     inline bool iterate_tr_define(model_reserve_type_t<ne555_timer>, ne555_timer& timer,
                                   MNA::MNA& mna, [[maybe_unused]] double time) noexcept
     {
-        return iterate_dc_define(model_reserve_type<ne555_timer>, timer, mna);
+        if(!timer.valid()) { return false; }
+        timer.tr_iteration_active = true;
+        ne555_input_stamp(timer, mna);
+        ne555_branch_stamp(timer, mna, 0, 5, timer.output_r,
+                           timer.latched_high ? timer.high_v : timer.low_v);
+        ne555_branch_stamp(timer, mna, 1, 1,
+                           timer.latched_high ? timer.discharge_off_r : timer.discharge_on_r, 0.0);
+        return true;
+    }
+
+    inline bool check_convergence_define(model_reserve_type_t<ne555_timer>, ne555_timer& timer) noexcept
+    {
+        if(!timer.tr_iteration_active) { return true; }
+        bool const desired{timer.desired_latch()};
+        if(desired == timer.latched_high || !timer.tr_transition_available) { return true; }
+        timer.latched_high = desired;
+        timer.tr_transition_available = false;
+        return false;
+    }
+
+    inline bool step_changed_tr_define(model_reserve_type_t<ne555_timer>, ne555_timer& timer,
+                                       [[maybe_unused]] double last_step,
+                                       [[maybe_unused]] double new_step) noexcept
+    {
+        timer.tr_transition_available = true;
+        return true;
     }
 
     inline bool iterate_trop_define(model_reserve_type_t<ne555_timer>, ne555_timer& timer,

@@ -82,7 +82,10 @@ namespace phy_engine::model
         if(node_i && node_en && node_o) [[likely]]
         {
             bool enabled{};
-            if(node_en->num_of_analog_node != 0) { enabled = node_en->node_information.an.voltage.real() >= t.Hl; }
+            if(node_en->num_of_analog_node != 0)
+            {
+                enabled = ::phy_engine::model::logic_level::is_high(node_en->node_information.an.voltage.real(), t.Ll, t.Hl);
+            }
             else
             {
                 enabled = node_en->node_information.dn.state == ::phy_engine::model::digital_node_statement_t::true_state;
@@ -102,8 +105,8 @@ namespace phy_engine::model
             if(node_i->num_of_analog_node != 0)
             {
                 double const v{node_i->node_information.an.voltage.real()};
-                if(v >= t.Hl) { inputState = ::phy_engine::model::digital_node_statement_t::true_state; }
-                else if(v <= t.Ll) { inputState = ::phy_engine::model::digital_node_statement_t::false_state; }
+                if(::phy_engine::model::logic_level::is_high(v, t.Ll, t.Hl)) { inputState = ::phy_engine::model::digital_node_statement_t::true_state; }
+                else if(::phy_engine::model::logic_level::is_low(v, t.Ll, t.Hl)) { inputState = ::phy_engine::model::digital_node_statement_t::false_state; }
                 else
                 {
                     inputState = ::phy_engine::model::digital_node_statement_t::indeterminate_state;
@@ -141,4 +144,3 @@ namespace phy_engine::model
 
     static_assert(::phy_engine::model::defines::can_generate_pin_view<TRI>);
 }  // namespace phy_engine::model
-

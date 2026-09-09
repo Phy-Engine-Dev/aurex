@@ -64,7 +64,9 @@ class LocatorNativeTests(unittest.TestCase):
         self.assertEqual(yellow, {"IN3"})
         self.assertEqual(set(camera["minimap"]["highlighted_ids"]), yellow)
         self.assertIn("distant-original", {e["id"] for e in markers})
-        self.assertEqual(svg.attrib["height"], "820")
+        # A focused inspection defaults to the conventional-symbol schematic;
+        # its fixed canvas reserves room for the complete-scene locator.
+        self.assertEqual((svg.attrib["width"], svg.attrib["height"]), ("1500", "1040"))
         self.assertNotIn("highlighted_ids", result["camera"]["minimap"])
         self.assertTrue(result["camera"]["minimap"]["rough"])
         x,y,w,h = camera["minimap"]["bounds"]

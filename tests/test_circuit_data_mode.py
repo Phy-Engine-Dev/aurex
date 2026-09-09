@@ -165,8 +165,9 @@ class DataModeNativeTests(unittest.TestCase):
             self.assertEqual([p["id"] for p in ports], [p["id"] for p in expected])
             for actual, original in zip(ports, expected):
                 self.assertEqual(actual["label"], original["label"])
-                for a, b in zip(actual["position"], original["position"]):
-                    self.assertAlmostEqual(a, b, places=6)  # PLSAV's existing decimal serialization
+                # interface_only is intentionally a compact electrical-I/O view;
+                # spatial data belongs to an explicit focused/spatial inspection.
+                self.assertNotIn("position", actual)
                 self.assertIn("logic_source", actual)
                 self.assertNotIn("pins", actual)
                 if source == analyzed["state_path"]:

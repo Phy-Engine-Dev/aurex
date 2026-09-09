@@ -99,6 +99,24 @@ endmodule'''
         self.assertTrue(result['verified'], result)
         self.assertEqual(result['reported_failure_markers'], [])
 
+    def test_icarus_error_and_failed_assert_cannot_be_reported_verified(self):
+        sources = [
+            'module tb; initial begin $error("MISMATCH"); $finish; end endmodule',
+            "module tb; initial begin assert(1'b0); #1; $finish; end endmodule",
+            'module tb; initial begin assert(1\'b0) else $error("ASSERT_BAD"); $finish; end endmodule',
+        ]
+        for source in sources:
+            with self.subTest(source=source):
+                result = self.run_hdl(source)
+                self.assertEqual(result['simulation']['exit_code'], 0, result)
+                self.assertFalse(result['verified'], result)
+                self.assertIn('icarus_runtime_ERROR_line', result['reported_failure_markers'])
+
+        warning = self.run_hdl(
+            'module tb; initial begin $warning("WARN_ONLY"); $finish; end endmodule')
+        self.assertTrue(warning['verified'], warning)
+        self.assertEqual(warning['reported_failure_markers'], [])
+
     def test_real_assertion_fails(self):
         result = self.run_hdl('module tb; initial $fatal(1,"EXPECTED_ASSERTION_FAILURE"); endmodule')
         self.assertFalse(result["verified"])

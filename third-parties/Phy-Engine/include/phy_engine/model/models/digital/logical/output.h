@@ -109,7 +109,7 @@ namespace phy_engine::model
             {
                 case ::phy_engine::model::digital_node_statement_t::false_state:
                 {
-                    if(voltage >= clip.Hl)
+                    if(::phy_engine::model::logic_level::is_high(voltage, clip.Ll, clip.Hl))
                     {
                         if(clip.Tsu > 0.0)
                         {
@@ -126,7 +126,7 @@ namespace phy_engine::model
                 }
                 case ::phy_engine::model::digital_node_statement_t::true_state:
                 {
-                    if(voltage <= clip.Ll)
+                    if(::phy_engine::model::logic_level::is_low(voltage, clip.Ll, clip.Hl))
                     {
                         if(clip.Th > 0.0)
                         {
@@ -147,7 +147,7 @@ namespace phy_engine::model
                     {
                         case ::phy_engine::model::digital_node_statement_t::false_state:
                         {
-                            if(voltage <= clip.Ll)
+                            if(::phy_engine::model::logic_level::is_low(voltage, clip.Ll, clip.Hl))
                             {
                                 if(tr_duration - clip.duration_A >= clip.Tsu) { clip.inputA = ::phy_engine::model::digital_node_statement_t::false_state; }
                             }
@@ -159,7 +159,7 @@ namespace phy_engine::model
                         }
                         case ::phy_engine::model::digital_node_statement_t::true_state:
                         {
-                            if(voltage >= clip.Hl)
+                            if(::phy_engine::model::logic_level::is_high(voltage, clip.Ll, clip.Hl))
                             {
                                 if(tr_duration - clip.duration_A >= clip.Th) { clip.inputA = ::phy_engine::model::digital_node_statement_t::true_state; }
                             }
@@ -171,11 +171,11 @@ namespace phy_engine::model
                         }
                         case ::phy_engine::model::digital_node_statement_t::indeterminate_state:
                         {
-                            if(voltage >= clip.Hl)
+                            if(::phy_engine::model::logic_level::is_high(voltage, clip.Ll, clip.Hl))
                             {
                                 if(tr_duration - clip.duration_A >= clip.Th) { clip.inputA = ::phy_engine::model::digital_node_statement_t::true_state; }
                             }
-                            else if(voltage <= clip.Ll)
+                            else if(::phy_engine::model::logic_level::is_low(voltage, clip.Ll, clip.Hl))
                             {
                                 if(tr_duration - clip.duration_A >= clip.Tsu) { clip.inputA = ::phy_engine::model::digital_node_statement_t::false_state; }
                             }

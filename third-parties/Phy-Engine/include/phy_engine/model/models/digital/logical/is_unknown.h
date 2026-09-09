@@ -94,8 +94,8 @@ namespace phy_engine::model
         else
         {
             double const v{node_i->node_information.an.voltage.real()};
-            if(v >= clip.Hl) { in = ::phy_engine::model::digital_node_statement_t::true_state; }
-            else if(v <= clip.Ll)
+            if(::phy_engine::model::logic_level::is_high(v, clip.Ll, clip.Hl)) { in = ::phy_engine::model::digital_node_statement_t::true_state; }
+            else if(::phy_engine::model::logic_level::is_low(v, clip.Ll, clip.Hl))
             {
                 in = ::phy_engine::model::digital_node_statement_t::false_state;
             }
@@ -134,4 +134,3 @@ namespace phy_engine::model
 
     static_assert(::phy_engine::model::defines::can_generate_pin_view<IS_UNKNOWN>);
 }  // namespace phy_engine::model
-
