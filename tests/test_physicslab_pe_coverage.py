@@ -20,7 +20,7 @@ sys.path.insert(0, str(ROOT / "src"))
 from aurex.config import AurexConfig
 from aurex.phy_engine.catalog import PL_MAX_POWER_W
 from aurex.tools.circuits import _load_spec, circuit_analyze, circuit_inspect
-from aurex.tools.plar_damage import _CONTRACTS
+from aurex.tools.plar_damage import _CONTRACTS, PE_MAX_FINITE_CURRENT_A
 from aurex.tools.registry import ToolRuntime
 
 
@@ -120,6 +120,10 @@ class PhysicsLabToPECoverageTests(unittest.TestCase):
                 self.assertEqual(component["params"]["low_v"], properties["低电平"])
             if "高电平" in properties:
                 self.assertEqual(component["params"]["high_v"], properties["高电平"])
+            compatibility = component["pl_source"]["digital_current_compatibility"]
+            self.assertEqual(compatibility["effective_max_current_a"],
+                             PE_MAX_FINITE_CURRENT_A)
+            self.assertFalse(compatibility["saved_limit_used_for_tripping"])
         guards_by_parent = {
             row["pl_source"]["parent_identifier"]: row
             for row in spec["components"] if row["type"] == "rated_protection"
@@ -398,7 +402,7 @@ class PhysicsLabToPECoverageTests(unittest.TestCase):
         self.assertGreater(abs(fuse_guard["model_state"]["trip_current_a"]), 2)
         self.assertLess(abs(load["voltage"][0]), 1e-6)
 
-    def test_plsav_gate_maximum_current_trips_only_for_real_analog_load(self):
+    def test_plsav_gate_maximum_current_is_disabled_for_physicslab_compatibility(self):
         saved = self.make_sav("gate-overload", [
             {"id": "IN", "model_id": "Logic Input",
              "properties": {"低电平": 0, "高电平": 3, "开关": 1},
@@ -410,16 +414,27 @@ class PhysicsLabToPECoverageTests(unittest.TestCase):
              "nodes": ["out", "gnd"], "position": [.4, 0, 0]},
         ])
         original = saved.read_bytes()
+        imported = _load_spec(self.runtime, str(saved))
+        imported_guard = next(row for row in imported["components"]
+                              if row["type"] == "rated_protection"
+                              and row["pl_source"]["parent_identifier"] == "BUF")
         result = circuit_analyze(self.runtime, {"path": str(saved), "analysis": "dc"})
         self.assertEqual(saved.read_bytes(), original)
         rows = self.full_measurements(result)
         guard = next(row for row in rows if row["type"] == "rated_protection"
                      and row["pl_source"]["parent_identifier"] == "BUF")
         load = next(row for row in rows if row["id"] == "LOAD")
-        self.assertEqual(guard["model_state"]["broken"], 1)
-        self.assertEqual(guard["model_state"]["trip_mask"], 1)
-        self.assertGreater(abs(guard["model_state"]["trip_current_a"]), .1)
-        self.assertLess(abs(load["voltage"][0]), 1e-6)
+        self.assertEqual(imported_guard["params"]["max_current_a"],
+                         PE_MAX_FINITE_CURRENT_A)
+        self.assertEqual(guard["model_state"]["broken"], 0)
+        self.assertEqual(guard["model_state"]["trip_mask"], 0)
+        self.assertGreater(abs(guard["model_state"]["current_a"]), .1)
+        self.assertAlmostEqual(load["voltage"][0], 3.0, places=6)
+        compatibility = next(row for row in imported["components"]
+                             if row["id"] == "BUF")["pl_source"]["digital_current_compatibility"]
+        self.assertEqual(compatibility["saved_max_current_a"], .1)
+        self.assertEqual(compatibility["effective_max_current_a"],
+                         PE_MAX_FINITE_CURRENT_A)
 
         pure = self.make_sav("gate-pure-digital", [
             {"id": "IN", "model_id": "Logic Input",
@@ -436,6 +451,9 @@ class PhysicsLabToPECoverageTests(unittest.TestCase):
         self.assertFalse(any(row["type"] == "rated_protection"
                              and row.get("pl_source", {}).get("parent_identifier") == "BUF"
                              for row in pure_spec["components"]))
+        pure_buffer = next(row for row in pure_spec["components"] if row["id"] == "BUF")
+        self.assertEqual(pure_buffer["pl_source"]["digital_current_compatibility"]
+                         ["effective_max_current_a"], PE_MAX_FINITE_CURRENT_A)
 
     def test_unlimited_float32_power_sentinel_does_not_create_a_trip_guard(self):
         saved = self.make_sav("unlimited-source", [{

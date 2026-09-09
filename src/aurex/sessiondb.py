@@ -25,7 +25,8 @@ class SessionDB:
                 CREATE TABLE IF NOT EXISTS sessions (
                     id TEXT PRIMARY KEY, title TEXT NOT NULL, source TEXT NOT NULL,
                     status TEXT NOT NULL, created REAL NOT NULL, updated REAL NOT NULL,
-                    summary TEXT NOT NULL DEFAULT '', compacted_until INTEGER NOT NULL DEFAULT 0
+                    summary TEXT NOT NULL DEFAULT '', compacted_until INTEGER NOT NULL DEFAULT 0,
+                    owner_id TEXT NOT NULL DEFAULT ''
                 );
                 CREATE TABLE IF NOT EXISTS messages (
                     id INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT NOT NULL,
@@ -107,6 +108,11 @@ class SessionDB:
                 CREATE INDEX IF NOT EXISTS subagent_tools_parent
                     ON subagent_tool_outcomes(parent_run_id, created);
             """)
+            session_columns = {r['name'] for r in db.execute('PRAGMA table_info(sessions)')}
+            if 'owner_id' not in session_columns:
+                # Existing, community and CLI-created records remain operator-only.
+                db.execute("ALTER TABLE sessions ADD COLUMN owner_id TEXT NOT NULL DEFAULT ''")
+            db.execute('CREATE INDEX IF NOT EXISTS sessions_owner ON sessions(owner_id,updated)')
             columns = {r['name'] for r in db.execute('PRAGMA table_info(runs)')}
             if 'input_data' not in columns:
                 db.execute("ALTER TABLE runs ADD COLUMN input_data TEXT NOT NULL DEFAULT '{}'")
@@ -138,28 +144,35 @@ class SessionDB:
         finally:
             db.close()
 
-    def session(self, session_id: str | None = None, *, title: str = "New conversation", source: str = "web") -> str:
+    def session(self, session_id: str | None = None, *, title: str = "New conversation",
+                source: str = "web", owner_id: str = "") -> str:
+        if not isinstance(owner_id, str) or len(owner_id) > 200:
+            raise ValueError('owner_id must be text up to 200 characters')
         sid = session_id or uuid.uuid4().hex
         with self.connect() as db:
-            db.execute("INSERT OR IGNORE INTO sessions(id,title,source,status,created,updated) VALUES(?,?,?,'idle',?,?)",
-                       (sid, title[:120], source, time.time(), time.time()))
+            db.execute("INSERT OR IGNORE INTO sessions(id,title,source,status,created,updated,owner_id) VALUES(?,?,?,'idle',?,?,?)",
+                       (sid, title[:120], source, time.time(), time.time(), owner_id))
         return sid
 
-    def get(self, sid: str) -> dict | None:
+    def get(self, sid: str, *, owner_id: str | None = None) -> dict | None:
+        owner_clause = ' AND s.owner_id=?' if owner_id is not None else ''
+        values = (sid, owner_id) if owner_id is not None else (sid,)
         with self.connect() as db:
             row = db.execute("""SELECT s.*, (SELECT r.id FROM runs r WHERE r.session_id=s.id
                 AND r.status IN ('running','cancelling') ORDER BY r.created,r.id LIMIT 1) AS active_run_id,
                 (SELECT COUNT(*) FROM runs r WHERE r.session_id=s.id AND r.status='queued' AND r.cancel_requested=0) AS queued_tasks
-                FROM sessions s WHERE s.id=?""", (sid,)).fetchone()
+                FROM sessions s WHERE s.id=?""" + owner_clause, values).fetchone()
         return dict(row) if row else None
 
-    def list(self) -> list[dict]:
+    def list(self, *, owner_id: str | None = None) -> list[dict]:
+        where = ' WHERE s.owner_id=?' if owner_id is not None else ''
+        values = (owner_id,) if owner_id is not None else ()
         with self.connect() as db:
             return [dict(r) for r in db.execute("""SELECT s.id,s.title,s.source,s.status,s.created,s.updated,
                 (SELECT r.id FROM runs r WHERE r.session_id=s.id AND r.status IN ('running','cancelling')
                  ORDER BY r.created,r.id LIMIT 1) AS active_run_id,
                 (SELECT COUNT(*) FROM runs r WHERE r.session_id=s.id AND r.status='queued' AND r.cancel_requested=0) AS queued_tasks
-                FROM sessions s ORDER BY s.updated DESC LIMIT 200""")]
+                FROM sessions s""" + where + " ORDER BY s.updated DESC LIMIT 200", values)]
 
     def status(self, sid: str, status: str):
         with self.connect() as db:
@@ -210,7 +223,8 @@ class SessionDB:
                      task_id: str | None = None, images=None, title: str | None = None,
                      requester_user_id: str | None = None, source: str = 'web', target=None,
                      explicit_publish_requested: bool = False, requester_nickname: str | None = None,
-                     reply_id: str | None = None, metadata: dict | None = None, _legacy: bool = False) -> str:
+                     reply_id: str | None = None, metadata: dict | None = None,
+                     owner_id: str | None = None, _legacy: bool = False) -> str:
         if not isinstance(original_user_request, str) or not original_user_request.strip() or len(original_user_request) > 500000:
             raise ValueError('Original request must contain 1–500000 characters')
         if requester_user_id is not None and (not isinstance(requester_user_id, str) or not requester_user_id.strip() or len(requester_user_id) > 200):
@@ -224,6 +238,8 @@ class SessionDB:
                 raise ValueError(name + ' must be nonempty text or null')
         if metadata is not None and not isinstance(metadata, dict):
             raise ValueError('Server metadata must be an object')
+        if owner_id is not None and (not isinstance(owner_id, str) or not owner_id or len(owner_id) > 200):
+            raise ValueError('owner_id must be nonempty text up to 200 characters or null')
         if target is not None and (not isinstance(target, dict) or set(target) != {'type', 'id'} or target.get('type') not in {'Experiment', 'Discussion', 'User'} or not isinstance(target.get('id'), str) or not target['id'].strip() or len(target['id']) > 200):
             raise ValueError('Invalid community target')
         if title is not None and not isinstance(title, str):
@@ -239,10 +255,13 @@ class SessionDB:
                   requester_nickname, reply_id, encode(metadata or {}))
         with self.connect() as db:
             db.execute('BEGIN IMMEDIATE')
-            if db.execute('SELECT 1 FROM sessions WHERE id=?', (sid,)).fetchone() is None:
+            session = db.execute('SELECT owner_id FROM sessions WHERE id=?', (sid,)).fetchone()
+            if session is None:
                 now = time.time()
-                db.execute("INSERT INTO sessions(id,title,source,status,created,updated) VALUES(?,?,?,'idle',?,?)",
-                           (sid, (title or original_user_request)[:120], source, now, now))
+                db.execute("INSERT INTO sessions(id,title,source,status,created,updated,owner_id) VALUES(?,?,?,'idle',?,?,?)",
+                           (sid, (title or original_user_request)[:120], source, now, now, owner_id or ''))
+            elif owner_id is not None and session['owner_id'] != owner_id:
+                raise ValueError('Session belongs to a different Web user')
             existing = db.execute('SELECT * FROM runs WHERE id=?', (rid,)).fetchone()
             if existing:
                 if existing['session_id'] != sid or existing['prompt'] != prompt:
@@ -266,10 +285,15 @@ class SessionDB:
         with self.connect() as db:
             return self._task(db.execute('SELECT * FROM runs WHERE id=?', (rid,)).fetchone())
 
-    def tasks(self, sid: str | None = None, status: str | None = None, limit: int = 200) -> list[dict]:
+    def tasks(self, sid: str | None = None, status: str | None = None, limit: int = 200,
+              *, owner_id: str | None = None, active_only: bool = False) -> list[dict]:
         clauses, values = [], []
         if sid is not None:
             clauses.append('session_id=?'); values.append(sid)
+        if owner_id is not None:
+            clauses.append('session_id IN (SELECT id FROM sessions WHERE owner_id=?)'); values.append(owner_id)
+        if active_only:
+            clauses.append("status IN ('queued','running','cancelling')")
         if status is not None:
             if status not in {'queued','running','cancelling','cancelled','completed','needs_attention','interrupted','error'}:
                 raise ValueError('Invalid task status')

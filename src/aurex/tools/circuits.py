@@ -1474,8 +1474,8 @@ def _spec_from_sav(runtime: ToolRuntime, path: Path) -> dict[str, Any]:
                     assumptions.append(f"Saved {field} missing: explicit native default {default:g} V.")
             assumptions.append(
                 "Saved high/low voltages drive and decode mixed analog nodes; "
-                "when this saved gate output feeds an analog MNA load, its maximum-current rating uses the same transient electrothermal protection model as other live ratings. "
-                "On a pure digital net the rating remains metadata because that domain has no analog amperes.")
+                "PhysicsLab does not enforce digital-device maximum-current protection, so this PLSAV import maps its effective current limit to PE's maximum finite value while preserving the saved field as provenance. "
+                "This compatibility rule does not change native PE rated_protection behavior.")
             if component["type"] == "digital_output":
                 # PhysicsLab Logic Output is an indicator, not a timing-check
                 # primitive.  A saved analog voltage must therefore decode in
@@ -2501,7 +2501,7 @@ def register_circuit_tools(registry: ToolRegistry) -> None:
          {"path": _PATH, "with_image": _WITH_IMAGE, "camera": _CAMERA, "operations": {"type": "array", "items": {"type": "object", "properties": {
              "action": {"enum": ["add", "update", "remove", "connect"]}, "id": {"type": "string"}, "component": {"type": "object"},
              "params": {"type": "object"}, "nodes": {"type": "array", "items": {"type": "string"}}, "label": {"type": ["string", "null"], "maxLength": 4096}, "position": {"type": "array", "items": {"type": "number"}}, "rotation": {"type": "array", "items": {"type": "number"}}, "pin": {"type": "integer"}, "node": {"type": "string"}}}}}, ["path", "operations"], circuit_edit),
-        ("circuit_analyze", "Run actual native Phy-Engine DC, AC, transient or digital analysis. For buttons, analog switches, SPDT/DPDT selectors, slide rheostats, source voltage or mixed digital inputs, first discover exact IDs with circuit_inspect(controls_only=true), then use tr_interactions so each change occurs before its specified native TR solve. Legacy stimulus is a separate digital-only post-TR sequence. Returns measurements and immutable state; image only when explicitly requested.",
+        ("circuit_analyze", "Run actual native Phy-Engine DC, AC, transient or digital analysis. On PLSAV import, PhysicsLab digital-device maximum-current fields are preserved as provenance but mapped to PE's maximum finite threshold because the PhysicsLab runtime does not enforce them; native PE protection models are unchanged. For buttons, analog switches, SPDT/DPDT selectors, slide rheostats, source voltage or mixed digital inputs, first discover exact IDs with circuit_inspect(controls_only=true), then use tr_interactions so each change occurs before its specified native TR solve. Legacy stimulus is a separate digital-only post-TR sequence. Returns measurements and immutable state; image only when explicitly requested.",
          {"path": _PATH, "spec": _SPEC, "with_image": _WITH_IMAGE, "analysis": {"enum": ["op", "dc", "ac", "acop", "tr", "trop"]},
           "view": {"enum": ["spatial", "topology", "schematic"]}, "projection": {"enum": ["isometric", "top"]}, "camera": _CAMERA,
           "focus_ids": {"type": "array", "items": {"type": "string"}}, "query": {"type": "string"}, "limit": {"type": "integer", "minimum": 1, "maximum": 24},

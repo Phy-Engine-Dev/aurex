@@ -24,6 +24,14 @@ from .registry import ToolError
 # lossless .sav edit non-exportable.
 _PL_UNLIMITED_POWER_W = float.fromhex("0x1.fffffep+127")
 
+# PhysicsLab serializes 最大电流 on Boolean gates, but its own electrical
+# runtime does not consume digital-device over-current protection. PE keeps a
+# real protection model for native designs; only the PLSAV compatibility layer
+# maps a digital device's effective current limit to the largest finite value
+# representable by PE/Python's binary64 ABI. Keeping this finite (rather than
+# JSON Infinity) preserves strict artifact serialization and PE validation.
+PE_MAX_FINITE_CURRENT_A = float.fromhex("0x1.fffffffffffffp+1023")
+
 
 # line_pin is opened on failure. sense pins measure the original device's
 # terminal voltage. A missing rating key means this contract only preserves an
@@ -66,9 +74,11 @@ _CONTRACTS: dict[str, dict[str, Any]] = {
     "Transformer": {"line_pin": 0, "sense_pins": (0, 1), "power": "额定功率"},
     "Tapped Transformer": {"line_pin": 0, "sense_pins": (0, 1), "power": "额定功率"},
     "Relay Component": {"line_pin": 3, "sense_pins": (3, 4), "current": "额定电流"},
-    # Boolean gate 最大电流 is a thermally accumulated live rating.  It is
-    # meaningful only when the output is coupled to an analog MNA load; pure
-    # digital nets have no physical branch current.
+    # PhysicsLab exposes 最大电流 on Boolean gates but does not apply it in its
+    # own digital runtime. A mixed analog load gives PE a measurable branch,
+    # so the adapter can retain a guard for topology/provenance while replacing
+    # the saved threshold with PE_MAX_FINITE_CURRENT_A. Pure digital nets have
+    # no physical branch current and need no guard.
     "No Gate": {"line_pin": 1, "sense_pins": (1, None), "current": "最大电流", "mixed_only": True},
     "Yes Gate": {"line_pin": 1, "sense_pins": (1, None), "current": "最大电流", "mixed_only": True},
     "And Gate": {"line_pin": 2, "sense_pins": (2, None), "current": "最大电流", "mixed_only": True},
@@ -132,9 +142,39 @@ def apply_damage_protection(components: list[dict], scene: dict) -> list[dict]:
         model_id = original.get("type")
         contract = _CONTRACTS.get(model_id)
         initial_broken = bool(original.get("is_broken", False))
+        cid = original.get("id")
+        owned_components = ([component for component in output
+                             if _source_owner(component, cid)]
+                            if isinstance(cid, str) and cid else [])
+        imported_as_digital = any(
+            component.get("type", "").startswith("digital_")
+            for component in owned_components
+        )
+        if imported_as_digital:
+            raw_properties = original.get("properties")
+            saved_limit = (raw_properties.get("最大电流")
+                           if isinstance(raw_properties, dict) else None)
+            compatibility = {
+                "policy": "physicslab_digital_current_protection_disabled",
+                "effective_max_current_a": PE_MAX_FINITE_CURRENT_A,
+                "saved_max_current_a": saved_limit,
+                "saved_limit_used_for_tripping": False,
+                "scope": "PLSAV import only; native PE protection models are unchanged",
+            }
+            for component in owned_components:
+                source = component.setdefault("pl_source", {})
+                source["digital_current_compatibility"] = copy.deepcopy(compatibility)
+                assumptions = source.setdefault("assumptions", [])
+                note = (
+                    "PhysicsLab does not enforce digital-device 最大电流 at runtime; "
+                    "this PLSAV import maps the effective PE current-protection threshold "
+                    "to the maximum finite binary64 value while retaining the saved value "
+                    "as provenance. Native PE rated_protection behavior is unchanged."
+                )
+                if note not in assumptions:
+                    assumptions.append(note)
         if contract is None and not initial_broken:
             continue
-        cid = original.get("id")
         if not isinstance(cid, str) or not cid:
             raise ToolError("Damage adaptation requires each original component ID")
         props = original.get("properties")
@@ -150,7 +190,9 @@ def apply_damage_protection(components: list[dict], scene: dict) -> list[dict]:
             if any(type(pin) is not int or not isinstance(pin_nodes.get(pin), str) for pin in needed):
                 raise ToolError(f"{cid}: protection contract references a missing original pin")
             live_limits = {
-                "max_current_a": _rating(props, contract["current"], cid) if "current" in contract else 0.0,
+                "max_current_a": (PE_MAX_FINITE_CURRENT_A if imported_as_digital and "current" in contract
+                                  else _rating(props, contract["current"], cid) if "current" in contract
+                                  else 0.0),
                 "max_voltage_v": _rating(props, contract["voltage"], cid) if "voltage" in contract else 0.0,
                 "max_power_w": _rating(props, contract["power"], cid) if "power" in contract else 0.0,
             }
@@ -189,7 +231,6 @@ def apply_damage_protection(components: list[dict], scene: dict) -> list[dict]:
                         sense_positive, sense_negative)]
 
         digest = hashlib.sha256(cid.encode("utf-8")).hexdigest()
-        owned_components = [component for component in output if _source_owner(component, cid)]
         for target_index, (line_pin, external_line, limits,
                            sense_positive, sense_negative) in enumerate(targets):
             guard_id = "__pl_damage_" + digest + (f"_{target_index}" if len(targets) > 1 else "")
@@ -241,7 +282,7 @@ def apply_damage_protection(components: list[dict], scene: dict) -> list[dict]:
                     "At a saved current or power rating the normalized thermal equilibrium equals trip temperature; overload duration and cooling, not one solver iteration, determine a transient trip.",
                     "An already-broken saved device is isolated at every distinct external node; tied original pins remain tied behind one open guard.",
                     "The source .sav is unchanged; Ron=1e-12 ohm and Roff=1e12 ohm are explicit native engineering approximations.",
-                    *( ["A saved digital gate current rating is thermally active only because its output is electrically coupled to an analog MNA load; a pure digital net has no analog current to heat the model."]
+                    *( ["PhysicsLab does not enforce a digital gate's saved 最大电流; this PLSAV-only guard uses PE's maximum finite current threshold and cannot trip at a finite solved current. Pure digital nets need no analog-current guard."]
                        if contract is not None and contract.get("mixed_only") else []),
                 ],
                 "numerical_equivalence_to_original": False,

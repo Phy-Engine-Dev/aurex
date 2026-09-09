@@ -923,7 +923,7 @@ def _simulate_spec(spec: Any, lib_path: str, *, return_state: bool = False,
     if mixed:
         out["mixed_signal_scope"] = {
             "method": "Configured digital propagations are coupled to native MNA solves at every physical TR step.",
-            "drive_model": "Ideal voltage drive at each gate's saved Ll/Hl. Imported PhysicsLab gate outputs with an analog load use an irreversible saved maximum-current guard.",
+            "drive_model": "Ideal voltage drive at each gate's saved Ll/Hl. PhysicsLab digital-device saved maximum-current values are provenance only and map to PE's maximum finite threshold during PLSAV import; native PE rated_protection remains available for native designs.",
             "unsupported": ["mixed AC/trop", "finite digital output impedance", "original-app pointwise equivalence"],
         }
     if sequence_samples:

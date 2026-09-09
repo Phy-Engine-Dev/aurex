@@ -2,7 +2,7 @@
 
 面向物理实验室社区的中文电学实验助手。Aurex 通过独立的 `aurex-vllm` 容器调用 Qwen3.8-27B-AWQ-MTP，支持文本、图片、社区检索、模拟/数字/混合电路分析、Verilog 工作区和 PLSAV 导出。开发用途的 `vllm` 容器与 OpenCode 不会被脚本删除。
 
-> 安全提示：仓库绝不保存社区账号密码、API Token、网页访问码、模型服务密钥或 `.aurex/` 数据库。下面的“账户配置”仅说明私有文件字段和操作方式；请勿把真实凭据写入 Issue、日志或提交。
+> 安全提示：仓库绝不保存社区账号密码、API Token、管理员访问码、模型服务密钥或 `.aurex/` 数据库。下面的“账户配置”仅说明私有文件字段和操作方式；请勿把真实凭据写入 Issue、日志或提交。
 
 ## 快速部署（2 × V100 16 GiB）
 
@@ -18,7 +18,7 @@ python3 -m venv .venv
 bash scripts/aurex-vllm.sh start
 bash scripts/aurex-vllm.sh status
 
-# 生成仅本机可读的配置与网页访问码，再启动 Web。
+# 生成仅本机可读的配置与管理员访问码，再启动 Web。
 .venv/bin/python scripts/configure-aurex3.py
 bash scripts/aurex-web.sh start
 bash scripts/aurex-web.sh status
@@ -35,9 +35,9 @@ curl --noproxy '*' http://127.0.0.1:8000/health
 
 若已有兼容 OpenAI 的模型服务，不必启动容器；将私有 `.config/aurex3.json` 的 `llm.base_url`、`llm.model` 与实际上下文长度改为该服务的值，然后执行 Web 启动命令即可。
 
-## 账户、访问码与 Web
+## 账户、角色与 Web
 
-`scripts/configure-aurex3.py` 从 `aurex3.config.example.json` 创建权限为 `0600` 的 `.config/aurex3.json`，并在 `.config/web-token` 创建随机访问码。社区账户只填写在私有配置的以下字段中：
+`scripts/configure-aurex3.py` 从 `aurex3.config.example.json` 创建权限为 `0600` 的 `.config/aurex3.json`，并在 `.config/web-token` 创建随机管理员访问码。社区服务账户只填写在私有配置的以下字段中：
 
 ```json
 {
@@ -48,7 +48,12 @@ curl --noproxy '*' http://127.0.0.1:8000/health
 }
 ```
 
-网页默认监听 `0.0.0.0:4097`；访问码仅在部署机器上通过 `cat .config/web-token` 查看。持有访问码的人可以访问此工作台的会话与文件，因此只应经可信的内网或 Tailscale 使用，不能把端口和访问码公开到互联网。
+网页默认监听 `0.0.0.0:4097`，提供两种真实的服务端角色：
+
+- 用户模式输入 24 位物理实验室用户 ID，读取并显示该用户的公开昵称、简介、等级和统计。用户 ID 是公开资料标签，不是社区账号认证，也不会授予发布、回复或冒充该用户的权限；会话所有权仍由随机 HttpOnly 浏览器凭据隔离。
+- 管理员模式使用 `.config/web-token` 中的访问码，可查看全局会话和完整 FIFO 队列、创建管理员任务并管理任意任务。访问码只能在部署机器上读取，不能公开。
+
+普通用户只能读取和取消自己的任务；全局队列只显示他人的匿名占位、状态与排队位置。历史社区/CLI/管理员记录只对管理员可见。桌面端的会话、当前对话、全局队列为三个同级区域，任务栏可拖动或用方向键调宽并保存宽度；手机端通过“会话/队列”按钮打开全屏面板。
 
 ```bash
 bash scripts/aurex-web.sh start          # 启动网页、队列与持续社区轮询
@@ -154,9 +159,9 @@ cd /home/macromodel/Documents/src/aurex3
 bash scripts/aurex-web.sh start
 ```
 
-配置脚本从 `aurex3.config.example.json` 生成 `.config/aurex3.json`；配置及访问码权限为0600，均被 Git 忽略。请在私有配置中填写社区账号，不要把账号密码或访问码放进公开配置。已有文件不会被覆盖。
+配置脚本从 `aurex3.config.example.json` 生成 `.config/aurex3.json`；配置及管理员访问码权限为0600，均被 Git 忽略。请在私有配置中填写社区账号，不要把账号密码或管理员访问码放进公开配置。已有文件不会被覆盖。
 
-工作台默认绑定 `0.0.0.0:4097`，本机及 Tailscale 可访问 `http://100.123.133.75:4097`。访问码在 `.config/web-token`。这是单用户工作台：持有访问码者可以查看所有会话及文件，并非多租户隔离服务；不要将HTTP端口暴露到不可信网络。网页支持带图片提问、选择 Experiment/Discussion/User 目标、逐步查看工具结果和图片、下载本地实验文件。
+工作台默认绑定 `0.0.0.0:4097`，本机及 Tailscale 可访问 `http://100.123.133.75:4097`。管理员访问码在 `.config/web-token`。普通用户的数据按“浏览器能力凭据 + 关联用户 ID”隔离；裸用户 ID 不能跨设备恢复或接管会话。网页支持带图片提问、选择 Experiment/Discussion/User 目标、逐步查看工具结果和图片、下载本地实验文件。仍建议只在可信内网或 Tailscale 使用，不要把 HTTP 端口暴露到不可信公网。
 
 ```bash
 # 首先在配置中选择 agent.dry_run；true只检查，不发社区评论。
@@ -175,7 +180,7 @@ CLI与Web是同一个Aurex v3前端：都连接唯一的常驻server、同一个
 
 通知轮询只响应显式 `@aurex`，默认新部署 `bootstrap_lookback_sec=0`，避免重答历史消息。Web、CLI、通知机器人和管理员API共用持久化FIFO；同一目标/提问者可归入同一会话，但每次用户提交都是独立task（`runs.id`），同一会话也不会把新问题合并成旧任务。一次只运行一个TP2推理链，其它任务保留排队记录。
 
-管理员使用 `POST /api/tasks` 提交原始请求，可指定已有 `session_id`；不指定则建立新会话。`GET /api/tasks`、`GET /api/tasks/:id` 查询队列和独立状态；`POST /api/tasks/:id/cancel` 只请求安全边界取消。HTTP客户端不能传 `source`、`purpose`、`metadata` 或自定task ID；`source=admin` 由端点确定。访问码是单管理员权限，不是对外公开的匿名提问接口。
+管理员使用 `POST /api/tasks` 提交原始请求，可指定已有 `session_id`；不指定则建立新会话。普通用户使用 `POST /api/requests`。`GET /api/me` 返回当前角色及白名单公开资料；`GET /api/tasks`、`GET /api/tasks/:id` 和取消端点均由服务端执行所有权检查。HTTP客户端不能传 `source`、`purpose`、`metadata` 或自定task ID；`source=admin` 由管理员端点确定。
 
 ## 电路工具
 

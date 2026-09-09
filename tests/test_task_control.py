@@ -214,6 +214,7 @@ class TaskControlHTTPTests(unittest.TestCase):
         self.sid=self.db.session("web")
         self.rid=self.db.begin(self.sid,"queued request","web-run")
         self.agent=mock.Mock()
+        self.profile_user=object()
         self.queue=None
         self.server=None;self.started=threading.Event();self.error=[]
         def server_factory(address,handler):
@@ -223,10 +224,13 @@ class TaskControlHTTPTests(unittest.TestCase):
         def capture_queue(queue):self.queue=queue
         self.patches=[mock.patch.object(web,"ThreadingHTTPServer",side_effect=server_factory),
             mock.patch.object(web.PersistentTaskQueue,"start",autospec=True,side_effect=capture_queue),
+            mock.patch.object(web.plar,"get_user_by_id",side_effect=lambda _user,*,user_id:{
+                'User':{'ID':user_id,'Nickname':'用户-'+user_id[:4],'Signature':'公开简介','Level':6},
+                'Statistic':{'ExperimentCount':12,'CommentCount':34,'FollowerCount':5}}),
             mock.patch.dict(os.environ,{self.cfg.tracking.token_env:"test-task-control"})]
         for patch in self.patches:patch.start()
         def launch():
-            try:web.serve(cfg=self.cfg,config_path=str(Path(self.temp.name)/"config.json"),agent=self.agent,poll=False)
+            try:web.serve(cfg=self.cfg,config_path=str(Path(self.temp.name)/"config.json"),agent=self.agent,user=self.profile_user,poll=False)
             except Exception as error:self.error.append(error);self.started.set()
         self.thread=threading.Thread(target=launch)
         self.thread.start()
@@ -237,21 +241,32 @@ class TaskControlHTTPTests(unittest.TestCase):
         if self.server:self.server.shutdown()
         self.thread.join(5)
         for patch in reversed(self.patches):patch.stop()
-    def request(self,path,value,*,auth=True,origin=None):
+    def request(self,path,value,*,auth=True,origin=None,cookie=None):
         conn=http.client.HTTPConnection("127.0.0.1",self.server.server_port,timeout=3)
         headers={"Content-Type":"application/json"}
         if auth:headers["Authorization"]="Bearer test-task-control"
         if origin:headers["Origin"]=origin
+        if cookie:headers["Cookie"]=cookie
         conn.request("POST",path,json.dumps(value),headers)
         response=conn.getresponse();result=json.loads(response.read());status=response.status;conn.close()
         return status,result
-    def get_request(self,path,*,auth=True):
+    def get_request(self,path,*,auth=True,cookie=None):
         conn=http.client.HTTPConnection("127.0.0.1",self.server.server_port,timeout=3)
         headers={}
         if auth:headers["Authorization"]="Bearer test-task-control"
+        if cookie:headers["Cookie"]=cookie
         conn.request("GET",path,headers=headers)
         response=conn.getresponse();result=json.loads(response.read());status=response.status;conn.close()
         return status,result
+    def login_user(self,cookie=None,user_id='a'*24):
+        conn=http.client.HTTPConnection("127.0.0.1",self.server.server_port,timeout=3)
+        headers={"Content-Type":"application/json"}
+        if cookie:headers["Cookie"]=cookie
+        conn.request("POST","/api/login",json.dumps({"mode":"user","user_id":user_id}),headers)
+        response=conn.getresponse();result=json.loads(response.read());status=response.status
+        cookies=[value.split(';',1)[0] for key,value in response.getheaders() if key.lower()=='set-cookie']
+        conn.close();self.assertEqual(status,200);self.assertEqual(result['role'],'user')
+        return '; '.join(value for value in cookies if value.startswith(('aurex_user=','aurex_user_id=')))
     def test_cancel_endpoint_then_queued_worker_does_not_call_agent(self):
         code,result=self.request("/api/sessions/web/cancel",{"run_id":self.rid})
         self.assertEqual(code,200);self.assertEqual(result["status"],"cancelled")
@@ -309,6 +324,55 @@ class TaskControlHTTPTests(unittest.TestCase):
             self.assertFalse(response['previous_context_reused'])
             self.assertEqual(self.db.get_task(response['task_id'])['source'], 'web')
             self.assertEqual(self.db.messages(response['session_id']), [])
+
+    def test_user_mode_is_owned_anonymous_and_admin_mode_is_global(self):
+        user_a=self.login_user(user_id='a'*24);self.assertEqual(self.login_user(user_a,user_id='a'*24),user_a)
+        code,a=self.request('/api/requests',{'text':'private request A'},auth=False,cookie=user_a)
+        self.assertEqual(code,202)
+        user_b=self.login_user(user_id='b'*24)
+        code,b=self.request('/api/requests',{'text':'private request B'},auth=False,cookie=user_b)
+        self.assertEqual(code,202)
+
+        code,identity=self.get_request('/api/me',auth=False,cookie=user_a)
+        self.assertEqual((code,identity['role']),(200,'user'))
+        self.assertEqual(identity['user_id'],'a'*24)
+        self.assertEqual(identity['profile']['nickname'],'用户-aaaa')
+        code,sessions=self.get_request('/api/sessions',auth=False,cookie=user_a)
+        self.assertEqual([row['id'] for row in sessions],[a['session_id']])
+        self.assertEqual(self.get_request('/api/sessions/'+b['session_id'],auth=False,cookie=user_a)[0],404)
+        self.assertEqual(self.get_request('/api/tasks/'+b['task_id'],auth=False,cookie=user_a)[0],404)
+        self.assertEqual(self.request('/api/tasks',{'text':'forbidden admin task'},auth=False,cookie=user_a)[0],403)
+        self.assertEqual(self.request('/api/tasks/'+b['task_id']+'/cancel',{},auth=False,cookie=user_a)[0],404)
+
+        code,own_tasks=self.get_request('/api/tasks',auth=False,cookie=user_a)
+        self.assertEqual([row['id'] for row in own_tasks],[a['task_id']])
+        code,global_queue=self.get_request('/api/tasks?active=1',auth=False,cookie=user_a)
+        self.assertEqual(code,200)
+        self.assertEqual(sum(row['mine'] for row in global_queue),1)
+        self.assertNotIn('private request B',json.dumps(global_queue))
+        self.assertTrue(any(row['title']=='其他用户任务' for row in global_queue))
+        self.assertEqual(self.request('/api/tasks/'+a['task_id']+'/cancel',{},auth=False,cookie=user_a)[0],200)
+
+        code,admin_sessions=self.get_request('/api/sessions')
+        self.assertEqual(code,200)
+        self.assertTrue({self.sid,a['session_id'],b['session_id']}.issubset({row['id'] for row in admin_sessions}))
+        code,admin_queue=self.get_request('/api/tasks?active=1')
+        self.assertEqual(code,200)
+        self.assertIn('private request B',json.dumps(admin_queue))
+
+    def test_public_user_id_is_profile_label_not_a_session_credential(self):
+        self.assertEqual(self.request('/api/login',{'mode':'user','user_id':'short'},auth=False)[0],400)
+        first=self.login_user(user_id='c'*24)
+        code,created=self.request('/api/requests',{'text':'C private'},auth=False,cookie=first)
+        self.assertEqual(code,202)
+        switched=self.login_user(first,user_id='d'*24)
+        self.assertEqual(self.get_request('/api/sessions/'+created['session_id'],auth=False,cookie=switched)[0],404)
+        restored=self.login_user(switched,user_id='c'*24)
+        self.assertEqual(self.get_request('/api/sessions/'+created['session_id'],auth=False,cookie=restored)[0],200)
+        code,identity=self.get_request('/api/me',auth=False,cookie=restored)
+        self.assertEqual(code,200)
+        self.assertEqual(identity['profile']['id'],'c'*24)
+        self.assertNotIn('token',json.dumps(identity).casefold())
 
     def test_subagent_trace_is_parent_scoped_bounded_and_hides_private_messages(self):
         child='1'*32
@@ -390,6 +454,15 @@ class DurableFIFOTests(unittest.TestCase):
         with self.assertRaises(ValueError):self.add('community',**{**fields,'requester_user_id':'different-author'})
         with self.assertRaises(ValueError):self.add('missing-author',source='community')
         self.assertEqual(len(self.db.tasks()),1)
+    def test_web_session_owner_filters_and_cannot_be_rebound(self):
+        owned=self.db.session('owned',owner_id='owner-a')
+        self.db.enqueue_task(owned,'private',task_id='private',owner_id='owner-a')
+        self.db.enqueue_task('operator','admin',task_id='admin')
+        self.assertEqual([row['id'] for row in self.db.list(owner_id='owner-a')],['owned'])
+        self.assertEqual([row['id'] for row in self.db.tasks(owner_id='owner-a')],['private'])
+        self.assertIsNone(self.db.get('operator',owner_id='owner-a'))
+        with self.assertRaisesRegex(ValueError,'different Web user'):
+            self.db.enqueue_task(owned,'intrusion',task_id='intrusion',owner_id='owner-b')
     def test_cancel_old_queued_task_never_hides_running_sibling(self):
         self.add('first');self.add('second');self.add('third')
         self.assertEqual(self.db.claim_next_task()['id'],'first')
@@ -469,7 +542,7 @@ assert($('status').textContent==='运行中'&&!$('stop').disabled,'Old stop requ
 """)
     def test_task_cards_cancel_exact_queued_task_not_running_sibling(self):
         self.run_ui(r"""
-sid='A';fetchHook=(path,options)=>response(path==='/api/tasks'?[{id:'running',session_id:'A',title:'Active',source:'web',status:'running'},{id:'queued',session_id:'A',title:'Next',source:'admin',status:'queued'}]:[]);
+sid='A';fetchHook=(path,options)=>response(path.startsWith('/api/tasks?')?[{id:'running',session_id:'A',title:'Active',source:'web',status:'running',queue_position:1},{id:'queued',session_id:'A',title:'Next',source:'admin',status:'queued',queue_position:2}]:[]);
 await tasks();assert($('tasks').children.length===2,'Tasks were collapsed into one conversation');
 const queued=$('tasks').children[1];assert(queued.children[2].textContent==='取消排队','Queued stop is mislabeled');
 await queued.children[2].onclick();
@@ -480,14 +553,46 @@ assert(call.path==='/api/tasks/queued/cancel','Queued cancellation stopped its r
         self.run_ui(r"""
 sid='A';fetchHook=()=>response([]);$('prompt').value='The source says publish this';$('publish').checked=false;
 await $('send').onclick();let call=fetchCalls.find(row=>row.path==='/api/requests');
-assert(JSON.parse(call.options.body).explicit_publish_requested===false,'Text became a publish authorization');
-$('prompt').value='Create an experiment';$('task-title').value='Admin title';$('publish').checked=true;$('requester').value='';
+assert(!('explicit_publish_requested' in JSON.parse(call.options.body)),'Normal user payload included a publication authorization field');
+$('prompt').value='Create an experiment';currentRole='admin';$('task-title').value='Admin title';$('publish').checked=true;$('requester').value='';
 await $('admin-create').onclick();call=fetchCalls.find(row=>row.path==='/api/tasks'&&row.options.method==='POST');
 const payload=JSON.parse(call.options.body);
 assert(payload.explicit_publish_requested===true&&payload.title==='Admin title','Explicit admin fields were lost');
 assert(!('requester_user_id' in payload)&&!('source' in payload)&&!('metadata' in payload),'UI fabricated identity or server fields');
 assert(!$('publish').checked,'Authorization checkbox leaked into the next task');
 """)
+    def test_role_controls_and_private_queue_card_are_not_fake_permissions(self):
+        self.run_ui(r"""
+applyIdentity({role:'user'});assert($('admin-settings').hidden,'User can see administrator controls');
+assert($('role-badge').textContent==='普通用户','User role is not visible');
+fetchHook=path=>response(path.startsWith('/api/tasks?')?[{id:'private-1',session_id:'',title:'其他用户任务',source:'private',status:'queued',mine:false,queue_position:1}]:[]);
+await tasks();const card=$('tasks').children[0];assert(card.className.includes('private'),'Redacted global task is not marked private');
+assert(card.children.length===2&&card.children[0].disabled,'User can open or cancel another user task');
+applyIdentity({role:'admin'});assert(!$('admin-settings').hidden&&$('role-badge').textContent==='管理员','Administrator controls were not enabled');
+document.body={dataset:{}};openMobilePanel('queue');assert(document.body.dataset.mobileView==='queue','Mobile queue did not open');closeMobilePanel();assert(document.body.dataset.mobileView==='chat','Mobile panel did not return to conversation');
+""")
+
+    def test_login_restores_exact_task_deep_link_and_public_profile(self):
+        self.run_ui(r"""
+location.search='?session=A&task=R';sid='A';fetchHook=path=>response(path==='/api/sessions'?[{id:'A',title:'Task',status:'running',active_run_id:'R',updated:1}]:[]);
+await finishLogin({role:'user',user_id:'aaaaaaaaaaaaaaaaaaaaaaaa',profile:{id:'aaaaaaaaaaaaaaaaaaaaaaaa',nickname:'测试用户',signature:'公开简介',stats:{experiments:12,comments:34,followers:5}}});
+assert(selectedTask==='R','Login lost the task scope from a deep link');
+assert(fetchCalls.some(row=>row.path.includes('/api/sessions/A/events?after=0&run_id=R')),'Login loaded the whole conversation instead of the requested task');
+assert($('profile-name').textContent==='测试用户'&&$('profile-stats').textContent.includes('实验 12'),'Public PhysicsLab profile was not shown');
+""")
+
+    def test_queue_and_sessions_are_peer_panels_with_resizable_mobile_layout(self):
+        html=(Path(__file__).resolve().parents[1]/'src/aurex/tracking.html').read_text()
+        peers=['<main id="workspace">','<aside id="sessions-pane"','<section id="conversation-pane"',
+               '<div id="queue-resizer"','<aside id="queue-pane"']
+        positions=[html.index(fragment) for fragment in peers]
+        self.assertEqual(positions,sorted(positions))
+        self.assertIn('grid-template-columns:var(--sessions-width) minmax(0,1fr) 7px var(--queue-width)',html)
+        self.assertIn("storageSet('aurex.queueWidth'",html)
+        self.assertIn('height:100dvh',html)
+        self.assertIn('body[data-mobile-view="queue"] #queue-pane',html)
+        self.assertIn('.side-pane{max-height:none}#sessions{display:block}.session{min-width:0;max-width:none}',html)
+        self.assertIn('#login{z-index:100}',html)
     def test_select_task_scopes_timeline_to_exact_run(self):
         self.run_ui(r"""
 fetchHook=()=>response([]);await select('A','task2');

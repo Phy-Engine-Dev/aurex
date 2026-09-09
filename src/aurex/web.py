@@ -2,9 +2,12 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import hmac
 import json
 import os
+import re
+import secrets
 import threading
 import time
 import uuid
@@ -13,7 +16,50 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlparse, parse_qs
 
+import plar
+
 from .sessiondb import SessionDB, encode
+
+
+_PHYSICSLAB_USER_ID = re.compile(r'[0-9a-fA-F]{24}')
+
+
+def _public_user_profile(package, requested_user_id):
+    """Project the public PhysicsLab identity fields used by the Web shell."""
+    if not isinstance(package, dict):
+        raise ValueError('物理实验室用户资料格式无效')
+    raw_user = package.get('User') if isinstance(package.get('User'), dict) else {}
+    raw_stats = package.get('Statistic') if isinstance(package.get('Statistic'), dict) else {}
+    resolved = str(raw_user.get('ID') or '').strip()
+    if resolved.casefold() != requested_user_id.casefold():
+        raise ValueError('物理实验室用户 ID 与查询结果不一致')
+
+    def text(value, limit):
+        return plar.best_effort_extract_text(value).strip()[:limit] or None
+
+    def integer(value):
+        if isinstance(value, bool):
+            return None
+        try:
+            return int(value) if value is not None and str(value).strip() else None
+        except (TypeError, ValueError, OverflowError):
+            return None
+
+    return {
+        'id': resolved,
+        'nickname': text(raw_user.get('Nickname') or raw_user.get('Name'), 160),
+        'signature': text(raw_user.get('Signature'), 1000),
+        'level': integer(raw_user.get('Level')),
+        'experience': integer(raw_user.get('Experience')),
+        'stats': {
+            'experiments': integer(raw_stats.get('ExperimentCount')),
+            'comments': integer(raw_stats.get('CommentCount')),
+            'followers': integer(raw_stats.get('FollowerCount')),
+            'following': integer(raw_stats.get('FollowingCount')),
+            'stars': integer(raw_stats.get('StarCount')),
+            'supports': integer(raw_stats.get('SupportCount')),
+        },
+    }
 
 
 def _public_subagent(row):
@@ -57,7 +103,8 @@ class PersistentTaskQueue:
         existing = self.database.get_task(task_id)
         session_id = existing['session_id'] if existing else self.database.session(
             ('community-' if kwargs.get('source') == 'community' else 'task-') + task_id,
-            title=kwargs.get('title') or original_user_request, source=kwargs.get('source', 'web'))
+            title=kwargs.get('title') or original_user_request, source=kwargs.get('source', 'web'),
+            owner_id=kwargs.get('owner_id') or '')
         rid = self.database.enqueue_task(session_id, original_user_request, **kwargs)
         if existing is None:
             self.database.event(session_id, rid, 'submitted', {'text': original_user_request, 'task_id': rid})
@@ -150,16 +197,44 @@ def serve(*, cfg, config_path, agent, user=None, hostname=None, port=None, poll=
     database = SessionDB(cfg.resolve_path(cfg.tracking.database_path, config_path=config_path))
     cache = Path(cfg.resolve_path(cfg.storage.cache_dir, config_path=config_path)).resolve()
     cache.mkdir(parents=True, exist_ok=True)
-    token = os.environ.get(cfg.tracking.token_env, '')
+    admin_token = os.environ.get(cfg.tracking.token_env, '').strip()
+    profile_cache = {}
+    profile_gate = threading.Lock()
     gate = threading.Lock()
     queue = PersistentTaskQueue(database, agent, user=user, logger=logger, on_result=on_task_result)
     if enqueue_ready:
         enqueue_ready(queue.enqueue)
 
-    def create_task(data, *, session_id=None, source='web'):
-        allowed = {'text', 'original_user_request', 'images', 'target', 'title', 'requester_user_id', 'explicit_publish_requested'}
+    def user_profile(user_id, *, required=False):
+        """Resolve public profile data without treating a public ID as authentication."""
+        now = time.monotonic()
+        with profile_gate:
+            cached = profile_cache.get(user_id.casefold())
+            if cached and now - cached[0] < 300:
+                return cached[1]
+        if user is None:
+            if required:
+                raise ValueError('当前服务未连接物理实验室，无法校验用户 ID')
+            return {'id': user_id, 'nickname': None, 'signature': None, 'level': None,
+                    'experience': None, 'stats': {}}
+        try:
+            profile = _public_user_profile(plar.get_user_by_id(user, user_id=user_id), user_id)
+        except Exception as exc:
+            if required:
+                raise ValueError('无法读取该物理实验室用户 ID') from exc
+            return {'id': user_id, 'nickname': None, 'signature': None, 'level': None,
+                    'experience': None, 'stats': {}, 'unavailable': True}
+        with profile_gate:
+            if len(profile_cache) >= 256 and user_id.casefold() not in profile_cache:
+                oldest = min(profile_cache, key=lambda key: profile_cache[key][0])
+                profile_cache.pop(oldest, None)
+            profile_cache[user_id.casefold()] = (now, profile)
+        return profile
+
+    def create_task(data, *, principal, session_id=None, source='web'):
+        allowed = {'text', 'original_user_request', 'images', 'target'}
         if source == 'admin':
-            allowed.add('session_id')
+            allowed.update({'session_id', 'title', 'requester_user_id', 'explicit_publish_requested'})
         if set(data) - allowed:
             raise ValueError('Unknown or server-only task fields: ' + ', '.join(sorted(set(data) - allowed)))
         if 'text' in data and 'original_user_request' in data:
@@ -201,11 +276,13 @@ def serve(*, cfg, config_path, agent, user=None, hostname=None, port=None, poll=
                     image.convert('RGB').save(file)
                     paths.append(str(file))
         sid = session_id or data.get('session_id')
-        if sid is not None and (not isinstance(sid, str) or not database.get(sid)):
+        owner_id = principal['owner_id'] if principal['role'] == 'user' else ''
+        if sid is not None and (not isinstance(sid, str) or not database.get(
+                sid, owner_id=owner_id if principal['role'] == 'user' else None)):
             raise ValueError('Session not found')
         rid = queue.enqueue(sid, original, prompt=prompt, images=paths, source=source, target=target,
                             title=data.get('title'), requester_user_id=requester,
-                            explicit_publish_requested=publish)
+                            explicit_publish_requested=publish, owner_id=owner_id or None)
         task = database.get_task(rid)
         return {'session_id': task['session_id'], 'run_id': rid, 'task_id': rid, 'status': task['status'],
                 'context_policy': 'fresh_session_per_request', 'previous_context_reused': False}
@@ -216,18 +293,40 @@ def serve(*, cfg, config_path, agent, user=None, hostname=None, port=None, poll=
             if logger:
                 logger.debug('web %s %s', self.command, urlparse(self.path).path)
 
-        def auth(self):
-            if not token:
-                return True
+        def cookies(self):
+            cookie = SimpleCookie()
+            try:
+                cookie.load(self.headers.get('Cookie', ''))
+            except Exception:
+                return {}
+            return {key: morsel.value for key, morsel in cookie.items()}
+
+        def principal(self):
             supplied = self.headers.get('Authorization', '').removeprefix('Bearer ')
             if not supplied:
-                cookie = SimpleCookie()
-                try:
-                    cookie.load(self.headers.get('Cookie', ''))
-                    supplied = cookie['aurex_access'].value if 'aurex_access' in cookie else ''
-                except Exception:
-                    supplied = ''
-            return hmac.compare_digest(supplied, token)
+                supplied = self.cookies().get('aurex_access', '')
+            if admin_token and hmac.compare_digest(supplied, admin_token):
+                return {'role': 'admin', 'owner_id': ''}
+            cookies = self.cookies()
+            user_secret = cookies.get('aurex_user', '')
+            user_id = cookies.get('aurex_user_id', '')
+            if (re.fullmatch(r'[A-Za-z0-9_-]{40,100}', user_secret)
+                    and _PHYSICSLAB_USER_ID.fullmatch(user_id)):
+                owner = hashlib.sha256((user_secret + '\0' + user_id.casefold()).encode()).hexdigest()
+                return {'role': 'user', 'owner_id': owner, 'user_id': user_id.casefold()}
+            return None
+
+        @staticmethod
+        def owns(principal, session):
+            return bool(session) and (principal['role'] == 'admin' or session['owner_id'] == principal['owner_id'])
+
+        def require_session(self, principal, sid):
+            session = database.get(sid)
+            return session if self.owns(principal, session) else None
+
+        def send_cookies(self, values):
+            for value in values:
+                self.send_header('Set-Cookie', value + '; HttpOnly; SameSite=Strict; Path=/')
 
         def respond(self, value, status=200):
             body = encode(value).encode()
@@ -235,6 +334,17 @@ def serve(*, cfg, config_path, agent, user=None, hostname=None, port=None, poll=
             self.send_header('Content-Type', 'application/json; charset=utf-8')
             self.send_header('Cache-Control', 'no-store')
             self.send_header('X-Content-Type-Options', 'nosniff')
+            self.send_header('Content-Length', str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def respond_with_cookies(self, value, cookies, status=200):
+            body = encode(value).encode()
+            self.send_response(status)
+            self.send_header('Content-Type', 'application/json; charset=utf-8')
+            self.send_header('Cache-Control', 'no-store')
+            self.send_header('X-Content-Type-Options', 'nosniff')
+            self.send_cookies(cookies)
             self.send_header('Content-Length', str(len(body)))
             self.end_headers()
             self.wfile.write(body)
@@ -262,27 +372,61 @@ def serve(*, cfg, config_path, agent, user=None, hostname=None, port=None, poll=
                 self.end_headers()
                 self.wfile.write(data)
                 return
-            if not self.auth():
+            principal = self.principal()
+            if not principal:
                 return self.respond({'error': 'Access token required'}, 401)
+            if route.path == '/api/me':
+                return self.respond({'role': principal['role'], 'admin_available': bool(admin_token),
+                    'user_id': principal.get('user_id'),
+                    'profile': user_profile(principal['user_id']) if principal['role'] == 'user' else None,
+                    'capabilities': {'create_admin_task': principal['role'] == 'admin',
+                        'cancel_any_task': principal['role'] == 'admin',
+                        'view_all_sessions': principal['role'] == 'admin'}})
             if route.path == '/api/sessions':
-                return self.respond(database.list())
+                return self.respond(database.list(owner_id=principal['owner_id'])
+                    if principal['role'] == 'user' else database.list())
             if route.path == '/api/tasks':
                 query = parse_qs(route.query)
                 try:
-                    rows = database.tasks(sid=query.get('session_id', [None])[0],
-                        status=query.get('status', [None])[0], limit=int(query.get('limit', ['200'])[0]))
+                    sid_filter = query.get('session_id', [None])[0]
+                    active_only = query.get('active', ['0'])[0] == '1'
+                    if sid_filter and not self.require_session(principal, sid_filter):
+                        return self.respond({'error': 'Task not found'}, 404)
+                    if principal['role'] == 'user' and active_only and not sid_filter:
+                        rows = database.tasks(status=query.get('status', [None])[0],
+                            limit=int(query.get('limit', ['200'])[0]), active_only=True)
+                    else:
+                        rows = database.tasks(sid=sid_filter,
+                            status=query.get('status', [None])[0], limit=int(query.get('limit', ['200'])[0]),
+                            owner_id=principal['owner_id'] if principal['role'] == 'user' else None,
+                            active_only=active_only)
                     # Keep FIFO polling lightweight; the full immutable request is at /api/tasks/:id.
-                    return self.respond([{key: row[key] for key in ('id','session_id','title','status',
-                        'source','requester_user_id','requester_nickname','target','explicit_publish_requested',
-                        'cancel_requested','created','updated')} for row in rows])
+                    visible = []
+                    for position, row in enumerate(rows, 1):
+                        session = database.get(row['session_id'])
+                        mine = principal['role'] == 'admin' or session['owner_id'] == principal['owner_id']
+                        if not mine:
+                            visible.append({'id': 'private-' + str(position), 'session_id': '',
+                                'title': '其他用户任务', 'status': row['status'], 'source': 'private',
+                                'mine': False, 'queue_position': position, 'created': row['created'],
+                                'updated': row['updated'], 'cancel_requested': False})
+                            continue
+                        item = {key: row[key] for key in ('id','session_id','title','status',
+                            'source','requester_user_id','requester_nickname','target','explicit_publish_requested',
+                            'cancel_requested','created','updated')}
+                        item.update({'mine': True, 'queue_position': position})
+                        visible.append(item)
+                    return self.respond(visible)
                 except ValueError as exc:
                     return self.respond({'error': str(exc)}, 400)
             if route.path.startswith('/api/tasks/'):
                 task = database.get_task(route.path.rsplit('/', 1)[-1])
-                return self.respond(task if task else {'error': 'Task not found'}, 200 if task else 404)
+                if not task or not self.require_session(principal, task['session_id']):
+                    return self.respond({'error': 'Task not found'}, 404)
+                return self.respond(task)
             if route.path.startswith('/api/artifacts/'):
                 artifact = database.get_artifact(route.path.rsplit('/', 1)[-1])
-                if not artifact:
+                if not artifact or not self.require_session(principal, artifact['session_id']):
                     return self.respond({'error': 'Artifact not found'}, 404)
                 file = Path(artifact['path']).resolve()
                 if not file.is_relative_to(cache) or not file.is_file():
@@ -307,7 +451,7 @@ def serve(*, cfg, config_path, agent, user=None, hostname=None, port=None, poll=
                 # Return the same result for an unknown task and a task owned by
                 # another session.  A crafted URL must not disclose that the
                 # foreign parent/child exists.
-                if not database.get(sid) or not task or task['session_id'] != sid:
+                if not self.require_session(principal, sid) or not task or task['session_id'] != sid:
                     return self.respond({'error': 'Task not found in session'}, 404)
                 try:
                     if len(parts) == 6:
@@ -320,10 +464,12 @@ def serve(*, cfg, config_path, agent, user=None, hostname=None, port=None, poll=
                     return self.respond({'error': 'Subagent not found in task'}, 404)
             if len(parts) >= 3 and parts[:2] == ['api', 'sessions']:
                 sid = parts[2]
-                if not database.get(sid):
+                if not self.require_session(principal, sid):
                     return self.respond({'error': 'Session not found'}, 404)
                 if len(parts) == 3:
-                    return self.respond(database.get(sid))
+                    session = database.get(sid)
+                    session.pop('owner_id', None)
+                    return self.respond(session)
                 query = parse_qs(route.query)
                 try:
                     if parts[3] == 'events':
@@ -343,30 +489,55 @@ def serve(*, cfg, config_path, agent, user=None, hostname=None, port=None, poll=
                 data = self.read_json()
                 path = urlparse(self.path).path
                 if path == '/api/login':
-                    if token and not hmac.compare_digest(str(data.get('token', '')), token):
+                    mode = data.get('mode', 'admin')
+                    if mode == 'user':
+                        if set(data) != {'mode', 'user_id'}:
+                            raise ValueError('用户模式需要且只接受物理实验室用户 ID')
+                        user_id = str(data.get('user_id') or '').strip().casefold()
+                        if not _PHYSICSLAB_USER_ID.fullmatch(user_id):
+                            raise ValueError('物理实验室用户 ID 必须是 24 位十六进制字符')
+                        profile = user_profile(user_id, required=True)
+                        secret = self.cookies().get('aurex_user', '')
+                        if not re.fullmatch(r'[A-Za-z0-9_-]{40,100}', secret):
+                            secret = secrets.token_urlsafe(32)
+                        return self.respond_with_cookies(
+                            {'ok': True, 'role': 'user', 'user_id': user_id, 'profile': profile},
+                            ['aurex_user=' + secret + '; Max-Age=2592000',
+                             'aurex_user_id=' + user_id + '; Max-Age=2592000',
+                             'aurex_access=; Max-Age=0'])
+                    if mode != 'admin' or set(data) - {'mode', 'token'}:
+                        raise ValueError('Invalid login mode')
+                    if not admin_token:
+                        return self.respond({'error': 'Administrator access is not configured'}, 503)
+                    if not hmac.compare_digest(str(data.get('token', '')), admin_token):
                         return self.respond({'error': 'Incorrect access token'}, 401)
-                    self.send_response(200)
-                    self.send_header('Content-Type', 'application/json')
-                    self.send_header('Set-Cookie', 'aurex_access=' + token + '; HttpOnly; SameSite=Strict; Path=/')
-                    self.end_headers()
-                    self.wfile.write(b'{"ok":true}')
-                    return
-                if not self.auth():
+                    return self.respond_with_cookies({'ok': True, 'role': 'admin'},
+                        ['aurex_access=' + admin_token])
+                if path == '/api/logout':
+                    return self.respond_with_cookies({'ok': True}, ['aurex_access=; Max-Age=0'])
+                principal = self.principal()
+                if not principal:
                     return self.respond({'error': 'Access token required'}, 401)
                 if path == '/api/sessions':
-                    sid = database.session(title=str(data.get('title') or 'New conversation'))
+                    sid = database.session(title=str(data.get('title') or 'New conversation'),
+                        owner_id=principal['owner_id'] if principal['role'] == 'user' else '')
                     return self.respond({'id': sid}, 201)
-                if path in ('/api/tasks', '/api/requests'):
-                    # This deployment has one administrator access token, not per-user accounts.
+                if path == '/api/tasks':
+                    if principal['role'] != 'admin':
+                        return self.respond({'error': 'Administrator access required'}, 403)
                     with gate:
-                        result = create_task(data, source='admin' if path == '/api/tasks' else 'web')
+                        result = create_task(data, principal=principal, source='admin')
+                    return self.respond(result, 202)
+                if path == '/api/requests':
+                    with gate:
+                        result = create_task(data, principal=principal, source='web')
                     return self.respond(result, 202)
                 parts = path.strip('/').split('/')
                 if len(parts) == 4 and parts[:2] == ['api', 'tasks'] and parts[3] == 'cancel':
                     if data:
                         raise ValueError('Task cancellation accepts an empty JSON object')
                     task = database.get_task(parts[2])
-                    if not task:
+                    if not task or not self.require_session(principal, task['session_id']):
                         return self.respond({'error': 'Task not found'}, 404)
                     result = database.request_cancel(task['session_id'], task['id'])
                     queue.wake.set()
@@ -375,15 +546,17 @@ def serve(*, cfg, config_path, agent, user=None, hostname=None, port=None, poll=
                     if set(data) != {'run_id'}:
                         raise ValueError('Cancellation accepts only run_id')
                     with gate:
+                        if not self.require_session(principal, parts[2]):
+                            return self.respond({'error': 'Session not found'}, 404)
                         result = database.request_cancel(parts[2], data['run_id'])
                     queue.wake.set()
                     return self.respond(result, 202 if result['status'] == 'cancelling' else 200)
                 if len(parts) == 4 and parts[:2] == ['api', 'sessions'] and parts[3] == 'messages':
                     sid = parts[2]
                     with gate:
-                        if not database.get(sid):
+                        if not self.require_session(principal, sid):
                             return self.respond({'error': 'Session not found'}, 404)
-                        result = create_task(data, session_id=sid)
+                        result = create_task(data, principal=principal, session_id=sid)
                     return self.respond(result, 202)
                 return self.respond({'error': 'Not found'}, 404)
             except (ValueError, KeyError, OSError) as exc:
