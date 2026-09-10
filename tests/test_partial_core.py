@@ -198,7 +198,13 @@ class PartialCoreTests(unittest.TestCase):
             self.assertEqual(meta['complete_document_id'], payload['document_id'])
             self.assertTrue(meta['location'].startswith('machine_evidence.'))
             self.assertLessEqual(meta['expanded'], meta['shown'])
-        self.assertEqual(core['families']['recorded_state_read_refs']['total'], 0)
+        for name in ('source_facts', 'structure_counts', 'analysis_outcome_refs'):
+            self.assertIn(name, core['families'])
+        self.assertEqual(core['empty_families'],
+                         ['recorded_state_read_refs', 'interface_sets'])
+        for name in core['empty_families']:
+            self.assertNotIn(name, core['families'])
+            self.assertNotIn(name, core)
         self.assertEqual(core['tool_totals']['circuit_analyze']['completed_outcomes'], 20)
         self.budget.summarize('Retain the actual goal and open issues. ' * 2000, title='checkpoint')
         self.assertTrue(all(options['max_tokens'] >= 2048 for _, options in self.client.requests))

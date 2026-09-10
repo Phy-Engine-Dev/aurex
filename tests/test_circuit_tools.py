@@ -16,7 +16,7 @@ sys.path.insert(0, str(ROOT / "src"))
 
 from aurex.config import AurexConfig
 from aurex.phy_engine.catalog import PL_MAX_POWER_W
-from aurex.tools.circuits import (_editable_component_manifest, _render_spec, _spatial_context,
+from aurex.tools.circuits import (_controls_result, _editable_component_manifest, _interface_result, _query_many_manifest, _render_spec, _selection_spatial_order, _spatial_context,
                                   _summarize_numeric_series, circuit_analyze, circuit_compare_traces, circuit_create,
                                   circuit_edit, circuit_inspect,
                                   circuit_query_many, circuit_read_trace,
@@ -34,11 +34,20 @@ class CircuitValidationTests(unittest.TestCase):
     def test_catalog_and_unique_registration(self):
         registry = ToolRegistry()
         register_circuit_tools(registry)
-        self.assertEqual(len(registry.list()), 9)
+        self.assertEqual(len(registry.list()), 10)
+        self.assertIsNotNone(registry.get("circuit_diagnose"))
         self.assertIsNotNone(registry.get("circuit_read_stimulus"))
         self.assertIsNotNone(registry.get("circuit_query_many"))
+        query_description = registry.get("circuit_query_many").description
+        self.assertIn("measurements.voltage_across_0_to_1.real", query_description)
+        self.assertIn("measurements.derived_current_0_to_1.real", query_description)
+        self.assertIn("measurements.digital is only", query_description)
         self.assertIsNotNone(registry.get("circuit_compare_traces"))
         self.assertTrue(all(t.parameters["type"] == "object" for t in registry.list()))
+        query_help = registry.get("circuit_query_many").description
+        self.assertIn("measurements.voltage_across_0_to_1.real", query_help)
+        self.assertIn("measurements.derived_current_0_to_1.real", query_help)
+        self.assertIn("is not analog voltage/current", query_help)
 
     def test_non_electrical_and_missing_types_rejected_before_engine(self):
         with tempfile.TemporaryDirectory() as folder:
@@ -100,6 +109,121 @@ class CircuitValidationTests(unittest.TestCase):
         self.assertEqual(context["relations"][0]["nearest"][0]["shared_nodes"], ["gnd"])
         self.assertEqual(context["relations"][0]["nearest"][1]["direction"], "above")
         self.assertFalse(context["relations"][0]["nearest"][1]["electrically_connected"])
+
+    def test_collection_spatial_order_separates_saved_refs_from_bit_significance(self):
+        components = [
+            {"id": "input-top", "ref": "C1", "type": "Logic Input",
+             "position": [0.00, .30, 0], "position_source": "saved"},
+            {"id": "input-bottom", "ref": "C2", "type": "Logic Input",
+             "position": [.01, .10, 0], "position_source": "saved"},
+            {"id": "input-middle", "ref": "C3", "type": "Logic Input",
+             "position": [-.01, .20, 0], "position_source": "saved"},
+        ]
+        order = _selection_spatial_order(components, covers_all_query_matches=True)
+        self.assertTrue(order["covers_all_query_matches"])
+        self.assertTrue(order["geometry_authoritative"])
+        self.assertTrue(order["unambiguous"])
+        self.assertEqual([row["ref"] for row in order["top_to_bottom"]],
+                         ["C1", "C3", "C2"])
+        self.assertIsNone(order["logical_bit_order"])
+        self.assertEqual(order["logical_bit_order_status"], "undeclared")
+
+        tied = _selection_spatial_order([
+            {**components[0], "position": [0, .2, 0]},
+            {**components[1], "position": [1, .2, 9]},
+        ], covers_all_query_matches=True)
+        self.assertFalse(tied["unambiguous"])
+        self.assertIsNone(tied["top_to_bottom"])
+        self.assertEqual(len(tied["groups"][0]["vertical_bands"][0]), 2)
+
+        jittered_row = _selection_spatial_order([
+            {**components[0], "position": [1, .24, 0]},
+            {**components[1], "position": [0, .17, 0]},
+        ], covers_all_query_matches=True)
+        jittered_group = jittered_row["groups"][0]
+        self.assertFalse(jittered_group["unambiguous"])
+        self.assertIsNone(jittered_group["top_to_bottom"])
+        self.assertEqual([row["ref"] for row in
+                          jittered_group["top_to_bottom_bands"][0]["left_to_right"]],
+                         ["C2", "C1"])
+
+        generated = _selection_spatial_order([
+            {**components[0], "position_source": "generated"}, components[1],
+        ], covers_all_query_matches=True)
+        self.assertFalse(generated["geometry_authoritative"])
+
+    def test_interface_result_groups_saved_rows_without_inventing_bus_order(self):
+        with tempfile.TemporaryDirectory() as folder:
+            netlist = Path(folder) / "interface.json"
+            def port(cid, ref, kind, position):
+                return {"id": cid, "ref": ref, "type": kind, "label": "",
+                        "properties": {}, "statistics": {},
+                        "pins": [{"pin": 0, "node": cid + "-node"}],
+                        "position": position, "position_source": "saved"}
+            components = [
+                # Saved component centres are visibly aligned despite small Y
+                # jitter; grouping must not require exact floating equality.
+                port("left", "C1", "Logic Input", [0, 2.04, 0]),
+                port("right", "C2", "Logic Input", [1, 1.97, 0]),
+                port("start", "C24", "Logic Input", [.5, 0, 0]),
+                port("out-left", "C11", "Logic Output", [0, 1.03, 0]),
+                port("out-right", "C12", "Logic Output", [1, .97, 0]),
+            ]
+            netlist.write_text(json.dumps({"components": components,
+                "nodes": [{"id": row["pins"][0]["node"],
+                           "connections": [{"component": row["id"], "pin": 0}]}
+                          for row in components]}))
+            result = _interface_result({"artifact": {"netlist_path": str(netlist)}}, 0, 64)
+        groups = result["interface_groups"]
+        self.assertTrue(groups["geometry_authoritative"])
+        inputs = next(row for row in groups["groups"] if row["direction"] == "input")
+        self.assertEqual([[item["ref"] for item in band["left_to_right"]]
+                          for band in inputs["top_to_bottom_bands"]],
+                         [["C1", "C2"], ["C24"]])
+        outputs = next(row for row in groups["groups"] if row["direction"] == "output")
+        self.assertEqual([item["ref"] for item in outputs["top_to_bottom_bands"][0]["left_to_right"]],
+                         ["C11", "C12"])
+        global_rows = groups["global_top_to_bottom_bands"]
+        self.assertEqual([[item["ref"] for item in band["left_to_right"]]
+                          for band in global_rows],
+                         [["C1", "C2"], ["C11", "C12"], ["C24"]])
+        self.assertEqual(global_rows[1]["id"], "G_INTERFACE_ROW_2")
+        self.assertEqual(global_rows[1]["row_number"], 2)
+        self.assertTrue(all(item["direction"] == "output"
+                            for item in global_rows[1]["left_to_right"]))
+        self.assertIsNone(groups["logical_bit_order"])
+        self.assertEqual(groups["row_tolerance_saved_units"], 0.08)
+
+    def test_controls_result_preserves_exact_saved_ref_and_position(self):
+        with tempfile.TemporaryDirectory() as folder:
+            netlist = Path(folder) / "controls.json"
+            components = [
+                {"id": "logic-id", "ref": "C24", "type": "Logic Input",
+                 "properties": {"开关": 0}, "position": [0, 1, 0]},
+                {"id": "switch-id", "ref": "C209", "type": "Simple Switch",
+                 "properties": {"开关": 1}, "position": [0, -1, 0]},
+            ]
+            netlist.write_text(json.dumps({"components": components}))
+            result = _controls_result({"artifact": {"netlist_path": str(netlist)}}, 0, 64)
+        rows = {row["ref"]: row for row in result["controls"]}
+        self.assertEqual(rows["C24"]["id"], "logic-id")
+        self.assertEqual(rows["C24"]["kind"], "digital_input")
+        self.assertEqual(rows["C209"]["id"], "switch-id")
+        self.assertEqual(rows["C209"]["kind"], "spst")
+        self.assertEqual(rows["C209"]["position"], [0, -1, 0])
+        self.assertIn("different refs/ids are different components", result["usage"])
+
+    def test_query_manifest_reports_missing_spatial_instead_of_claiming_complete(self):
+        manifest = _query_many_manifest([{
+            "query": "C1", "ok": True, "component_ids": ["one"],
+            "components": [{"id": "one", "ref": "C1", "type": "Logic Input"}],
+            "match_count": 1, "has_more": False,
+            "missing_fields": ["spatial"],
+        }], ["spatial"], include_all=False)
+        row = manifest["rows"][0]
+        self.assertEqual(row["missing_fields"], ["spatial"])
+        self.assertFalse(row["requested_values_complete"])
+        self.assertEqual(row["details_not_in_manifest"], ["spatial_unavailable"])
 
     def test_numeric_trace_summary_distinguishes_window_stability_from_settled_remainder(self):
         series = [(0, 0.0, 0.0), (1, 1.0, 0.05), (2, 2.0, 1.0),
@@ -400,6 +524,10 @@ class CircuitNativeTests(unittest.TestCase):
         self.assertNotIn("component_catalog", result)
         self.assertNotIn("pins", result["results"][0]["components"][0])
         self.assertEqual(result["selected_fields"], ["identity"])
+        self.assertEqual(result["query_manifest"]["query_coverage"],
+                         {"requested": 2, "represented": 2, "complete": True})
+        self.assertEqual([row["query"] for row in result["query_manifest"]["rows"]],
+                         ["V1", "R1"])
         self.assertLess(len(json.dumps(result)), 5000)
         detailed = circuit_query_many(self.runtime, {
             "path": created["circuit_path"], "queries": ["V1", "R1"], "limit": 1,
@@ -424,6 +552,22 @@ class CircuitNativeTests(unittest.TestCase):
         self.assertTrue(node["results"][0]["components"][0]["matched_pins"])
         self.assertFalse(node["results"][1]["ok"])
         self.assertEqual(node["results"][2]["components"][0]["type"], "Resistor")
+        partial_node = circuit_query_many(self.runtime, {
+            "path": created["circuit_path"], "queries": [node_id], "limit": 1,
+            "fields": ["pins"],
+        })["results"][0]
+        self.assertEqual(partial_node["match_count"], 2)
+        self.assertTrue(partial_node["has_more"])
+        self.assertEqual(partial_node["next_offset"], 1)
+        self.assertEqual(partial_node["nodes"][0]["total_connections"], 2)
+        self.assertEqual(partial_node["nodes"][0]["external_connections"], 1)
+        self.assertTrue(partial_node["nodes"][0]["connections_truncated"])
+        manifest_node = circuit_query_many(self.runtime, {
+            "path": created["circuit_path"], "queries": [node_id], "limit": 1,
+            "fields": ["pins"],
+        })["query_manifest"]["rows"][0]["nodes"][0]
+        self.assertEqual(manifest_node["external_connections"], 1)
+        self.assertTrue(manifest_node["connections_truncated"])
         repeated = circuit_query_many(self.runtime, {
             "path": created["circuit_path"], "queries": ["R1", "R1"], "limit": 1,
         })
@@ -543,6 +687,31 @@ class CircuitNativeTests(unittest.TestCase):
         self.assertTrue(expanded_batch["results"][0]["ok"])
         self.assertEqual(expanded_batch["results"][0]["match_count"], 2)
         self.assertEqual(expanded_batch["results"][0]["component_ids"], ["CAP"])
+
+    def test_original_model_name_resolves_after_native_import(self):
+        spec = {"components": [
+            {"id": "V", "type": "vdc", "nodes": ["vcc", "gnd"],
+             "params": {"v": 5}},
+            {"id": "VM", "type": "voltage_meter", "nodes": ["vcc", "gnd"],
+             "params": {"r_input": 1e9}, "pl_source": {
+                 "model_id": "Multimeter", "source_ref": "C19", "is_helper": False}},
+            {"id": "VM:guard", "type": "resistor", "nodes": ["vcc", "gnd"],
+             "params": {"r": 1e12}, "pl_source": {
+                 "model_id": "Multimeter", "source_ref": "C19", "is_helper": True}},
+        ]}
+        analyzed = circuit_analyze(self.runtime, {"spec": spec, "analysis": "dc"})
+        inspected = circuit_inspect(self.runtime, {
+            "path": analyzed["state_path"], "query": "Multimeter", "limit": 8})
+        self.assertEqual(inspected["pagination"]["primary_ids"], ["VM"])
+        self.assertEqual(inspected["pagination"]["total_matches"], 1)
+        batch = circuit_query_many(self.runtime, {
+            "path": analyzed["state_path"], "queries": ["Multimeter"],
+            "limit": 8, "fields": ["measurements.voltage"],
+        })
+        self.assertEqual(batch["successful_query_count"], 1)
+        self.assertEqual(batch["results"][0]["component_ids"], ["VM"])
+        self.assertEqual(batch["results"][0]["components"][0]["measurements"]["voltage"],
+                         [5.0, 0.0])
 
     def test_position_aware_schematic_routes_exact_nodes_and_marks_partial_context(self):
         created = circuit_create(self.runtime, {"spec": {"components": [

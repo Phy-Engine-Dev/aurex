@@ -243,6 +243,23 @@ COMPONENTS["digital_random4"].update({
     "model_notes": "Deterministic 4-bit PE LFSR surrogate. PhysicsLab saves do not serialize its hidden runtime state; imports use an explicit stable non-zero surrogate seed and preserve saved low/high voltage levels. This supports transition/reset/circuit-response tests but cannot reproduce or certify the original app's exact initial random values or sequence.",
 })
 
+# Explicit native output positions. A named unloaded output still has a
+# measurable value; a singleton input can retain its model's open-pin default.
+# Never infer direction from a label such as "q" or from its node's spelling.
+_DIGITAL_OUTPUT_PINS = {
+    "digital_input": (0,), "digital_output": (),
+    "digital_not": (1,), "digital_yes": (1,), "digital_tri": (2,),
+    "digital_half_adder": (2, 3), "digital_full_adder": (3, 4),
+    "digital_half_sub": (2, 3), "digital_full_sub": (3, 4),
+    "digital_mul2": (4, 5, 6, 7), "digital_dff": (2,),
+    "digital_tff": (2,), "digital_t_bar_ff": (2,), "digital_jkff": (3,),
+    "digital_counter4": (0, 1, 2, 3), "digital_random4": (0, 1, 2, 3),
+    "digital_input8": tuple(range(8)), "digital_output8": (),
+    **{"digital_" + name: (2,) for name in ("and", "or", "xor", "xnor", "nand", "nor", "imp", "nimp")},
+}
+for _kind, _positions in _DIGITAL_OUTPUT_PINS.items():
+    COMPONENTS[_kind]["digital_output_pins"] = _positions
+
 # Every native digital primitive has Ll/Hl attributes.  PhysicsLab persists
 # those levels on sequential/arithmetic modules too, and real community saves
 # connect their outputs to relays, lamps and other analog loads.  Limiting this

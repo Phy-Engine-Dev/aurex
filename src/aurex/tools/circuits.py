@@ -426,6 +426,33 @@ def _source_ref_ids(spec: dict[str, Any], source_ref: str) -> list[str]:
     return result
 
 
+def _source_model_ids(spec: dict[str, Any], query: str) -> list[str]:
+    """Resolve a literal PhysicsLab model name on an imported native spec.
+
+    A saved ``Multimeter`` may become a native ``voltage_meter`` or a very
+    small ``resistor`` after import.  The renderer therefore cannot find it by
+    the original model name once the caller follows ``state_path``.  Preserve
+    the existing literal-query contract by resolving against ``pl_source``
+    before handing exact native IDs to the renderer.  Import helpers are
+    excluded so a query names the saved component rather than its ESR, damage
+    guard, or other implementation detail.
+    """
+    needle = query.strip().casefold()
+    if not needle:
+        return []
+    result = []
+    for component in spec.get("components", []):
+        source = component.get("pl_source") if isinstance(component, dict) else None
+        if not isinstance(source, dict) or source.get("is_helper") is True:
+            continue
+        model_id = source.get("model_id")
+        cid = component.get("id")
+        if (isinstance(model_id, str) and needle == model_id.casefold() and
+                isinstance(cid, str) and cid not in result):
+            result.append(cid)
+    return result
+
+
 def _annotate_source_refs(output: dict[str, Any], spec: dict[str, Any]) -> None:
     """Expose stable original refs beside revision-local renderer refs."""
     refs = {}
@@ -460,6 +487,107 @@ def _direction(dx: float, dy: float) -> str:
             "upper_left" if dy > 0 else "lower_left")
 
 
+_SAVED_ROW_TOLERANCE = 0.08
+
+
+def _selection_spatial_order(components: list[dict[str, Any]], *,
+                             covers_all_query_matches: bool) -> dict[str, Any]:
+    """Return collection-level geometry without inventing logical bit order."""
+    usable: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    incomplete_reasons: list[str] = []
+    geometry_authoritative = True
+    for component in components:
+        cid = component.get("id")
+        if not isinstance(cid, str) or cid in seen:
+            continue
+        seen.add(cid)
+        position = component.get("position")
+        source = component.get("position_source")
+        if source == "generated":
+            geometry_authoritative = False
+            incomplete_reasons.append(f"{cid}:generated_geometry")
+        elif source not in ("saved", "provided"):
+            geometry_authoritative = False
+            incomplete_reasons.append(f"{cid}:position_source_unverified")
+        if not isinstance(position, list) or len(position) < 2:
+            geometry_authoritative = False
+            incomplete_reasons.append(f"{cid}:missing_position")
+            continue
+        try:
+            x, y = float(position[0]), float(position[1])
+        except (TypeError, ValueError, OverflowError):
+            geometry_authoritative = False
+            incomplete_reasons.append(f"{cid}:invalid_position")
+            continue
+        if not math.isfinite(x) or not math.isfinite(y):
+            geometry_authoritative = False
+            incomplete_reasons.append(f"{cid}:invalid_position")
+            continue
+        usable.append({"id": cid, "ref": component.get("ref"),
+                       "source_ref": component.get("source_ref"),
+                       "type": component.get("type"), "label": component.get("label", ""),
+                       "x": x, "y": y})
+
+    groups = []
+    grouped: dict[str, list[dict[str, Any]]] = {}
+    for component in usable:
+        grouped.setdefault(str(component.get("type") or "unknown"), []).append(component)
+    for component_type, members in grouped.items():
+        ordered = sorted(members, key=lambda item: (-item["y"], item["x"], item["id"]))
+        bands: list[list[dict[str, Any]]] = []
+        for member in ordered:
+            locator = {key: member[key] for key in ("id", "ref", "source_ref", "label")
+                       if member.get(key) not in (None, "")}
+            # Saved centres contain small placement/rotation jitter.  Use the
+            # same complete-link row tolerance as interface_only so a visible
+            # horizontal bus is not falsely reported as a strict vertical
+            # order.  Complete-link (top minus bottom) prevents chained rows.
+            if (not bands or
+                    max(row["_y"] for row in bands[-1]) - member["y"] >
+                    _SAVED_ROW_TOLERANCE):
+                bands.append([{**locator, "_x": member["x"], "_y": member["y"]}])
+            else:
+                bands[-1].append({**locator, "_x": member["x"], "_y": member["y"]})
+        public_bands = [[{k: v for k, v in row.items() if k not in ("_x", "_y")}
+                         for row in sorted(band, key=lambda item: (item["_x"], str(item.get("id"))))]
+                        for band in bands]
+        ambiguities = [band for band in public_bands if len(band) > 1]
+        unambiguous = not ambiguities
+        group: dict[str, Any] = {"type": component_type, "count": len(members),
+                                 "unambiguous": unambiguous,
+                                 "ambiguities": ambiguities,
+                                 "row_tolerance_saved_units": _SAVED_ROW_TOLERANCE,
+                                 "top_to_bottom_bands": [
+                                     {"count": len(band), "left_to_right": band}
+                                     for band in public_bands]}
+        if unambiguous:
+            group["top_to_bottom"] = [band[0] for band in public_bands]
+        else:
+            group["top_to_bottom"] = None
+            group["vertical_bands"] = public_bands
+        groups.append(group)
+
+    result = {
+        "projection": "saved_top_view",
+        "axis": "saved_y_descending",
+        "scope": "distinct primary components in this selection only; neighbours excluded",
+        "covers_all_query_matches": bool(covers_all_query_matches),
+        "geometry_authoritative": bool(geometry_authoritative and len(usable) == len(seen)),
+        "unambiguous": all(group["unambiguous"] for group in groups),
+        "groups": groups,
+        "ref_semantics": "ref/source_ref are generated locators, not bit indices",
+        "logical_bit_order": None,
+        "logical_bit_order_status": "undeclared",
+        "semantics": "result order is query order; geometry order does not establish logical bit significance",
+    }
+    if incomplete_reasons:
+        result["incomplete_reasons"] = incomplete_reasons
+    if len(groups) == 1:
+        result["top_to_bottom"] = groups[0].get("top_to_bottom")
+    return result
+
+
 def _spatial_context(data: dict[str, Any], primary_ids: list[str], *,
                      primary_limit: int = 4, neighbor_limit: int = 4) -> dict[str, Any] | None:
     """Return bounded, explicit relative-position facts for focused objects.
@@ -474,7 +602,8 @@ def _spatial_context(data: dict[str, Any], primary_ids: list[str], *,
                   if isinstance(row, dict) and isinstance(row.get("position"), list)
                   and len(row["position"]) >= 2]
     by_id = {str(row.get("id")): row for row in components}
-    primary = [by_id[cid] for cid in primary_ids if cid in by_id][:primary_limit]
+    requested = list(dict.fromkeys(primary_ids))
+    primary = [by_id[cid] for cid in requested if cid in by_id][:primary_limit]
     if not primary:
         return None
     rows = []
@@ -504,13 +633,17 @@ def _spatial_context(data: dict[str, Any], primary_ids: list[str], *,
             "type": source.get("type"),
             "nearest": [item[2] for item in candidates[:neighbor_limit]],
         })
-    return {
+    output = {
         "projection": "saved_top_view",
         "relations": rows,
         "semantics": ("left/right/above/below are derived from saved x/y positions in top view. "
                       "Distance is layout distance, not wire length. Only shared_nodes/electrically_connected "
                       "is connectivity evidence. Request with_image=true for a focused schematic when a visual relation remains ambiguous."),
     }
+    if len(primary) > 1:
+        output["selection_order"] = _selection_spatial_order(
+            primary, covers_all_query_matches=len(primary) == len(requested))
+    return output
 
 
 def _renderer(runtime: ToolRuntime) -> str:
@@ -571,10 +704,11 @@ def _compact_view(data: dict[str, Any], summary: dict[str, Any]) -> dict[str, An
         for node in data["nodes"]:
             local = [p for p in node["connections"] if p["component"] in shown]
             if local:
+                external = len(node["connections"]) - len(local)
                 nodes.append({"id": node["id"], "connections": local[:32],
                               "total_connections": len(node["connections"]),
-                              "external_connections": len(node["connections"]) - len(local),
-                              "connections_truncated": len(local) > 32})
+                              "external_connections": external,
+                              "connections_truncated": external > 0 or len(local) > 32})
             if len(nodes) == 64:
                 break
     raw_camera = summary.get("camera", data.get("camera", {}))
@@ -666,8 +800,10 @@ def _view(runtime: ToolRuntime, source: Path, *, create: bool = False, exportabl
                                   "requested_limit": requested_limit,
                                   "next_offset": offset + len(page) if offset + len(page) < len(matches) else None,
                                   "scope": "components whose saved/native pin node exactly equals this node"}
-        selected["pagination"].update({"query": node_query, "match_count": len(matches), "offset": offset,
+        selected["pagination"].update({"query": node_query, "match_count": len(matches),
+                                         "total_matches": len(matches), "offset": offset,
                                          "limit": page_limit, "requested_limit": requested_limit,
+                                         "has_more": selected["node_query"]["next_offset"] is not None,
                                          "next_offset": selected["node_query"]["next_offset"]})
         selected["warnings"].append("Node query is exact connectivity evidence; it does not identify driver direction or prove dynamic behavior by itself.")
         if requested_limit > page_limit:
@@ -811,12 +947,120 @@ def _interface_result(result: dict[str, Any], offset: int, limit: int) -> dict[s
                       "connected_to_other_components": connection_count > 1 if connection_count is not None else None,
                       "logic": logic, "logic_text": "LHXZ"[logic] if logic is not None else None,
                       "logic_source": source if logic is not None else "no recorded logic value available"})
+    # Give a small model the collection-level layout once.  This is geometry
+    # evidence only: it deliberately uses stable C refs instead of repeating
+    # UUIDs already present in ``ports``, and never invents bus significance.
+    # Without this index a wide interface forced callers to request per-port
+    # spatial neighbours and reconstruct obvious rows by hand.
+    grouped: dict[tuple[str, str], list[dict[str, Any]]] = {}
+    geometry_authoritative = True
+    for component in data["components"]:
+        kind = component.get("type")
+        if kind not in ("Logic Input", "Logic Output"):
+            continue
+        position = component.get("position")
+        source_name = component.get("position_source")
+        if (not isinstance(position, list) or len(position) < 2 or
+                source_name not in ("saved", "provided")):
+            geometry_authoritative = False
+            continue
+        try:
+            x, y = float(position[0]), float(position[1])
+        except (TypeError, ValueError, OverflowError):
+            geometry_authoritative = False
+            continue
+        if not math.isfinite(x) or not math.isfinite(y):
+            geometry_authoritative = False
+            continue
+        direction = "input" if kind == "Logic Input" else "output"
+        grouped.setdefault((direction, kind), []).append({
+            "ref": component.get("ref"), "label": component.get("label", ""),
+            "_x": x, "_y": y,
+        })
+    interface_groups = []
+    # PhysicsLab stores the centre of each placed object, not a snapped port
+    # anchor.  Components which are visibly on the same row therefore differ
+    # slightly in Y (the real 24-input fixture spans roughly 0.07 units within
+    # one row).  Exact-Y grouping turned every port into a singleton.  Keep a
+    # deliberately small, published tolerance and use complete-link bands so
+    # nearby rows cannot be joined by a chain of small offsets.
+    row_tolerance = _SAVED_ROW_TOLERANCE
+    for (direction, kind), members in sorted(grouped.items()):
+        ordered = sorted(members, key=lambda row: (-row["_y"], row["_x"], str(row.get("ref"))))
+        bands: list[list[dict[str, Any]]] = []
+        for member in ordered:
+            if (not bands or
+                    max(row["_y"] for row in bands[-1]) - member["_y"] > row_tolerance):
+                bands.append([member])
+            else:
+                bands[-1].append(member)
+        public_bands = []
+        for band in bands:
+            locators = [{key: row[key] for key in ("ref", "label") if row.get(key) not in (None, "")}
+                        for row in sorted(band, key=lambda row: (row["_x"], str(row.get("ref"))))]
+            public_bands.append({
+                "layout": "horizontal_row" if len(locators) > 1 else "singleton",
+                "count": len(locators), "left_to_right": locators,
+            })
+        interface_groups.append({"direction": direction, "type": kind,
+                                 "count": len(members), "top_to_bottom_bands": public_bands})
+    # Direction-specific groups answer questions such as "the first output
+    # row", but source prose often says only "the second row".  Preserve a
+    # second, cross-direction ordering so the model never has to guess whether
+    # that ordinal is global or output-relative.  This is still geometry only.
+    global_members = []
+    for (direction, kind), members in grouped.items():
+        global_members.extend({**member, "direction": direction, "type": kind}
+                              for member in members)
+    global_ordered = sorted(
+        global_members,
+        key=lambda row: (-row["_y"], row["_x"], str(row.get("ref"))))
+    global_rows: list[list[dict[str, Any]]] = []
+    for member in global_ordered:
+        if (not global_rows or
+                max(row["_y"] for row in global_rows[-1]) - member["_y"] > row_tolerance):
+            global_rows.append([member])
+        else:
+            global_rows[-1].append(member)
+    global_bands = []
+    for index, band in enumerate(global_rows, 1):
+        locators = [{key: row[key] for key in ("ref", "label", "direction", "type")
+                     if row.get(key) not in (None, "")}
+                    for row in sorted(band, key=lambda row: (row["_x"], str(row.get("ref"))))]
+        global_bands.append({
+            "id": f"G_INTERFACE_ROW_{index}",
+            "row_number": index,
+            "layout": "horizontal_row" if len(locators) > 1 else "singleton",
+            "count": len(locators),
+            "left_to_right": locators,
+        })
+    interface_map = {
+        "schema": "aurex.interface-geometry.v1",
+        "projection": "saved_top_view",
+        "row_tolerance_saved_units": row_tolerance,
+        "geometry_authoritative": bool(geometry_authoritative and sum(len(v) for v in grouped.values()) == len(ports)),
+        "groups": interface_groups,
+        "global_top_to_bottom_bands": global_bands,
+        "logical_bit_order": None,
+        "logical_bit_order_status": "undeclared",
+        "semantics": ("Bands and left_to_right order come only from saved positions. "
+                      "An unqualified source phrase such as first/second row maps to "
+                      "global_top_to_bottom_bands.row_number; an explicitly input/output-relative "
+                      "phrase maps to groups[].top_to_bottom_bands. "
+                      "They are candidate interface groupings, not signal names, bus significance, "
+                      "stimulus-column order, or proof of function."),
+    }
     return {"interface_only": True, "with_image": False, "images": [], "ports": ports[offset:offset + limit],
             "total_ports": len(ports), "total_inputs": sum(p["direction"] == "input" for p in ports),
             "total_outputs": sum(p["direction"] == "output" for p in ports), "total_components": len(data["components"]),
             "offset": offset, "limit": limit, "has_more": offset + limit < len(ports),
             "next_offset": offset + limit if offset + limit < len(ports) else None,
-            "scope": "Actual Logic Input/Output devices in saved order, with original IDs/labels and exact saved-node connection counts; internal gates and bare coordinates omitted. Use a focused schematic/spatial_context only for a real layout question. A port with connected_to_other_components=false is isolated and cannot stimulate or observe the circuit. This is not an inferred module signature: unlabelled inputs may be constants. No stimulus or waveform is invented.",
+            "array_order": "saved_component_order",
+            "ref_semantics": "generated_locator_not_bit_index",
+            "logical_bit_order": None,
+            "logical_bit_order_status": "undeclared",
+            "interface_groups": interface_map,
+            "scope": "Actual Logic Input/Output devices in saved component-array order, with original IDs/labels and exact saved-node connection counts. Array order is not C-ref numeric order, saved-view spatial order, logical bit significance or stimulus-column order. Internal gates and bare coordinates are omitted. Use a focused schematic/spatial_context only for a real layout question. A port with connected_to_other_components=false is isolated and cannot stimulate or observe the circuit. This is not an inferred module signature: unlabelled inputs may be constants. No stimulus or waveform is invented.",
             "artifact": result["artifact"],
             **{k: result[k] for k in ("circuit_path", "state_path", "state_source", "measurement_source") if k in result}}
 
@@ -870,6 +1114,13 @@ def _controls_result(result: dict[str, Any], offset: int, limit: int) -> dict[st
                 continue
         if not isinstance(control_id, str) or not control_id:
             continue
+        ref = component.get("ref")
+        if isinstance(ref, str) and ref:
+            descriptor["ref"] = ref
+        position = component.get("position")
+        if (isinstance(position, list) and len(position) == 3 and
+                all(type(value) in (int, float) and math.isfinite(value) for value in position)):
+            descriptor["position"] = position
         if control_id not in controls:
             controls[control_id] = descriptor
             order.append(control_id)
@@ -879,7 +1130,7 @@ def _controls_result(result: dict[str, Any], offset: int, limit: int) -> dict[st
             "controls": rows[offset:offset + limit], "total_controls": len(rows),
             "offset": offset, "limit": limit, "has_more": offset + limit < len(rows),
             "next_offset": offset + limit if offset + limit < len(rows) else None,
-            "usage": "Use exact id in circuit_analyze.tr_interactions. These are time-varying physical/model controls; switch and rheostat controls remain analog devices, not fabricated digital ports.",
+            "usage": "Each row's ref and id identify that same exact saved control; different refs/ids are different components. Use id in circuit_analyze.tr_interactions. Logic Inputs and physical switches may share one mixed TR frame; switches and rheostats remain analog devices, not fabricated digital ports.",
             "artifact": result["artifact"],
             **{k: result[k] for k in ("circuit_path", "state_path", "state_source", "measurement_source") if k in result}}
 
@@ -935,6 +1186,20 @@ def circuit_inspect(runtime: ToolRuntime, args: dict[str, Any]) -> dict[str, Any
             # Slice the stable alias here and expose the complete alias count
             # below instead of silently resolving the revision-local C-ref.
             offset = 0
+    source_model_query = None
+    source_model_ids = None
+    source_model_offset = offset
+    if (known_spec is not None and query and not focus and
+            not re.fullmatch(r"N(?:0|[1-9][0-9]*)", query, re.IGNORECASE)):
+        stable_ids = _source_model_ids(known_spec, query)
+        if stable_ids:
+            source_model_query, source_model_ids, query = query, stable_ids, ""
+            focus = stable_ids[offset:offset + limit]
+            if not focus:
+                raise ToolError(
+                    f"Inspection offset {offset} exceeds {len(stable_ids)} native matches "
+                    f"for source model {source_model_query}")
+            offset = 0
 
     def attach_source_ref_resolution(result: dict[str, Any]) -> None:
         if not source_ref_query or source_ref_ids is None:
@@ -955,6 +1220,20 @@ def circuit_inspect(runtime: ToolRuntime, args: dict[str, Any]) -> dict[str, Any
             "next_offset": (source_ref_offset + len(focus)
                             if source_ref_offset + len(focus) < total else None),
         })
+
+    def attach_source_model_resolution(result: dict[str, Any]) -> None:
+        if not source_model_query or source_model_ids is None:
+            return
+        total = len(source_model_ids)
+        pagination = result.setdefault("pagination", {})
+        pagination.update({
+            "primary_ids": copy.deepcopy(focus),
+            "offset": source_model_offset, "limit": limit,
+            "total_matches": total, "match_count": len(focus),
+            "has_more": source_model_offset + len(focus) < total,
+            "next_offset": (source_model_offset + len(focus)
+                            if source_model_offset + len(focus) < total else None),
+        })
     if value.get("schema") == "aurex.pe-state.v1":
         output = _view(runtime, source, state=True, offset=offset, limit=limit, view=view, projection=projection, focus_ids=focus, query=query, camera=camera, with_image=with_image)
         output["circuit_path"] = str(source)
@@ -973,6 +1252,7 @@ def circuit_inspect(runtime: ToolRuntime, args: dict[str, Any]) -> dict[str, Any
         if isinstance(value.get("protection_summary"), dict):
             output["protection_summary"] = copy.deepcopy(value["protection_summary"])
         attach_source_ref_resolution(output)
+        attach_source_model_resolution(output)
         return (_interface_result(output, page_offset, page_limit) if interface_only
                 else _controls_result(output, page_offset, page_limit) if controls_only else output)
     if value.get("schema") == "aurex.circuit.v1":
@@ -997,6 +1277,7 @@ def circuit_inspect(runtime: ToolRuntime, args: dict[str, Any]) -> dict[str, Any
             _attach_edit_contract(output, editable, visible_ids)
     output["circuit_path"] = str(source)
     attach_source_ref_resolution(output)
+    attach_source_model_resolution(output)
     return (_interface_result(output, page_offset, page_limit) if interface_only
             else _controls_result(output, page_offset, page_limit) if controls_only else output)
 
@@ -1039,6 +1320,62 @@ def _query_many_pins(component: dict[str, Any],
             projected["connected"] = bool((node.get("total_connections") or 0) > 1)
         pins.append(projected)
     return pins
+
+
+def _query_many_manifest(rows: list[dict[str, Any]], selected_fields: list[str], *,
+                         include_all: bool) -> dict[str, Any]:
+    """Keep every batch target visible without replaying verbose neighbours.
+
+    ``results`` remains the complete operator/API result.  The manifest is a
+    compact, deterministic model contract: every query has one row and all
+    producer-selected electrical values except detailed spatial neighbours are
+    retained.  Collection geometry is returned once as ``spatial_order``.
+    """
+    manifest_rows = []
+    for row in rows:
+        compact = {key: copy.deepcopy(row[key]) for key in
+                   ("query", "ok", "component_ids", "match_count", "has_more", "next_offset", "error",
+                    "missing_fields")
+                   if key in row}
+        components = []
+        for component in row.get("components", []) if isinstance(row.get("components"), list) else []:
+            if not isinstance(component, dict):
+                continue
+            components.append({key: copy.deepcopy(component[key]) for key in
+                               ("id", "ref", "source_ref", "type", "label", "native_type",
+                                "matched_pins", "pins", "properties", "measurements", "edit",
+                                "missing_fields") if key in component})
+        if components:
+            compact["components"] = components
+        nodes = row.get("nodes")
+        if isinstance(nodes, list):
+            compact["nodes"] = [{key: copy.deepcopy(node[key]) for key in
+                                  ("id", "total_connections", "connections", "external_connections",
+                                   "connections_truncated")
+                                  if isinstance(node, dict) and key in node}
+                                 for node in nodes]
+        deferred = []
+        if "spatial" in selected_fields and "spatial" in row:
+            deferred.append("spatial_neighbours")
+        elif "spatial" in selected_fields and "spatial" in row.get("missing_fields", []):
+            deferred.append("spatial_unavailable")
+        if include_all:
+            deferred.append("unbounded_all_record_fields")
+        compact["requested_values_complete"] = not deferred
+        if deferred:
+            compact["details_not_in_manifest"] = deferred
+        manifest_rows.append(compact)
+    return {
+        "schema": "aurex.query-many-manifest.v1",
+        "query_coverage": {"requested": len(rows), "represented": len(manifest_rows), "complete": True},
+        "selected_fields": ["all"] if include_all else ["identity", *selected_fields],
+        "rows": manifest_rows,
+        "selected_value_coverage": (
+            "declared_per_row_by_requested_values_complete_details_not_in_manifest_and_missing_fields"),
+        "spatial_detail_policy": ("Collection geometry is in spatial_order; detailed nearest-neighbour rows remain "
+                                  "in results and may be omitted from a bounded model presentation. Query only a "
+                                  "small ambiguous subset if neighbour detail is still necessary."),
+    }
 
 
 def circuit_query_many(runtime: ToolRuntime, args: dict[str, Any]) -> dict[str, Any]:
@@ -1092,6 +1429,8 @@ def circuit_query_many(runtime: ToolRuntime, args: dict[str, Any]) -> dict[str, 
     identity_fields = ("id", "ref", "source_ref", "type", "label")
 
     rows = []
+    spatial_components: dict[str, dict[str, Any]] = {}
+    spatial_selection_complete = True
     circuit_path = None
     state_path = None
     for query in normalized:
@@ -1106,6 +1445,7 @@ def circuit_query_many(runtime: ToolRuntime, args: dict[str, Any]) -> dict[str, 
             # node must not discard every valid answer or force the model to
             # resend the remaining queries.
             rows.append({"query": query, "ok": False, "error": str(error)})
+            spatial_selection_complete = False
             continue
         if circuit_path is None:
             circuit_path = result.get("circuit_path")
@@ -1174,6 +1514,22 @@ def circuit_query_many(runtime: ToolRuntime, args: dict[str, Any]) -> dict[str, 
                 compact["missing_fields"] = missing
             selected_components.append(compact)
 
+        if include_spatial:
+            match_count = pagination.get(
+                "total_matches", pagination.get("match_count", len(component_ids)))
+            if (type(match_count) is not int or len(component_ids) != match_count or
+                    len(selected_components) != len(component_ids) or pagination.get("has_more")):
+                spatial_selection_complete = False
+            selected_by_id = {str(component.get("id") or ""): component
+                              for component in netlist.get("components", [])
+                              if isinstance(component, dict)}
+            for component_id in component_ids:
+                selected = selected_by_id.get(component_id)
+                if not isinstance(selected, dict):
+                    spatial_selection_complete = False
+                    continue
+                spatial_components[component_id] = copy.deepcopy(selected)
+
         # An exact node selector itself asks which components touch that node,
         # so retain the node identity/count.  Its complete connection records
         # are still field-controlled by pins/all.
@@ -1181,7 +1537,8 @@ def circuit_query_many(runtime: ToolRuntime, args: dict[str, Any]) -> dict[str, 
         for node in netlist.get("nodes", []):
             if str(node.get("id", "")).casefold() != query.casefold():
                 continue
-            node_fields = ("id", "total_connections", "connections", "connections_truncated") \
+            node_fields = ("id", "total_connections", "connections", "external_connections",
+                           "connections_truncated") \
                 if include_all or "pins" in selected_fields else ("id", "total_connections")
             exact_nodes.append({key: copy.deepcopy(node[key]) for key in node_fields if key in node})
         row = {
@@ -1213,6 +1570,12 @@ def circuit_query_many(runtime: ToolRuntime, args: dict[str, Any]) -> dict[str, 
                   "appears only when named in fields, or when all=true. missing_fields means the exact requested "
                   "field is absent on that component. Repeated queries are allowed."),
     }
+    output["query_manifest"] = _query_many_manifest(
+        rows, selected_fields, include_all=include_all)
+    if include_spatial:
+        output["spatial_order"] = _selection_spatial_order(
+            list(spatial_components.values()),
+            covers_all_query_matches=spatial_selection_complete)
     if circuit_path:
         output["circuit_path"] = circuit_path
     if state_path:
@@ -1311,6 +1674,7 @@ def _spec_from_sav(runtime: ToolRuntime, path: Path) -> dict[str, Any]:
             source: dict[str, Any] = {
                 "model_id": el["type"], "parent_identifier": el["id"],
                 "source_ref": el.get("ref"),
+                "primitive_pin_mapping": list(order),
                 "raw_properties": copy.deepcopy(el.get("properties", {})),
                 "raw_statistics": copy.deepcopy(el.get("statistics", {})),
                 "assumptions": [], "numerical_equivalence_to_original": False,
@@ -1346,6 +1710,7 @@ def _spec_from_sav(runtime: ToolRuntime, path: Path) -> dict[str, Any]:
                                    "position": el["position"], "rotation": el["rotation"],
                                    "pl_source": {**copy.deepcopy(source),
                                        "parent_identifier": el["id"], "is_helper": True,
+                                       "primitive_pin_mapping": [0, 1],
                                        "decomposition_role": "complementary_output_not_gate"}})
             continue
         mapped_type = {"Eight Bit Display": "8bit Display", "Eight Bit Input": "8bit Input"}.get(el["type"], el["type"])
@@ -1384,6 +1749,7 @@ def _spec_from_sav(runtime: ToolRuntime, path: Path) -> dict[str, Any]:
                            "pl_source": {"model_id": el["type"],
                                "parent_identifier": el["id"],
                                "source_ref": el.get("ref"),
+                               "primitive_pin_mapping": [p["pin"] for p in sorted(el["pins"], key=lambda p: p["pin"])],
                                "raw_properties": copy.deepcopy(el.get("properties", {})),
                                "raw_statistics": copy.deepcopy(el.get("statistics", {})),
                                "assumptions": fallback_assumptions,
@@ -1578,7 +1944,12 @@ def _expand_stimulus_table(spec: dict[str, Any], table: Any) -> list[dict[str, A
     if not isinstance(inputs, list) or not inputs:
         raise ToolError("stimulus_table.inputs must list at least one exact digital_input component ID")
     if any(not c["type"].startswith("digital_") for c in spec["components"]):
-        raise ToolError("stimulus_table currently requires a digital-only circuit, like legacy stimulus")
+        raise ToolError(
+            "MIXED_REQUIRES_TR_INTERACTIONS: stimulus_table is a post-analysis digital-only sequence. "
+            "For analysis=tr on a mixed circuit, put the exact digital_input control IDs and physical "
+            "switch/button/source IDs together in tr_interactions [{time_s,set:{...}}]. Do not retry "
+            "stimulus or stimulus_table on this unchanged mixed circuit."
+        )
     known = {c["id"]: c for c in spec["components"]}
     seen = set()
     for column, cid in enumerate(inputs):
@@ -1620,6 +1991,124 @@ def _expand_stimulus_table(spec: dict[str, Any], table: Any) -> list[dict[str, A
               "then confirm a candidate clock by exact node query (for example circuit_inspect(query=\"N24\")) instead of position or listing order."
         )
     return expanded
+
+
+def circuit_diagnose(runtime: ToolRuntime, args: dict[str, Any]) -> dict[str, Any]:
+    """Bounded deterministic preflight/dependency slice of an exact native revision."""
+    from ..circuit_diagnostics import circuit_diagnostics
+    mode = args.get("mode", "preflight")
+    targets = args.get("targets", [])
+    if mode not in ("preflight", "slice", "diagnose", "run_contract"):
+        raise ToolError("mode must be preflight, slice, diagnose or run_contract")
+    if (not isinstance(targets, list) or len(targets) > 32 or
+            any(not isinstance(item, str) or not 0 < len(item) <= 128 for item in targets)):
+        raise ToolError("targets must contain at most 32 exact component IDs/source refs/node names")
+    if mode == "slice" and not targets:
+        raise ToolError("slice requires targets")
+    contract = args.get("contract")
+    contract_binding = {}
+    if mode == "run_contract" and isinstance(contract, dict):
+        try:
+            contract_binding["contract_sha256"] = hashlib.sha256(json.dumps(
+                contract, sort_keys=True, separators=(",", ":"),
+                allow_nan=False).encode()).hexdigest()
+        except (TypeError, ValueError):
+            pass
+        if isinstance(contract.get("expected_source"), str):
+            contract_binding["expected_source"] = contract["expected_source"]
+    bounds = {}
+    for key, default, low, high in (("offset", 0, 0, 1000000), ("limit", 8, 1, 16), ("depth", 8, 1, 32)):
+        value = args.get(key, default)
+        if type(value) is not int or not low <= value <= high:
+            raise ToolError(f"{key} must be an integer in [{low}, {high}]")
+        bounds[key] = value
+    try:
+        source, original = _input(runtime, str(args.get("path") or ""))
+        spec = _load_spec(runtime, str(source))
+    except (ToolError, ValueError, KeyError, TypeError) as error:
+        if mode == 'run_contract':
+            return {'verdict': 'INCONCLUSIVE', 'failure_class': 'replay_source_unavailable',
+                    'execution': {'started': False, 'error': str(error)[:512]},
+                    **contract_binding}
+        raise
+    native_spec_sha256 = hashlib.sha256(json.dumps(
+        spec, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+    replay_source_sha256 = (hashlib.sha256(source.read_bytes()).hexdigest()
+                            if source.is_file() else None)
+    measurements = original.get("measurements") if original.get("schema") == "aurex.pe-state.v1" else None
+    if mode == "run_contract":
+        from ..circuit_diagnostics import (normalize_run_contract,
+            evaluate_run_contract, run_contract_targets)
+        try:
+            table = normalize_run_contract(spec, contract)
+        except ValueError as error:
+            raise ToolError(str(error)) from error
+        contract_targets = run_contract_targets(contract)
+        preflight = circuit_diagnostics(
+            spec, targets=contract_targets,
+            depth=max(8, len(spec.get('components', []))),
+            max_characters=5200)
+        # Never simulate a cropped slice: analog feedback/load/supply and all
+        # sequential state remain in the exact complete native revision.
+        if preflight.get('blocking_finding_counts'):
+            return {'verdict': 'INCONCLUSIVE', 'failure_class': 'invalid_netlist_or_drive_contract',
+                    'execution': {'started': False}, 'preflight': preflight,
+                    'coverage': {'assertions': len(contract['expected']), 'evaluated': 0},
+                    'native_spec_sha256': native_spec_sha256,
+                    **({'replay_source_sha256': replay_source_sha256}
+                       if replay_source_sha256 else {}), **contract_binding}
+        from ..trace_archive import read_series, compact_snapshot
+        if table is not None:
+            spec['stimulus'] = _expand_stimulus_table(spec, table)
+        # Every contract executes the complete saved native design afresh.
+        # Editable snapshot measurements/settle flags are never proof of PASS.
+        replay_source = str(source)
+        try:
+            measurements = pe_simulate(runtime, {'spec': spec, 'return_state': True})
+        except ToolError as error:
+            message = str(error)
+            category = ('digital_not_settled' if 'DIGITAL_NOT_SETTLED' in message else
+                        'invalid_netlist_or_drive_contract' if 'DIGITAL_MULTIPLE_DRIVERS' in message else
+                        'numerical_nonconvergence' if any(word in message.lower() for word in ('singular', 'convergence', 'converge')) else
+                        'execution_failed')
+            return {'verdict': 'INCONCLUSIVE', 'failure_class': category,
+                    'execution': {'completed': False, 'error': message[:1800]},
+                    'coverage': {'assertions': len(contract['expected']), 'evaluated': 0},
+                    'native_spec_sha256': native_spec_sha256,
+                    **({'replay_source_sha256': replay_source_sha256}
+                       if replay_source_sha256 else {}), **contract_binding}
+        snapshot = measurements.pop('state')
+        snapshot['run_contract'] = copy.deepcopy(contract)
+        snapshot['scene'] = _render_spec(spec,
+            {row['id']: row for row in measurements.get('components', [])},
+            measurements.get('interaction_states'))[0]
+        folder = _artifact_dir(runtime)
+        source = folder / 'contract.pe-state.json'
+        _write(source, compact_snapshot(source, snapshot))
+        transient = measurements.get('transient', {})
+        points = read_series(source, transient, 'samples') or []
+        stimulus = read_series(source, measurements, 'stimulus_results') or []
+        result = evaluate_run_contract(spec, contract, measurements, points=points, stimulus=stimulus)
+        result['state_path'] = str(source)
+        result['execution']['replayed_complete_spec'] = True
+        result['execution']['replay_source'] = replay_source
+        result['result_state_sha256'] = hashlib.sha256(source.read_bytes()).hexdigest()
+        result['native_spec_sha256'] = native_spec_sha256
+        if replay_source_sha256:
+            result['replay_source_sha256'] = replay_source_sha256
+        result['assertions'] = {'total': len(result['assertions']), 'offset': bounds['offset'],
+                               'rows': result['assertions'][bounds['offset']:bounds['offset'] + bounds['limit']]}
+        result['assertions']['shown'] = len(result['assertions']['rows'])
+        result['assertions']['has_more'] = bounds['offset'] + result['assertions']['shown'] < result['assertions']['total']
+        result['assertions']['next_offset'] = (bounds['offset'] + result['assertions']['shown']
+                                             if result['assertions']['has_more'] else None)
+        while len(json.dumps(result, ensure_ascii=False, separators=(',', ':'))) > 7000 and result['assertions']['rows']:
+            result['assertions']['rows'].pop()
+            result['assertions']['shown'] -= 1
+            result['assertions']['projection_omitted'] = result['assertions'].get('projection_omitted', 0) + 1
+            result['assertions']['next_offset'] = bounds['offset'] + result['assertions']['shown']
+        return result
+    return circuit_diagnostics(spec, mode=mode, targets=targets, measurements=measurements, **bounds)
 
 
 def circuit_analyze(runtime: ToolRuntime, args: dict[str, Any]) -> dict[str, Any]:
@@ -1789,6 +2278,9 @@ def circuit_analyze(runtime: ToolRuntime, args: dict[str, Any]) -> dict[str, Any
     return output
 
 
+_STIMULUS_READER_MAX_COMPONENTS = 24
+
+
 def circuit_read_stimulus(runtime: ToolRuntime, args: dict[str, Any]) -> dict[str, Any]:
     source, snapshot = _input(runtime, str(args.get("path") or ""))
     if snapshot.get("schema") != "aurex.pe-state.v1":
@@ -1798,10 +2290,16 @@ def circuit_read_stimulus(runtime: ToolRuntime, args: dict[str, Any]) -> dict[st
     if not isinstance(rows, list) or not rows:
         raise ToolError("This state has no recorded digital stimulus; request stimulus vectors during circuit_analyze")
     catalog = {c["id"]: c for c in snapshot["spec"]["components"]}
+    # Keep the historical no-argument page small.  The wider bound is for an
+    # explicit truth-table selection, where splitting related inputs/outputs
+    # across calls creates a needless evidence-merge hazard.
     selected = args.get("component_ids", list(catalog)[:8])
-    if (not isinstance(selected, list) or not 1 <= len(selected) <= 8 or
+    if (not isinstance(selected, list) or not 1 <= len(selected) <= _STIMULUS_READER_MAX_COMPONENTS or
             any(not isinstance(cid, str) or cid not in catalog for cid in selected) or len(set(selected)) != len(selected)):
-        raise ToolError("component_ids must select 1..8 unique IDs from the state; discover IDs with circuit_inspect")
+        raise ToolError(
+            f"component_ids must select 1..{_STIMULUS_READER_MAX_COMPONENTS} unique IDs from the state; "
+            "discover IDs with circuit_inspect"
+        )
     offset, limit = args.get("offset", 0), args.get("limit", 8)
     if type(offset) is not int or offset < 0 or type(limit) is not int or not 1 <= limit <= 16:
         raise ToolError("Stimulus offset must be nonnegative and limit must be 1..16")
@@ -1810,15 +2308,93 @@ def circuit_read_stimulus(runtime: ToolRuntime, args: dict[str, Any]) -> dict[st
         # Zero is a real logic value. Missing samples remain missing, not zero.
         values = {cid: row["digital"][cid] for cid in selected if cid in row["digital"]}
         changes = {cid: row.get("inputs", {})[cid] for cid in selected if cid in row.get("inputs", {})}
-        steps.append({"step": row["step"], "digital": values, "input_changes": changes,
-                      "omitted_input_changes": len(row.get("inputs", {})) - len(changes)})
-    return {"state_path": str(source), "recorded_not_resimulated": True,
-            "encoding": {"0": "L", "1": "H", "2": "X", "3": "Z"},
-            "components": [{"id": cid, "type": catalog[cid]["type"], "nodes": catalog[cid]["nodes"],
-                            "pin_labels": COMPONENTS[catalog[cid]["type"]]["pin_labels"]} for cid in selected],
+        step = {"step": row["step"], "digital": values, "input_changes": changes,
+                "omitted_input_changes": len(row.get("inputs", {})) - len(changes)}
+        # A sampled value is not necessarily a settled value.  Preserve the
+        # solver's per-frame propagation result so callers cannot mistake an
+        # attempted but unfinished digital tick for functional evidence.
+        step["digital_settled"] = (row["digital_settled"]
+                                    if type(row.get("digital_settled")) is bool else None)
+        steps.append(step)
+    components = []
+    for column, cid in enumerate(selected):
+        component = catalog[cid]
+        source_ref = ((component.get("pl_source") or {}).get("source_ref")
+                      if isinstance(component.get("pl_source"), dict) else None)
+        descriptor = {"column": column, "id": cid, "type": component["type"],
+                      "nodes": component["nodes"],
+                      "pin_labels": COMPONENTS[component["type"]]["pin_labels"]}
+        if isinstance(source_ref, str) and source_ref:
+            descriptor["source_ref"] = source_ref
+        components.append(descriptor)
+    encoding = {"0": "L", "1": "H", "2": "X", "3": "Z"}
+    logic_summary = None
+    if (components and all(component["type"] in {"digital_input", "digital_output"}
+                           and len(component["nodes"]) == 1 for component in components)):
+        inputs = [component for component in components if component["type"] == "digital_input"]
+        outputs = [component for component in components if component["type"] == "digital_output"]
+
+        def column(component: dict[str, Any]) -> dict[str, Any]:
+            result = {"id": component["id"]}
+            if "source_ref" in component:
+                result["source_ref"] = component["source_ref"]
+            return result
+
+        summary_rows = []
+        for step in steps:
+            digital = step["digital"]
+            missing = [component["id"] for component in components
+                       if component["id"] not in digital or not isinstance(digital[component["id"]], list)
+                       or len(digital[component["id"]]) != 1
+                       or type(digital[component["id"]][0]) is not int]
+
+            def state(component: dict[str, Any]) -> int | None:
+                values = digital.get(component["id"])
+                return values[0] if isinstance(values, list) and len(values) == 1 and type(values[0]) is int else None
+
+            unknown = []
+            for component in components:
+                value = state(component)
+                if value in (2, 3):
+                    unknown.append({**column(component), "state": value})
+            summary_rows.append({
+                "step": step["step"],
+                "digital_settled": step.get("digital_settled"),
+                "input_vector": [state(component) for component in inputs],
+                "output_vector": [state(component) for component in outputs],
+                "high_outputs": [column(component) for component in outputs if state(component) == 1],
+                "unknown_or_high_impedance": unknown,
+                "missing_component_ids": missing,
+            })
+        settled_values = [step.get("digital_settled") for step in steps]
+        all_rows_settled = (False if any(value is False for value in settled_values) else
+                            True if settled_values and all(value is True for value in settled_values) else
+                            None)
+        settle_scope = ("Every returned row is explicitly marked digitally settled. "
+                        if all_rows_settled is True else
+                        "At least one returned row is explicitly not digitally settled; its values are not functional proof. "
+                        if all_rows_settled is False else
+                        "The stored artifact does not prove that every returned row digitally settled. ")
+        logic_summary = {
+            "scope": (settle_scope +
+                      "Vectors are samples after each stored propagation attempt and follow the listed columns exactly; "
+                      "their order is not inferred logical bit significance. Settled means propagation converged only; "
+                      "it does not prove absence of X/Z or functional correctness. None/missing is not L."),
+            "all_rows_settled": all_rows_settled,
+            "settlement_scope": "returned_rows_only",
+            "input_columns": [column(component) for component in inputs],
+            "output_columns": [column(component) for component in outputs],
+            "rows": summary_rows,
+        }
+    result = {"state_path": str(source), "recorded_not_resimulated": True,
+            "encoding": encoding,
+            "components": components,
             "steps": steps, "offset": offset, "total_steps": len(rows), "total_components": len(catalog),
             "has_more": offset + len(steps) < len(rows),
-            "note": "Digital arrays are in catalog pin order. Step is the actual stored stimulus index, not an inferred timestamp. Only selected components/input changes are shown; full samples remain in the immutable state."}
+            "note": "Components stay in the exact requested order; column is that zero-based selection position and source_ref, when present, is the original PLSAV locator. Digital arrays are in catalog pin order. Step is the actual stored stimulus index, not an inferred timestamp. Only selected components/input changes are shown; full samples remain in the immutable state."}
+    if logic_summary is not None:
+        result["logic_summary"] = logic_summary
+    return result
 
 
 def _trace_sample_index_guide(points, interactions):
@@ -2426,11 +3002,11 @@ _PATH = {"type": "string", "description": "Local .sav/.plsav/.circuit.json/.pe-s
 _WITH_IMAGE = {"type": "boolean", "default": False, "description": "Default false: return structured data and immutable artifacts without generating or attaching SVG/PNG. Set true for an explicit visual/spatial question, or once for a targeted view=schematic after data-only inspection proves a complex topology still has a concrete spatial/wiring ambiguity. Images are supplementary and do not change simulation or saved circuit state."}
 _DIGITAL_STATE = {"type": "integer", "enum": [0, 1, 2, 3]}
 _STIMULUS = {"type": "array", "maxItems": 128,
-    "description": "Digital-only representative input frames [{set:{exact_input_component_id:0|1|2|3}}]. Omitted inputs keep their current values; an empty frame holds all inputs. Native advances 10ns/frame on the same circuit instance within this call. For repeated UUIDs prefer stimulus_table. This is a per-call limit, not a task budget; additional requested samples can use separate batches, but separate calls initialize from the source spec, not implicit continuation of hidden sequential state.",
+    "description": "Digital-only representative logic frames [{set:{exact_input_component_id:0|1|2|3}}]. Omitted inputs keep their current values; an empty frame holds all inputs. Each frame applies inputs, executes exactly one digital tick/settle, and samples without advancing physical time. For repeated UUIDs prefer stimulus_table. This is a per-call limit, not a task budget; additional requested samples can use separate batches, but separate calls initialize from the source spec, not implicit continuation of hidden sequential state.",
     "items": {"type": "object", "additionalProperties": False,
               "properties": {"set": {"type": "object", "additionalProperties": _DIGITAL_STATE}}}}
 _STIMULUS_TABLE = {"type": "object", "additionalProperties": False, "required": ["inputs", "vectors"],
-    "description": "Compact alternative to stimulus: list only the exact discovered Logic Input IDs that this test needs to change, then one matching-width row per frame. You do not need to repeat all circuit inputs. For one/few changing pins, sparse stimulus [{set:{exact_input_id:0}}, {set:{exact_input_id:1}}, {set:{}}] is simpler. Never zero/reset unrelated program or control inputs just to fill a table. Columns follow the supplied inputs order, not guessed bit order; no clock/reset role is inferred. Values are strict integers 0=L,1=H,2=X,3=Z; omitted inputs retain their current values. Native timing remains 10ns/frame within the call. Mutually exclusive with explicit stimulus (including inline spec.stimulus). Use representative samples, not an unsolicited exhaustive sweep; the existing 128-frame per-call limit is unchanged. Separate batches initialize from the source spec, not implicit continuation of hidden sequential state.",
+    "description": "Compact alternative to stimulus: list only the exact discovered Logic Input IDs that this test needs to change, then one matching-width row per frame. You do not need to repeat all circuit inputs. For one/few changing pins, sparse stimulus [{set:{exact_input_id:0}}, {set:{exact_input_id:1}}, {set:{}}] is simpler. Never zero/reset unrelated program or control inputs just to fill a table. Columns follow the supplied inputs order, not guessed bit order; no clock/reset role is inferred. Values are strict integers 0=L,1=H,2=X,3=Z; omitted inputs retain their current values. Each row executes exactly one digital tick/settle and samples without advancing physical time. Mutually exclusive with explicit stimulus (including inline spec.stimulus). Use representative samples, not an unsolicited exhaustive sweep; the existing 128-frame per-call limit is unchanged. Separate batches initialize from the source spec, not implicit continuation of hidden sequential state.",
     "properties": {"inputs": {"type": "array", "minItems": 1, "maxItems": 15, "uniqueItems": True,
         "items": {"type": "string", "minLength": 1, "maxLength": 128},
         "description": "Exact digital_input component IDs from circuit_inspect(interface_only=true); not display labels, output IDs or internal gates. For more than 15 explicitly changed inputs use sparse stimulus frames instead of repeating a wide row on every frame."},
@@ -2446,9 +3022,15 @@ _TR_INTERACTIONS = {"type": "array", "maxItems": 128,
 
 def register_circuit_tools(registry: ToolRegistry) -> None:
     definitions = [
+        ("circuit_diagnose", "Deterministic native evidence. A targetless preflight is whole-design only and does not prove relevance to the user's outputs. For slice, targets must be the requested Logic Output/meter refs or native IDs—not a reported fault node—so the backward observation cone establishes relevance. A target-slice blocker returns INCONCLUSIVE with execution.started=false; do not retry circuit_analyze on the unchanged circuit. run_contract performs the same target-scoped preflight before rerunning the complete saved native spec and checks only independent expected values. Logic Output/8bit Display probe pins are valid observations. Saved snapshot measurements never establish PASS; cropped topology is never simulated. Bounded paged output.",
+         {"path": _PATH, "mode": {"enum": ["preflight", "slice", "diagnose", "run_contract"], "default": "preflight"},
+          "targets": {"type": "array", "items": {"type": "string", "maxLength": 128}, "maxItems": 32},
+          "offset": {"type": "integer", "minimum": 0}, "limit": {"type": "integer", "minimum": 1, "maximum": 16, "default": 8},
+          "depth": {"type": "integer", "minimum": 1, "maximum": 32, "default": 8},
+          "contract": {"type": "object", "description": "run_contract only: expected_source (independent spec/reference), expected (1..32 {component,pin,equals:0|1,frame:0-based} or {component,pin,equals,time_s} or analog {node,equals,tolerance,time_s}). Optional explicit stimulus_table {inputs,vectors}; OR frame_count 1..128 plus clocks [{input,period_frames,high_frames,phase_frames}] and buses [{inputs_msb_first,values}]. Frames are logical stimulus steps, not physical time; time_s refers only to TR samples. Native and state paths always replay the full saved spec; unavailable replay source gives INCONCLUSIVE."}}, ["path"], circuit_diagnose),
         ("circuit_catalog", "List supported real Phy-Engine electrical models, exact pin order, SI parameters, defaults and .sav export support.", {}, [], circuit_catalog),
-        ("circuit_read_stimulus", "Read actual recorded digital stimulus results from an immutable native state, without rerunning. Select up to 8 component IDs and at most 16 steps. Use circuit_inspect to discover IDs; arrays are real L/H/X/Z samples in native pin order.",
-         {"path": _PATH, "component_ids": {"type": "array", "items": {"type": "string"}, "minItems": 1, "maxItems": 8, "uniqueItems": True},
+        ("circuit_read_stimulus", "Read actual recorded digital stimulus results from an immutable native state, without rerunning. Select up to 24 component IDs and at most 16 steps, so the inputs and relevant outputs of an ordinary truth-table sample should be read together instead of split across calls. Use circuit_inspect to discover IDs; returned components preserve the exact requested order and include original PLSAV source_ref locators when available; arrays are real L/H/X/Z samples in native pin order.",
+         {"path": _PATH, "component_ids": {"type": "array", "items": {"type": "string"}, "minItems": 1, "maxItems": _STIMULUS_READER_MAX_COMPONENTS, "uniqueItems": True},
           "offset": {"type": "integer", "minimum": 0}, "limit": {"type": "integer", "minimum": 1, "maximum": 16}}, ["path"], circuit_read_stimulus),
         ("circuit_read_trace", "Read or summarize actual timestamped samples from a saved native TR state, without rerun or interpolation. Prefer mode=summary for stability time, first/last/largest change, repeated-change/direction-reversal evidence (not proof of periodic oscillation), relay/switch model-state transitions, op-amp pin ranges, and a whole-trace answer in one call; supply up to 8 analog nodes OR component_ids and explicit thresholds. Use mode=samples only for a few exact boundary frames via sample_indices (up to 16); never page an entire trace to calculate a summary manually. Historical records retain original values. For the separate digital stimulus sequence use circuit_read_stimulus.",
          {"path": _PATH, "nodes": {"type": "array", "items": {"type": "string"}, "minItems": 1, "maxItems": 8, "uniqueItems": True},
@@ -2482,7 +3064,7 @@ def register_circuit_tools(registry: ToolRegistry) -> None:
           "offset": {"type": "integer", "minimum": 0}, "limit": {"type": "integer", "minimum": 1, "maximum": 64, "description": "interface_only: 1..64 (default64). Otherwise 1..24 (default8); 4..8 recommended for readable diagrams and up to 12 for a targeted schematic."}, "view": {"enum": ["auto", "overview", "region", "spatial", "topology", "schematic"]}, "projection": {"enum": ["isometric", "top"]},
           "focus_ids": {"type": "array", "items": {"type": "string"}}, "focus_id": {"type": "string"},
           "query": {"type": "string", "description": "Exact N<number> selects all components connected to that node. On an original PLSAV, exact C<number> is its displayed ref; on imported native/state paths, an available original source_ref C<number> takes precedence over the revision-local display ref and resolves stable native IDs. Otherwise use literal component text search. Never read_context/find a full netlist artifact."}, "camera": _CAMERA}, ["path"], circuit_inspect),
-        ("circuit_query_many", "Read several exact circuit targets in one read-only call with strict field selection. A call without fields returns identity and match evidence only. Request only the values needed for the next decision: pins; native_type; spatial; one exact saved property such as properties.高电平 or properties.低电平; one exact recorded measurement such as measurements.digital; or one exact native edit parameter such as edit.r. Only all=true returns complete matched records. fields and all are mutually exclusive. Each query independently reports ok/error/missing_fields, and normal repeated reads remain allowed. No images or simulation.",
+        ("circuit_query_many", "Read several exact circuit targets in one read-only call with strict field selection. A call without fields returns identity and match evidence only. Request only the values needed for the next decision: pins; native_type; spatial; one exact saved property such as properties.高电平 or properties.低电平; one exact recorded measurement; or one exact native edit parameter such as edit.r. For analog solved state use measurements.voltage, measurements.voltage_across_0_to_1.real, or measurements.derived_current_0_to_1.real. measurements.digital is only the 0/1/X/Z pin-state array and is not analog voltage/current. When spatial is requested for multiple exact matches, spatial_order returns their collection-level saved-view order while explicitly leaving logical bit significance undeclared. Only all=true returns complete matched records. fields and all are mutually exclusive. Each query independently reports ok/error/missing_fields, and normal repeated reads remain allowed. No images or simulation.",
          {"path": _PATH,
           "queries": {"type": "array", "minItems": 1, "maxItems": 24,
                       "items": {"type": "string", "minLength": 1, "maxLength": 128},

@@ -97,6 +97,19 @@ namespace phy_engine::model
         // Round-robin emitter for analog drives (because the digital API returns one drive per call).
         ::std::size_t analog_emit_cursor{};
 
+        constexpr int digital_pin_role(::std::size_t index) const noexcept
+        {
+            if(top_instance.mod==nullptr || index>=top_instance.mod->ports.size()) return -1;
+            auto const dir=top_instance.mod->ports.index_unchecked(index).dir;
+            using direction=::phy_engine::verilog::digital::port_dir;
+            if(dir==direction::input) return 0;
+            // An inout may emit a value. Treat it conservatively as a driver
+            // for contention preflight; shared outputs require explicit
+            // resolution rather than ignoring a bidirectional endpoint.
+            if(dir==direction::output || dir==direction::inout) return 1;
+            return -1;
+        }
+
         VERILOG_MODULE() noexcept = default;
         VERILOG_MODULE(VERILOG_MODULE const& other) noexcept
         {

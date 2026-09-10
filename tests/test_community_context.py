@@ -32,6 +32,25 @@ class CommunityContextTests(unittest.TestCase):
         self.assertEqual(out["trust"], "untrusted_external_content")
         self.assertNotIn("DO_NOT_LEAK", json.dumps(out))
 
+    def test_prior_bot_reply_is_marked_as_claim_to_recheck_not_author_spec(self):
+        bot = "698726c4fc064466378176b8"
+        comments = [{"ID": "prior", "UserID": bot, "Timestamp": 1700000000000,
+                     "Content": "此前我声称C1、C2、C3依次为高到低位"}]
+        trigger = {"ID": "correction", "UserID": "requester", "Timestamp": 1700000001000,
+                   "Content": "@aurex 请按输入位置纠正"}
+        with mock.patch("aurex.community_context.plar.get_summary",
+                        return_value={"Data": {"Subject": "3-8译码器"}}):
+            out = build_mention_context(
+                object(), target_type="Experiment", target_id="experiment",
+                comment=trigger, comments=comments, bot_user_id=bot,
+                download_images=False)
+        prior = next(item for item in out["comments"] if item["id"] == "prior")
+        self.assertEqual(prior["speaker_role"], "assistant_history")
+        self.assertEqual(prior["evidence_status"],
+                         "prior_claim_to_recheck_not_author_spec")
+        current = next(item for item in out["comments"] if item["id"] == "correction")
+        self.assertEqual(current["speaker_role"], "external_user")
+
     def test_timestamp_pagination_and_long_original_survive(self):
         first = [{"ID": str(i), "Timestamp": 1700000000000 + i, "Content": str(i)} for i in range(20)]
         last = [{"ID": "old", "Timestamp": 1699999999000, "Content": "older"}]

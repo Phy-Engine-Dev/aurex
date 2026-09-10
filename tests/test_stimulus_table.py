@@ -44,6 +44,7 @@ class StimulusTableTests(unittest.TestCase):
         registry = ToolRegistry()
         register_circuit_tools(registry)
         self.schema = registry.get('circuit_analyze').parameters
+        self.reader_schema = registry.get('circuit_read_stimulus').parameters
 
     def captured(self, args):
         saved = []
@@ -132,12 +133,101 @@ class StimulusTableTests(unittest.TestCase):
         props = self.schema['properties']
         self.assertEqual(props['stimulus']['items']['properties']['set']['additionalProperties'],
                          {'type': 'integer', 'enum': [0, 1, 2, 3]})
+        self.assertIn('one digital tick/settle', props['stimulus']['description'])
+        self.assertIn('without advancing physical time', props['stimulus']['description'])
+        self.assertIn('one digital tick/settle', props['stimulus_table']['description'])
+        self.assertIn('without advancing physical time', props['stimulus_table']['description'])
+        self.assertNotIn('10ns/frame', props['stimulus']['description'])
+        self.assertNotIn('10ns/frame', props['stimulus_table']['description'])
         table = {'inputs': [A, B], 'vectors': [[0, 1], [2, 3]]}
         jsonschema.validate({'stimulus_table': table}, self.schema)
         for invalid in ({'stimulus': [{'set': {A: True}}]}, {'stimulus': [{'set': {A: '1'}}]},
                         {'stimulus': [{A: 1}]}, {'stimulus': [], 'stimulus_table': table}):
             with self.subTest(invalid=invalid), self.assertRaises(jsonschema.ValidationError):
                 jsonschema.validate(invalid, self.schema)
+
+    def test_stimulus_reader_can_keep_an_ordinary_truth_table_in_one_call(self):
+        component_ids = [f'component-{index}' for index in range(11)]
+        jsonschema.validate({'path': '/tmp/state.pe-state.json', 'component_ids': component_ids,
+                             'offset': 0, 'limit': 8}, self.reader_schema)
+        self.assertEqual(self.reader_schema['properties']['component_ids']['maxItems'], 24)
+        with self.assertRaises(jsonschema.ValidationError):
+            jsonschema.validate({'path': '/tmp/state.pe-state.json',
+                                 'component_ids': [f'component-{index}' for index in range(25)]},
+                                self.reader_schema)
+
+    def test_reader_keeps_default_small_and_emits_exact_single_call_logic_summary(self):
+        input_refs = ('C1', 'C3', 'C2')
+        output_refs = ('C9', 'C10', 'C13', 'C16', 'C19', 'C24', 'C25', 'C26')
+        components = [
+            {'id': 'input-' + ref, 'type': 'digital_input', 'nodes': ['n-' + ref],
+             'params': {'state': 0}, 'pl_source': {'source_ref': ref}}
+            for ref in input_refs
+        ] + [
+            {'id': 'output-' + ref, 'type': 'digital_output', 'nodes': ['n-' + ref],
+             'pl_source': {'source_ref': ref}}
+            for ref in output_refs
+        ]
+        expected_outputs = ('C9', 'C10', 'C13', 'C16', 'C19', 'C24', 'C25', 'C26')
+        rows = []
+        for step, output_ref in enumerate(expected_outputs):
+            digital = {component['id']: [0] for component in components}
+            for bit, ref in enumerate(input_refs):
+                digital['input-' + ref] = [(step >> (2 - bit)) & 1]
+            digital['output-' + output_ref] = [1]
+            row = {'step': step, 'digital': digital,
+                   'inputs': {'input-' + ref: digital['input-' + ref][0] for ref in input_refs}}
+            if step != 1:  # A missing marker is unknown, not an implicit failure.
+                row['digital_settled'] = step != 2
+            rows.append(row)
+        # Missing is distinct from L, while X and Z retain their exact states.
+        exceptional = {component['id']: [0] for component in components}
+        exceptional['input-C1'] = [2]
+        exceptional['input-C3'] = [3]
+        exceptional['output-C9'] = [2]
+        exceptional['output-C10'] = [3]
+        exceptional.pop('input-C2')
+        exceptional.pop('output-C13')
+        rows.append({'step': 8, 'digital': exceptional, 'inputs': {}, 'digital_settled': True})
+        state = self.folder / 'truth.pe-state.json'
+        state.write_text(json.dumps({'schema': 'aurex.pe-state.v1', 'spec': {'components': components},
+                                     'scene': {}, 'measurements': {'stimulus_results': rows}}))
+
+        default = circuit_read_stimulus(self.runtime, {'path': str(state), 'limit': 1})
+        self.assertEqual(len(default['components']), 8)
+        self.assertTrue(default['logic_summary']['all_rows_settled'])
+        self.assertEqual(default['steps'][0]['digital_settled'], True)
+        first_two = circuit_read_stimulus(self.runtime, {'path': str(state), 'limit': 2})
+        self.assertIsNone(first_two['logic_summary']['all_rows_settled'])
+        self.assertEqual([row['digital_settled'] for row in first_two['steps']], [True, None])
+        selected = [component['id'] for component in components]
+        result = circuit_read_stimulus(self.runtime, {'path': str(state),
+                                                       'component_ids': selected, 'limit': 9})
+        self.assertEqual([component['id'] for component in result['components']], selected)
+        self.assertEqual([component['column'] for component in result['components']], list(range(11)))
+        self.assertEqual([component['source_ref'] for component in result['components']],
+                         list(input_refs + output_refs))
+        summary = result['logic_summary']
+        self.assertFalse(summary['all_rows_settled'])
+        self.assertEqual(summary['settlement_scope'], 'returned_rows_only')
+        self.assertEqual([row['digital_settled'] for row in summary['rows'][:3]],
+                         [True, None, False])
+        self.assertNotIn('after each stored stimulus step settled', summary['scope'])
+        self.assertEqual([column['source_ref'] for column in summary['input_columns']], list(input_refs))
+        self.assertEqual([column['source_ref'] for column in summary['output_columns']], list(output_refs))
+        self.assertEqual(summary['rows'][5]['input_vector'], [1, 0, 1])
+        self.assertEqual(summary['rows'][5]['output_vector'], [0, 0, 0, 0, 0, 1, 0, 0])
+        self.assertEqual(summary['rows'][5]['high_outputs'],
+                         [{'id': 'output-C24', 'source_ref': 'C24'}])
+        self.assertEqual(summary['rows'][6]['input_vector'], [1, 1, 0])
+        self.assertEqual(summary['rows'][6]['high_outputs'],
+                         [{'id': 'output-C25', 'source_ref': 'C25'}])
+        last = summary['rows'][8]
+        self.assertEqual(last['input_vector'], [2, 3, None])
+        self.assertEqual(last['output_vector'][:4], [2, 3, None, 0])
+        self.assertEqual({item['state'] for item in last['unknown_or_high_impedance']}, {2, 3})
+        self.assertEqual(set(last['missing_component_ids']), {'input-C2', 'output-C13'})
+        self.assertEqual(result['steps'][5]['digital'], rows[5]['digital'])
 
     def test_mixed_circuit_keeps_existing_digital_only_constraint(self):
         spec = design()

@@ -4,6 +4,84 @@
 #include <cmath>
 #include <limits>
 #include <utility>
+#include <sstream>
+#include <cstring>
+#include <tuple>
+
+// The result is a bounded diagnostic snapshot. Node ordinals follow native
+// netlist insertion order; pin locations retain model vec/chunk positions so
+// bindings can recover exact source component IDs without exposing pointers.
+extern "C" std::size_t circuit_get_digital_settle_json(void* circuit_ptr, char* buffer, std::size_t capacity)
+{
+    if(!circuit_ptr) return 0;
+    auto& c=*static_cast<phy_engine::circult*>(circuit_ptr);
+    auto const& s=c.digital_settle;
+    std::unordered_map<phy_engine::model::model_base*,std::pair<std::size_t,std::size_t>> positions;
+    std::size_t block_index{};
+    for(auto& block:c.nl.models)
+    {
+        for(auto* m=block.begin;m!=block.curr;++m) positions.emplace(m,std::pair{block_index,static_cast<std::size_t>(m-block.begin)});
+        ++block_index;
+    }
+    std::ostringstream out;
+    out.precision(17);
+    auto const reason=s.settled?"SETTLED":s.reason==phy_engine::digital::settle_reason::multiple_drivers?"DIGITAL_MULTIPLE_DRIVERS":s.reason==phy_engine::digital::settle_reason::event_budget?"DIGITAL_NOT_SETTLED":"NOT_RUN";
+    out<<"{\"version\":1,\"settled\":"<<(s.settled?"true":"false")<<",\"reason\":\""<<reason<<"\",\"time_s\":"<<s.time_s<<",\"processed_events\":"<<s.processed_events<<",\"pending_count\":"<<s.pending_nodes<<",\"multiple_driver_count\":"<<s.multiple_driver_nodes<<",\"undriven_count\":"<<s.undriven_nodes;
+    auto node_json=[&](phy_engine::model::node_t* wanted, std::size_t events) {
+        std::size_t ordinal{};
+        bool found{};
+        for(auto const& block:c.nl.nodes) { for(auto* n=block.begin;n!=block.curr;++n) { if(n==wanted) {found=true;break;} ++ordinal; } if(found) break; }
+        out<<"{\"node_ordinal\":"<<ordinal<<",\"events\":"<<events<<",\"pin_count\":"<<wanted->pins.size()<<",\"pins\":[";
+        std::size_t emitted{}, emitted_loads{};
+        std::vector<phy_engine::model::pin*> ordered(wanted->pins.begin(),wanted->pins.end());
+        std::sort(ordered.begin(),ordered.end(),[&](auto* a,auto* b) {
+            auto key=[&](auto* p) {
+                auto view=p->model->ptr->generate_pin_view();
+                auto index=static_cast<std::size_t>(p-view.pins);
+                auto location=positions.at(p->model);
+                return std::tuple{p->model->ptr->get_digital_pin_role(index)==1?0:1,location.first,location.second,index};
+            };
+            return key(a)<key(b);
+        });
+        for(auto* pin:ordered)
+        {
+            if(emitted==4) break;
+            auto pv=pin->model->ptr->generate_pin_view();
+            auto role=pin->model->ptr->get_digital_pin_role(static_cast<std::size_t>(pin-pv.pins));
+            if(role!=1 && emitted_loads++==2) break;
+            auto const [vec,chunk]=positions.at(pin->model);
+            if(emitted++) out<<',';
+            auto index=static_cast<std::size_t>(pin-pv.pins);
+            // model_pos calls its in-block index vec_pos and block index
+            // chunk_pos (see netlist::get_model).
+            out<<"{\"model_vec\":"<<chunk<<",\"model_chunk\":"<<vec<<",\"pin\":"<<index<<",\"role\":"<<pin->model->ptr->get_digital_pin_role(index)<<'}';
+        }
+        out<<"],\"shown_pins\":"<<emitted<<",\"omitted_pins\":"<<(wanted->pins.size()-emitted)<<'}';
+    };
+    auto nodes_json=[&](char const* name,auto const& nodes) {
+        out<<",\""<<name<<"\":[";
+        bool comma{};
+        for(auto* node:nodes) { if(comma) out<<',';comma=true;node_json(node,0); }
+        out<<']';
+    };
+    out<<",\"undriven_clock_count\":"<<s.undriven_clock_nodes<<",\"attempted_ticks\":"<<c.digital_ticks_attempted<<",\"settled_ticks\":"<<c.digital_ticks_settled<<",\"tick_count_scope\":\"circuit_lifetime\"";
+    out<<",\"projection\":{";
+    auto coverage=[&](char const* name,std::size_t total,std::size_t shown,bool comma) {
+        if(comma) out<<',';
+        out<<'\"'<<name<<"\":{\"total\":"<<total<<",\"shown\":"<<shown<<",\"omitted\":"<<(total>shown?total-shown:0)<<'}';
+    };
+    coverage("pending",s.pending_nodes,s.pending.size(),false);
+    coverage("conflicts",s.multiple_driver_nodes,s.conflicts.size(),true);
+    coverage("undriven",s.undriven_nodes,s.undriven.size(),true);
+    out<<'}';
+    nodes_json("pending",s.pending);nodes_json("conflicts",s.conflicts);nodes_json("undriven",s.undriven);
+    out<<",\"hot\":[";
+    bool comma{};for(auto const& item:s.hot) {if(comma)out<<',';comma=true;node_json(item.node,item.events);}
+    out<<"]}";
+    auto text=out.str();
+    if(buffer && capacity>text.size()) std::memcpy(buffer,text.c_str(),text.size()+1);
+    return text.size()+1;
+}
 
 // Bounded observation ABI. Unlike the legacy real-only sampler, this preserves
 // AC phase and four-state digital values and never reads analog union storage
@@ -15,6 +93,8 @@ extern "C" int circuit_sample_complex(void* circuit_ptr, std::size_t* vec_pos,
 {
     if (!circuit_ptr || !vec_pos || !chunk_pos || !vr || !vi || !vo || !ir || !ii || !io || !digital) return 1;
     auto* circuit = static_cast<phy_engine::circult*>(circuit_ptr);
+    if(circuit->digital_ticks_attempted && !circuit->digital_settle.settled)
+        return circuit->digital_settle.reason==phy_engine::digital::settle_reason::multiple_drivers ? 11 : 10;
     auto& netlist = circuit->get_netlist();
     vo[0] = io[0] = 0;
     for (std::size_t c = 0; c < comp_size; ++c)
@@ -139,11 +219,15 @@ enum class mixed_tick_result : unsigned char
     invalid_drive,
     conflicting_drive,
     analog_solve_failed,
+    digital_not_settled,
+    digital_multiple_drivers,
 };
 
 static mixed_tick_result circuit_mixed_tick(phy_engine::circult& circuit)
 {
-    circuit.digital_clk();
+    auto const& settle=circuit.digital_clk();
+    if(!settle.settled) return settle.reason==phy_engine::digital::settle_reason::multiple_drivers
+        ? mixed_tick_result::digital_multiple_drivers : mixed_tick_result::digital_not_settled;
     // A single combinational settle can revisit one model and emit its old
     // then final voltage. Keep only that driver's final value. Without model
     // identity, this harmless transition was indistinguishable from two
@@ -191,6 +275,8 @@ static int mixed_tick_error_code(mixed_tick_result result) noexcept
         case mixed_tick_result::invalid_drive: return 5;
         case mixed_tick_result::conflicting_drive: return 6;
         case mixed_tick_result::analog_solve_failed: return 7;
+        case mixed_tick_result::digital_not_settled: return 10;
+        case mixed_tick_result::digital_multiple_drivers: return 11;
         default: return 0;
     }
 }
@@ -281,7 +367,15 @@ static int circuit_run_transient_trace_controlled_impl(void* circuit_ptr, double
         else
         {
             if(!circuit->solve()){circuit->tr_duration=prior;return 3;}
-            for(std::size_t tick=0;tick<digital_steps_per_tr_step;++tick) circuit->digital_clk();
+            for(std::size_t tick=0;tick<digital_steps_per_tr_step;++tick)
+            {
+                auto const& settle=circuit->digital_clk();
+                if(!settle.settled)
+                {
+                    circuit->tr_duration=prior;
+                    return settle.reason==phy_engine::digital::settle_reason::multiple_drivers ? 11 : 10;
+                }
+            }
         }
         if(!circuit_solution_finite(*circuit)){circuit->tr_duration=prior;return 3;}
         *actual_digital_steps+=digital_steps_per_tr_step;

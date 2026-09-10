@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ctypes
+import json
 import os
 from dataclasses import dataclass
 from typing import Any
@@ -54,6 +55,10 @@ class _Lib:
 
         self._dll.circuit_analyze.argtypes = [ctypes.c_void_p]
         self._dll.circuit_analyze.restype = ctypes.c_int
+
+        if hasattr(self._dll, "circuit_get_digital_settle_json"):
+            self._dll.circuit_get_digital_settle_json.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t]
+            self._dll.circuit_get_digital_settle_json.restype = ctypes.c_size_t
 
         if hasattr(self._dll, "circuit_run_mixed_dc"):
             self._dll.circuit_run_mixed_dc.argtypes = [ctypes.c_void_p, ctypes.c_uint32]
@@ -233,6 +238,7 @@ class _Circuit:
         if entry is None:
             raise PhyEngineError("Rebuild Phy-Engine: mixed-signal DC driver is unavailable")
         rc = int(entry(self.ptr, ctypes.c_uint32(analyze_type)))
+        self._raise_digital_failure(rc)
         if rc:
             raise PhyEngineError(self._mixed_error("Mixed-signal DC solve", rc))
 
@@ -264,6 +270,7 @@ class _Circuit:
                 self.ptr, step, stop, max_steps, ctypes.byref(actual), ctypes.byref(steps))
         if 5 <= rc <= 8:
             raise PhyEngineError(self._mixed_error("Transient mixed-signal coupling", rc))
+        self._raise_digital_failure(rc)
         if rc:
             raise PhyEngineError(f"Transient solve failed (rc={rc}, completed_steps={steps.value}, time_s={actual.value})")
         if configured is not None and digital_steps.value != steps.value * digital_steps_per_tr_step:
@@ -294,7 +301,13 @@ class _Circuit:
         configured_version = int(configured()) if configured is not None else 0
         verified = version == 1 and ((actual_total is None and per_step == 1) or
             (configured_version == 1 and actual_total == steps * per_step))
+        settle = self.digital_settle_status()
         return {"version": version, "configured_version": configured_version, "verified_per_step": verified,
+                "settle_verified": bool(settle and settle.get("settled")),
+                **({"settle": settle} if settle else {}),
+                "time_semantics": {"physical_time": "native_TR_step", "digital_ticks": "explicit_propagation_count_not_physical_delay",
+                    "sample_phase": "after_all_requested_ticks_settled", "sequential_sampling": "native_primitive_clock_edge_during_event_processing",
+                    "save_interval": "sample_every_completed_physical_steps"},
                 "policy": ('once_after_each_native_solve_before_sampling' if per_step == 1 else
                     'configured_after_each_native_solve_before_sampling') if verified else 'unreported_by_native_library',
                 "per_tr_step": per_step,
@@ -367,6 +380,7 @@ class _Circuit:
             raise PhyEngineError("Transient observation failed: " + str(errors[0])) from errors[0]
         if 5 <= rc <= 8:
             raise PhyEngineError(self._mixed_error("Transient mixed-signal coupling", rc))
+        self._raise_digital_failure(rc)
         if rc or count.value != len(samples):
             raise PhyEngineError(f"Transient trace failed (rc={rc}, completed_steps={steps.value}, time_s={actual.value})")
         if configured is not None and digital_steps.value != steps.value * digital_steps_per_tr_step:
@@ -429,6 +443,7 @@ class _Circuit:
             raise PhyEngineError("Transient observation failed: " + str(trace_errors[0])) from trace_errors[0]
         if 5 <= rc <= 8:
             raise PhyEngineError(self._mixed_error("Controlled transient mixed-signal coupling", rc))
+        self._raise_digital_failure(rc)
         if rc or count.value != len(samples):
             raise PhyEngineError(
                 f"Controlled transient failed (rc={rc}, completed_steps={steps.value}, "
@@ -450,8 +465,36 @@ class _Circuit:
 
     def digital_clk(self) -> None:
         rc = int(self.lib._dll.circuit_digital_clk(self.ptr))
+        self._raise_digital_failure(rc)
         if rc != 0:
             raise PhyEngineError(f"circuit_digital_clk failed (rc={rc})")
+
+    def digital_settle_status(self) -> dict[str, Any] | None:
+        entry = getattr(self.lib._dll, "circuit_get_digital_settle_json", None)
+        if entry is None:
+            return None
+        size = int(entry(self.ptr, None, 0))
+        if not 0 < size <= 65536:
+            raise PhyEngineError("Invalid native digital settle diagnostic size")
+        data = ctypes.create_string_buffer(size)
+        if int(entry(self.ptr, data, size)) != size:
+            raise PhyEngineError("Native digital settle diagnostic changed during read")
+        result = json.loads(data.value)
+        positions = {(int(self.vec_pos[i]), int(self.chunk_pos[i])): i for i in range(self.comp_size)}
+        for field in ("pending", "conflicts", "undriven", "hot"):
+            for node in result.get(field, []):
+                for pin in node.get("pins", []):
+                    index = positions.get((pin.pop("model_vec"), pin.pop("model_chunk")))
+                    if index is not None:
+                        pin["component_index"] = index
+        return result
+
+    def _raise_digital_failure(self, rc: int) -> None:
+        if rc not in (10, 11):
+            return
+        status = self.digital_settle_status() or {"reason": "DIGITAL_MULTIPLE_DRIVERS" if rc == 11 else "DIGITAL_NOT_SETTLED", "settled": False}
+        raise PhyEngineError(json.dumps({"execution_status": "failed", "digital_settle": status,
+            "waveform_valid": False}, ensure_ascii=False, separators=(",", ":")))
 
     def set_model_digital(self, idx: int, attribute_index: int, state: int) -> None:
         if idx < 0 or idx >= self.comp_size:
@@ -497,6 +540,7 @@ class _Circuit:
                 digital_ord,
             )
         )
+        self._raise_digital_failure(rc)
         if rc != 0:
             raise PhyEngineError(f"circuit_sample_u8 failed (rc={rc})")
 
@@ -519,6 +563,7 @@ class _Circuit:
         digital = (ctypes.c_uint8 * cap)()
         rc = self.lib._dll.circuit_sample_complex(self.ptr, self.vec_pos, self.chunk_pos,
             self.comp_size, cap, vr, vi, vo, ir, ii, io, digital)
+        self._raise_digital_failure(rc)
         if rc:
             raise PhyEngineError(f"circuit_sample_complex failed (rc={rc})")
         return {

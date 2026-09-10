@@ -185,8 +185,18 @@ class TokenProgressTests(unittest.TestCase):
             self.request(lines=[packet(malformed, token_ids=[1, 1], finish='tool_calls'), b'data: [DONE]'])
 
     def test_length_and_missing_done_preserve_existing_behavior(self):
-        reply, _ = self.request(lines=[packet(token_ids=[1, 2], finish='length'), b'data: [DONE]'])
+        partial = {'tool_calls': [{'index': 0, 'id': 'PRIVATE_CALL_ID',
+            'type': 'function', 'function': {
+                'name': 'circuit_query_many', 'arguments': '{"private":'}}]}
+        reply, _ = self.request(lines=[packet(partial, token_ids=[1, 2], finish='length'),
+                                       b'data: [DONE]'])
         self.assertEqual(reply.finish_reason, 'length')
+        self.assertEqual(reply.generation_progress['reason'], 'max_tokens')
+        self.assertEqual(reply.generation_progress['tool_name'], 'circuit_query_many')
+        self.assertEqual(reply.generation_progress['tool_argument_characters'],
+                         len('{"private":'))
+        self.assertNotIn('PRIVATE_CALL_ID', json.dumps(reply.generation_progress))
+        self.assertNotIn('private', json.dumps(reply.generation_progress).lower())
         with self.assertRaisesRegex(ModelError, 'without.*DONE'):
             self.request(lines=[packet(VALID_TOOL, token_ids=[1, 2], finish='tool_calls')])
 
@@ -226,6 +236,77 @@ class TokenProgressTests(unittest.TestCase):
         self.assertEqual(caught.exception.progress['reason'], 'same_token_run')
         self.assertEqual(caught.exception.reply.finish_reason, 'repetition_guard')
         self.assertEqual(caught.exception.reply.tool_calls, [])
+
+    def test_navigation_wall_timeout_closes_stream_and_reports_only_safe_partial_metadata(self):
+        client, calls, closed = self.client(), [], []
+        now = [100.0]
+        raw_arguments = '{"queries":[{"query":"PRIVATE_COMPONENT"}'
+        partial_call = {'tool_calls': [{'index': 0, 'id': 'PRIVATE_CALL_ID',
+            'type': 'function', 'function': {
+                'name': 'circuit_query_many', 'arguments': raw_arguments}}]}
+
+        def receive(payload, *, on_tick=None, **_):
+            calls.append(payload)
+            try:
+                yield packet(partial_call, token_ids=[1, 2])
+                now[0] = 161.0
+                on_tick()
+                self.fail('The generation deadline must close the stream')
+            finally:
+                closed.append(True)
+
+        with patch('aurex.vllm_client.time.monotonic', side_effect=lambda: now[0]), \
+                patch.object(client, '_stream_lines', side_effect=receive):
+            with self.assertRaises(DegenerateGeneration) as caught:
+                client.chat([{'role': 'user', 'content': 'synthetic'}],
+                    tools=TOOLS, thinking=False, generation_timeout_sec=60)
+
+        error = caught.exception
+        self.assertEqual((len(calls), closed), (1, [True]))
+        self.assertEqual(error.reply.finish_reason, 'generation_timeout')
+        self.assertEqual(error.reply.tool_calls[0]['function']['arguments'], raw_arguments)
+        self.assertEqual(error.progress, {
+            'reason': 'generation_wall_timeout',
+            'tool_name': 'circuit_query_many',
+            'tool_argument_characters': len(raw_arguments),
+            'elapsed_seconds': 61.0,
+            'request_elapsed_seconds': 61.0,
+        })
+        telemetry = json.dumps(error.progress)
+        self.assertNotIn('PRIVATE_COMPONENT', telemetry)
+        self.assertNotIn('PRIVATE_CALL_ID', telemetry)
+        self.assertEqual(calls[0]['max_tokens'] if 'max_tokens' in calls[0] else None, None)
+
+    def test_navigation_wall_timeout_excludes_queue_and_prefill_before_first_activity(self):
+        client, closed = self.client(), []
+        now = [100.0]
+
+        def receive(_payload, *, on_tick=None, **_):
+            try:
+                now[0] = 175.0
+                on_tick()  # 75 s queued/prefill: not generation activity.
+                yield packet(token_ids=[1])
+                now[0] = 235.0
+                on_tick()  # exactly 60 s uses the >= boundary.
+                self.fail('The generation deadline must close the stream')
+            finally:
+                closed.append(True)
+
+        with patch('aurex.vllm_client.time.monotonic', side_effect=lambda: now[0]), \
+                patch.object(client, '_stream_lines', side_effect=receive):
+            with self.assertRaises(DegenerateGeneration) as caught:
+                client.chat([{'role': 'user', 'content': 'synthetic'}],
+                    tools=TOOLS, thinking=False, generation_timeout_sec=60)
+        self.assertEqual(closed, [True])
+        self.assertEqual(caught.exception.progress['elapsed_seconds'], 60.0)
+        self.assertEqual(caught.exception.progress['request_elapsed_seconds'], 135.0)
+
+    def test_generation_wall_timeout_requires_positive_number(self):
+        client = self.client()
+        for value in (0, -1, True, '60'):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                client.chat([], tools=TOOLS, thinking=False,
+                            generation_timeout_sec=value)
 
 
 if __name__ == '__main__':

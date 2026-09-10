@@ -730,6 +730,37 @@ class SessionDB:
                 (rid, sid)).fetchall()
         return [self._plan_item(row) for row in rows]
 
+    def task_plan_evidence_candidates(self, sid: str, rid: str, *, limit: int = 8) -> list[dict]:
+        """Return fresh successful tool receipts for the current plan stage.
+
+        A plan mutation updates at least one plan row, so the newest row update
+        is a durable stage cursor.  Restricting both session and run ownership
+        prevents a resumed session (or a repeated call in another task) from
+        lending evidence to the current task.
+        """
+        if type(limit) is not int or not 1 <= limit <= 16:
+            raise ValueError('Task-plan evidence candidate limit must be in 1..16')
+        with self.connect() as db:
+            if db.execute('SELECT 1 FROM runs WHERE id=? AND session_id=?',
+                          (rid, sid)).fetchone() is None:
+                raise ValueError('Task does not belong to this session')
+            stage = db.execute('''SELECT MAX(updated) AS changed_at
+                FROM task_plan_items WHERE run_id=? AND session_id=?''',
+                               (rid, sid)).fetchone()
+            if stage is None or stage['changed_at'] is None:
+                return []
+            # Take the newest bounded set, then restore chronological order in
+            # the controller-facing result.  Failed calls and plan bookkeeping
+            # are deliberately not evidence candidates.
+            rows = db.execute('''SELECT t.call_id,t.name,t.document_id,t.created
+                FROM tool_outcomes t JOIN documents d
+                  ON d.id=t.document_id AND d.session_id=t.session_id
+                WHERE t.session_id=? AND t.run_id=? AND t.ok=1
+                  AND t.name<>'task_plan' AND t.created>?
+                ORDER BY t.created DESC,t.call_id DESC LIMIT ?''',
+                              (sid, rid, stage['changed_at'], limit)).fetchall()
+        return [dict(row) for row in reversed(rows)]
+
     @staticmethod
     def _validate_plan_items(items) -> list[tuple[str, str]]:
         if not isinstance(items, list) or not 1 <= len(items) <= 12:
@@ -812,20 +843,23 @@ class SessionDB:
                     WHERE run_id=? AND session_id=? AND call_id=?''', (rid, sid, call_id)).fetchone()
                 if outcome is None:
                     # Qwen occasionally puts the returned document_id in the
-                    # call-ID field. Accept it only when it is an actual
-                    # document owned by this task session; arbitrary IDs and
-                    # cross-session evidence remain rejected below.
-                    if db.execute('SELECT 1 FROM documents WHERE id=? AND session_id=?',
-                                  (call_id, sid)).fetchone() is None:
+                    # call-ID field. Accept it only when it belongs to a
+                    # successful/failed tool outcome in this exact run. A
+                    # session-level document is navigation/attachment data,
+                    # not execution evidence for another task.
+                    if db.execute('''SELECT 1 FROM tool_outcomes
+                        WHERE document_id=? AND session_id=? AND run_id=?''',
+                                  (call_id, sid, rid)).fetchone() is None:
                         raise ValueError('Evidence ID is neither a completed call nor a document in this task: ' + call_id)
                     docs.append(call_id)
                 else:
                     docs.append(outcome['document_id'])
             docs = list(dict.fromkeys(docs))
             for document_id in docs:
-                if db.execute('SELECT 1 FROM documents WHERE id=? AND session_id=?',
-                              (document_id, sid)).fetchone() is None:
-                    raise ValueError('Evidence document does not belong to this task session: ' + document_id)
+                if db.execute('''SELECT 1 FROM tool_outcomes
+                    WHERE document_id=? AND session_id=? AND run_id=?''',
+                              (document_id, sid, rid)).fetchone() is None:
+                    raise ValueError('Evidence document does not belong to a tool outcome in this exact task: ' + document_id)
             previous = row['status']
             if previous == 'completed' and status != 'completed':
                 raise ValueError('Completed task-plan items are immutable')

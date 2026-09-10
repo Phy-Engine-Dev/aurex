@@ -57,6 +57,7 @@ class ContextPolicyTests(unittest.TestCase):
         cfg = load_config(str(path))
         self.assertIsNone(cfg.llm.max_output_tokens)
         self.assertIsNone(cfg.llm.reasoning_effort)
+        self.assertEqual(cfg.llm.thinking_frequency_penalty, 0.0)
         self.assertTrue(cfg.context.resolved().prune)
         self.assertEqual(cfg.context.resolved().retain_recent_turns, 3)
         self.assertFalse(cfg.context.prune)
@@ -78,6 +79,62 @@ class ContextPolicyTests(unittest.TestCase):
         path.write_text(json.dumps({'llm': {'reasoning_effort': 'high'}}))
         with self.assertRaises(ConfigError):
             load_config(str(path))
+
+    def test_thinking_frequency_penalty_is_finite_bounded_and_roundtrips(self):
+        path = Path(self.temp.name) / 'config.json'
+        path.write_text(json.dumps({'llm': {'thinking_frequency_penalty': 0.45}}))
+        cfg = load_config(str(path))
+        self.assertEqual(cfg.llm.thinking_frequency_penalty, 0.45)
+        save_config(cfg, str(path))
+        self.assertEqual(load_config(str(path)).llm.thinking_frequency_penalty, 0.45)
+        for invalid in (True, -0.01, 2.01, float('nan')):
+            path.write_text(json.dumps({'llm': {'thinking_frequency_penalty': invalid}}))
+            with self.subTest(invalid=invalid), self.assertRaises(ConfigError):
+                load_config(str(path))
+
+    def test_checkpoint_recomputes_next_move_when_plan_lags_completed_analysis(self):
+        self.db.set_task_plan(self.sid, 'run', [
+            {'id': 'inspect', 'title': 'Inspect every component'},
+            {'id': 'simulate', 'title': 'Run transient analysis'},
+        ])
+        args = {'path': '/tmp/design.sav', 'analysis': 'tr',
+                'tr_step': 0.001, 'tr_stop': 1.0}
+        until = 0
+        for index in range(2):
+            call_id = f'analysis-{index}'
+            self.db.message(self.sid, 'run', {'role': 'assistant', 'content': '',
+                'tool_calls': [{'id': call_id, 'type': 'function', 'function': {
+                    'name': 'circuit_analyze', 'arguments': json.dumps(args)}}]})
+            result = {'ok': True, 'data': {
+                'state_path': f'/tmp/state-{index}.json',
+                'measurements': {'transient': {
+                    'actual_stop_s': 1.0, 'requested_stop_s': 1.0,
+                    'completed_steps': 1000, 'sample_count': 21}}}}
+            _, until = self.db.tool_outcome(
+                self.sid, 'run', call_id, 'circuit_analyze',
+                json.dumps(result), True)
+
+        handoff = self.budget()._checkpoint_handoff(until, 'original-doc')
+        self.assertEqual(handoff['work_state']['active'][0]['id'], 'inspect')
+        details = handoff['important_details']
+        self.assertTrue(details['plan_status_may_lag_completed_tools'])
+        self.assertEqual(details['latest_analysis_outcomes'][-1]['transient'], {
+            'actual_stop_s': 1.0, 'requested_stop_s': 1.0,
+            'completed_steps': 1000, 'sample_count': 21})
+        self.assertEqual(details['repeated_completed_call_signatures'][0]['attempts'], 2)
+        self.assertEqual(handoff['next_move']['status'],
+                         'recompute_from_objective_and_machine_evidence')
+        self.assertEqual(handoff['next_move']['plan_candidate']['id'], 'inspect')
+        self.assertTrue(handoff['next_move']['plan_candidate_is_not_an_instruction'])
+        self.assertTrue(handoff['next_move']
+                        ['do_not_repeat_successful_call_solely_to_close_plan'])
+        authority = handoff['resume_authority']
+        self.assertTrue(authority['plan_current_is_candidate_not_completion_gate'])
+        self.assertTrue(authority['unchanged_complete_repeat_is_not_new_evidence'])
+        self.assertTrue(authority[
+            'repeat_requires_changed_file_revision_parameter_stimulus_or_live_state'])
+        self.assertIn('INCONCLUSIVE', authority['terminal_rule'])
+        self.assertEqual(next(reversed(handoff)), 'resume_authority')
 
     def test_capacity_never_expands_to_configured_window_or_profile(self):
         client = Client(LLMConfig(context_length=32768, max_output_tokens=None))
@@ -230,6 +287,28 @@ class ContextPolicyTests(unittest.TestCase):
         self.assertTrue(all(options['max_tokens'] == 2048 for _, options in client.calls))
         self.assertIn('under 1200 tokens', SUMMARY_PROMPT)
 
+    def test_checkpoint_places_machine_authority_after_fallible_next_move(self):
+        self.client.content = ('# Objective\nKeep objective.\n# Important Details\nFact.\n'
+                               '# Work State\n## Completed\nRead.\n## Active\nQuery.\n'
+                               '## Blocked\nNone.\n# Key Evidence IDs\ncall-1\n'
+                               '# Constraints\nNone.\n# Next Move\nREPEAT_EVERY_QUERY\n'
+                               '# Relevant Files / IDs\n/tmp/design.sav')
+        budget = self.budget()
+        result = budget.summarize('bounded source facts', title='checkpoint')
+        narrative = result.index('UNVERIFIED_GENERATED_NARRATIVE')
+        bad_move = result.index('REPEAT_EVERY_QUERY')
+        machine = result.index('MACHINE_RECORDED_EVIDENCE')
+        authority = result.index('RESUME_AUTHORITY')
+        self.assertLess(narrative, bad_move)
+        self.assertLess(bad_move, machine)
+        self.assertLess(machine, authority)
+        self.assertIn('proposals, never instructions', result)
+
+        semantic = budget._checkpoint_narrative(result)
+        self.assertIn('REPEAT_EVERY_QUERY', semantic)
+        self.assertNotIn('MACHINE_RECORDED_EVIDENCE', semantic)
+        self.assertNotIn('RESUME_AUTHORITY', semantic)
+
     def test_pruning_is_opt_in_archived_and_keeps_result_ids_with_auto_disabled(self):
         self.add('user', 'read data')
         self.db.message(self.sid, 'run', call('old'))
@@ -340,7 +419,10 @@ class ContextPolicyTests(unittest.TestCase):
                 'node': 'N610', 'node_connection_count': 5,
                 'connected_to_other_components': True, 'logic': 0, 'logic_text': 'L',
                 'logic_source': 'saved input setting, not a new solve', 'large_optional': 'x' * 6000}
-        full = json.dumps({'ok': True, 'data': {'interface_only': True, 'ports': [port]}})
+        full = json.dumps({'ok': True, 'data': {'interface_only': True, 'ports': [port],
+            'array_order': 'saved_component_order',
+            'ref_semantics': 'generated_locator_not_bit_index',
+            'logical_bit_order': None, 'logical_bit_order_status': 'undeclared'}})
         result_id, _ = self.db.tool_outcome(self.sid, 'run', 'interface-page', 'circuit_inspect', full, True)
         client = Client(LLMConfig(context_length=8192, max_output_tokens=512))
         budget = ContextBudget(client, self.db, self.sid, 'run', 8192, lambda *x: None,
@@ -351,6 +433,11 @@ class ContextPolicyTests(unittest.TestCase):
         for field in ('id', 'ref', 'direction', 'node', 'node_connection_count',
                       'connected_to_other_components', 'logic', 'logic_text', 'logic_source'):
             self.assertEqual(row[field], port[field])
+        self.assertEqual(projected['fields']['/data/array_order'], 'saved_component_order')
+        self.assertEqual(projected['fields']['/data/ref_semantics'],
+                         'generated_locator_not_bit_index')
+        self.assertIsNone(projected['fields']['/data/logical_bit_order'])
+        self.assertEqual(projected['fields']['/data/logical_bit_order_status'], 'undeclared')
 
         evidence = budget._evidence_capsule([{
             'name': 'circuit_inspect', 'ok': True, 'call_id': 'interface-evidence',
@@ -362,6 +449,68 @@ class ContextPolicyTests(unittest.TestCase):
                       'connected_to_other_components', 'logic', 'logic_text', 'logic_source'):
             self.assertEqual(saved[field], port[field])
         self.assertIn('bit significance', evidence['interface_records'][0]['scope'])
+
+    def test_stimulus_projection_keeps_atomic_logic_summary_instead_of_uuid_rows(self):
+        logic_summary = {
+            'scope': 'Vectors follow listed columns; no bit significance inferred.',
+            'all_rows_settled': False,
+            'settlement_scope': 'returned_rows_only',
+            'input_columns': [
+                {'id': 'input-1', 'source_ref': 'C1'},
+                {'id': 'input-3', 'source_ref': 'C3'},
+                {'id': 'input-2', 'source_ref': 'C2'},
+            ],
+            'output_columns': [
+                {'id': 'output-24', 'source_ref': 'C24'},
+                {'id': 'output-25', 'source_ref': 'C25'},
+            ],
+            'rows': [
+                {'step': 5, 'digital_settled': True,
+                 'input_vector': [1, 0, 1], 'output_vector': [1, 0],
+                 'high_outputs': [{'id': 'output-24', 'source_ref': 'C24'}],
+                 'unknown_or_high_impedance': [], 'missing_component_ids': []},
+                {'step': 6, 'digital_settled': False,
+                 'input_vector': [1, 1, 0], 'output_vector': [0, 1],
+                 'high_outputs': [{'id': 'output-25', 'source_ref': 'C25'}],
+                 'unknown_or_high_impedance': [], 'missing_component_ids': []},
+            ],
+        }
+        components = [
+            {'column': 0, 'id': 'input-1', 'source_ref': 'C1', 'type': 'digital_input',
+             'nodes': ['N1'], 'pin_labels': ['out']},
+            {'column': 1, 'id': 'output-24', 'source_ref': 'C24', 'type': 'digital_output',
+             'nodes': ['N24'], 'pin_labels': ['in']},
+        ]
+        data = {'recorded_not_resimulated': True, 'state_path': '/immutable/state.pe-state.json',
+                'encoding': {'0': 'L', '1': 'H', '2': 'X', '3': 'Z'},
+                'logic_summary': logic_summary, 'components': components,
+                'steps': [{'step': index, 'digital_settled': index == 0,
+                           'digital': {f'uuid-{column}': [column & 1]
+                           for column in range(24)}, 'large': 'x' * 2000} for index in range(16)],
+                'total_steps': 16, 'has_more': False}
+        full = json.dumps({'ok': True, 'data': data})
+        result_id, _ = self.db.tool_outcome(self.sid, 'run', 'stimulus-summary',
+                                            'circuit_read_stimulus', full, True)
+        projected = json.loads(self.budget(tool_output_tokens=4096).tool_document(
+            'Tool circuit_read_stimulus', full, document_id=result_id,
+            tool_name='circuit_read_stimulus'))
+        self.assertEqual(projected['fields']['/data/logic_summary'], logic_summary)
+        self.assertNotIn('/data/steps', projected['sections'])
+        component = projected['sections']['/data/components']['rows'][0]['value']
+        self.assertEqual((component['column'], component['source_ref']), (0, 'C1'))
+        evidence = self.budget()._evidence_capsule([{
+            'name': 'circuit_read_stimulus', 'ok': True, 'call_id': 'stimulus-summary',
+            'document_id': result_id, 'message_id': 20,
+            'arguments': {'path': data['state_path']}, 'arguments_sha256': 'a' * 64,
+            'result': {'ok': True, 'data': data},
+        }], 20)
+        retained = evidence['recorded_state_reads'][0]['logic_summaries'][0]
+        self.assertEqual(retained['input_columns'], logic_summary['input_columns'])
+        self.assertEqual(retained['output_columns'], logic_summary['output_columns'])
+        self.assertEqual(retained['rows'], logic_summary['rows'])
+        self.assertFalse(retained['all_rows_settled'])
+        self.assertEqual(retained['settlement_scope'], 'returned_rows_only')
+        self.assertFalse(evidence['recorded_state_reads'][0]['all_observed_rows_settled'])
 
     def test_circuit_projection_keeps_control_contract_without_renderer_payload(self):
         data = {
@@ -428,6 +577,83 @@ class ContextPolicyTests(unittest.TestCase):
         self.assertEqual(rows['shown_rows'], 8)
         self.assertEqual([row['value']['ref'] for row in rows['rows']], [row['ref'] for row in components])
 
+    def test_interface_projection_keeps_collection_geometry_before_port_rows(self):
+        ports = [{'id': f'input-{index}', 'ref': f'C{index + 1}', 'label': '',
+                  'direction': 'input', 'node': f'N{index}',
+                  'node_connection_count': 2,
+                  'connected_to_other_components': True, 'logic': 0}
+                 for index in range(24)]
+        groups = {
+            'schema': 'aurex.interface-geometry.v1',
+            'projection': 'saved_top_view',
+            'row_tolerance_saved_units': .08,
+            'geometry_authoritative': True,
+            'groups': [{'direction': 'input', 'type': 'Logic Input', 'count': 24,
+                        'top_to_bottom_bands': [{
+                            'layout': 'horizontal_row', 'count': 24,
+                            'left_to_right': [{'ref': f'C{index + 1}'}
+                                              for index in range(24)]}]}],
+            'logical_bit_order': None,
+            'logical_bit_order_status': 'undeclared',
+            'semantics': 'geometry only; not bus significance',
+        }
+        data = {'interface_only': True, 'with_image': False,
+                'total_ports': 24, 'total_inputs': 24, 'total_outputs': 0,
+                'ports': ports, 'interface_groups': groups}
+        full = json.dumps({'ok': True, 'data': data})
+        result_id, _ = self.db.tool_outcome(
+            self.sid, 'run', 'interface-map', 'circuit_inspect', full, True)
+        budget = ContextBudget(Client(LLMConfig(context_length=8192,
+                                                max_output_tokens=512)),
+            self.db, self.sid, 'run', 8192, lambda *x: None,
+            policy=ContextPolicyConfig(safety_tokens=128, summary_max_tokens=4096))
+        projected = json.loads(budget.tool_document('Tool circuit_inspect', full,
+            document_id=result_id, tool_name='circuit_inspect'))
+        self.assertEqual(projected['fields']['/data/interface_groups'], groups)
+        self.assertEqual(projected['fields']['/data/interface_groups']
+                         ['logical_bit_order_status'], 'undeclared')
+
+    def test_focused_inspection_keeps_bounded_spatial_facts_without_image(self):
+        spatial = {'projection': 'saved_top_view', 'relations': [{
+            'source': {'id': 'R1', 'ref': 'C1'},
+            'nearest': [{'id': 'C1', 'ref': 'C2', 'direction': 'left',
+                         'shared_nodes': ['N1'], 'electrically_connected': True}],
+        }]}
+        data = {'with_image': False,
+                'pagination': {'primary_ids': ['R1'], 'primary_refs': ['C1'],
+                               'match_count': 1, 'offset': 0, 'limit': 1,
+                               'has_more': False, 'next_offset': None},
+                'spatial_context': spatial,
+                'netlist': {'components': [{'id': 'R1', 'ref': 'C1',
+                    'type': 'Resistor', 'pins': [{'pin': 0, 'node': 'N1'}],
+                    'selection_role': 'primary'}],
+                    'nodes': [{'id': 'N1', 'connections': [
+                        {'component': 'R1', 'pin': 0},
+                        {'component': 'C1', 'pin': 0}]}]}}
+        full = json.dumps({'ok': True, 'data': data})
+        result_id, _ = self.db.tool_outcome(
+            self.sid, 'run', 'focused-spatial', 'circuit_inspect', full, True)
+        budget = ContextBudget(Client(LLMConfig(context_length=8192,
+                                                max_output_tokens=512)),
+            self.db, self.sid, 'run', 8192, lambda *x: None,
+            policy=ContextPolicyConfig(safety_tokens=128, summary_max_tokens=4096))
+        projected = json.loads(budget.tool_document('Tool circuit_inspect', full,
+            document_id=result_id, tool_name='circuit_inspect',
+            tool_args={'query': 'C1'}))
+        self.assertEqual(projected['fields']['/data/spatial_context'], spatial)
+        self.assertNotIn('/data/camera', projected['fields'])
+        evidence = budget._evidence_capsule([{
+            'name': 'circuit_inspect', 'ok': True, 'call_id': 'focused-spatial',
+            'document_id': result_id, 'message_id': 4,
+            'arguments': {'path': '/immutable.sav', 'query': 'C1'},
+            'arguments_sha256': 'd' * 64,
+            'result': {'ok': True, 'data': data},
+        }], 4)
+        relation = evidence['spatial_relation_records'][0]['relations'][0]['nearest'][0]
+        self.assertEqual(relation['direction'], 'left')
+        self.assertEqual(relation['shared_nodes'], ['N1'])
+        self.assertTrue(relation['electrically_connected'])
+
     def test_batch_circuit_projection_preserves_exact_selected_fields_byte_for_byte(self):
         results = [{
             'query': f'C{i}', 'ok': True, 'component_ids': [f'uuid-{i}'],
@@ -460,6 +686,62 @@ class ContextPolicyTests(unittest.TestCase):
                             for row in rows))
         self.assertTrue(all(row['components'][0]['pins'][0]['node'] == f'N{i}'
                             for i, row in enumerate(rows, 1)))
+
+    def test_large_batch_projection_keeps_all_query_identities_before_optional_detail(self):
+        spatial_order = {
+            'projection': 'saved_top_view', 'axis': 'saved_y_descending',
+            'covers_all_query_matches': True, 'geometry_authoritative': True,
+            'unambiguous': True, 'logical_bit_order': None,
+            'logical_bit_order_status': 'undeclared',
+            'top_to_bottom': [
+                {'id': 'top', 'ref': 'C1'}, {'id': 'middle', 'ref': 'C3'},
+                {'id': 'bottom', 'ref': 'C2'}],
+            'groups': [{'type': 'Logic Input', 'count': 3, 'unambiguous': True,
+                'top_to_bottom': [
+                    {'id': 'top', 'ref': 'C1'}, {'id': 'middle', 'ref': 'C3'},
+                    {'id': 'bottom', 'ref': 'C2'}]}],
+        }
+        results = [{
+            'query': f'C{i}', 'ok': True, 'component_ids': [f'uuid-{i}'],
+            'components': [{'id': f'uuid-{i}', 'ref': f'C{i}',
+                            'type': 'Logic Input', 'large': 'x' * 2500}],
+            'match_count': 1, 'has_more': False,
+        } for i in range(1, 12)]
+        data = {'batch': True, 'query_count': len(results),
+                'selected_fields': ['identity', 'spatial'],
+                'spatial_order': spatial_order, 'results': results}
+        full = json.dumps({'ok': True, 'data': data})
+        result_id, _ = self.db.tool_outcome(
+            self.sid, 'run', 'large-spatial-batch', 'circuit_query_many', full, True)
+        # Production uses a 90k model window.  A 32k fixture is sufficient to
+        # exercise the dedicated query-many envelope while still forcing the
+        # deliberately huge optional detail rows to be cropped.
+        budget = ContextBudget(Client(LLMConfig(context_length=32768, max_output_tokens=512)),
+            self.db, self.sid, 'run', 32768, lambda *x: None,
+            policy=ContextPolicyConfig(safety_tokens=128, summary_max_tokens=4096))
+        projected = json.loads(budget.tool_document('Tool circuit_query_many', full,
+            document_id=result_id, tool_name='circuit_query_many'))
+        self.assertEqual(projected['fields']['/data/spatial_order'], spatial_order)
+        manifest = projected['fields']['/data/query_manifest']
+        self.assertEqual(manifest['query_coverage'], {
+            'requested': len(results), 'represented': len(results), 'complete': True})
+        self.assertEqual([row['query'] for row in manifest['rows']],
+                         [row['query'] for row in results])
+        self.assertEqual([row['component_ids'][0] for row in manifest['rows']],
+                         [row['component_ids'][0] for row in results])
+        self.assertLess(projected['sections']['/data/results']['shown_rows'], len(results))
+        evidence = budget._evidence_capsule([{
+            'name': 'circuit_query_many', 'ok': True, 'call_id': 'spatial-evidence',
+            'document_id': result_id, 'message_id': 12,
+            'arguments': {'queries': ['C1', 'C2', 'C3'], 'fields': ['spatial']},
+            'arguments_sha256': 'c' * 64,
+            'result': {'ok': True, 'data': data},
+        }], 12)
+        saved = evidence['spatial_order_records'][0]
+        self.assertEqual(saved['logical_bit_order_status'], 'undeclared')
+        self.assertTrue(saved['covers_all_query_matches'])
+        self.assertEqual([row['ref'] for row in saved['groups'][0]['top_to_bottom']],
+                         ['C1', 'C3', 'C2'])
 
     def test_circuit_projection_keeps_compact_measured_trace_summary_before_large_rows(self):
         trace_summary = {
@@ -612,6 +894,125 @@ class ContextPolicyTests(unittest.TestCase):
         self.assertTrue(section['complete_interface_index'])
         self.assertEqual(section['columns'][0:6], ['id', 'ref', 'label', 'direction', 'node', 'node_connection_count'])
         self.assertEqual(section['rows'][44][0:6], [ports[44][field] for field in section['columns'][0:6]])
+
+    def test_checkpoint_keeps_interface_groups_and_query_spatial_order(self):
+        groups = {'schema': 'aurex.interface-geometry.v1',
+                  'projection': 'saved_top_view',
+                  'geometry_authoritative': True,
+                  'logical_bit_order': None,
+                  'logical_bit_order_status': 'undeclared',
+                  'groups': [{'direction': 'input', 'type': 'Logic Input',
+                              'count': 2, 'top_to_bottom_bands': [{
+                                  'layout': 'horizontal_row', 'count': 2,
+                                  'left_to_right': [{'ref': 'C1'}, {'ref': 'C2'}]}]}]}
+        interface_args = {'path': '/tmp/design.sav', 'interface_only': True}
+        self.db.message(self.sid, 'run', {'role': 'assistant', 'content': '',
+            'tool_calls': [{'id': 'interface-groups', 'type': 'function',
+                'function': {'name': 'circuit_inspect',
+                             'arguments': json.dumps(interface_args)}}]})
+        _, until = self.db.tool_outcome(self.sid, 'run', 'interface-groups',
+            'circuit_inspect', json.dumps({'ok': True, 'data': {
+                'interface_only': True, 'total_inputs': 2, 'total_outputs': 0,
+                'total_ports': 2, 'interface_groups': groups,
+                'ports': [{'id': 'one', 'ref': 'C1', 'direction': 'input',
+                           'node': 'N1', 'node_connection_count': 2},
+                          {'id': 'two', 'ref': 'C2', 'direction': 'input',
+                           'node': 'N2', 'node_connection_count': 2}],
+            }}), True)
+        spatial = {'projection': 'saved_top_view',
+                   'axis': 'saved_y_descending',
+                   'covers_all_query_matches': True,
+                   'geometry_authoritative': True, 'unambiguous': False,
+                   'logical_bit_order': None,
+                   'logical_bit_order_status': 'undeclared',
+                   'groups': [{'type': 'Logic Input', 'count': 2,
+                               'unambiguous': False,
+                               'vertical_bands': [[{'id': 'one', 'ref': 'C1'},
+                                                   {'id': 'two', 'ref': 'C2'}]]}]}
+        query_args = {'path': '/tmp/design.sav', 'queries': ['C1', 'C2'],
+                      'fields': ['spatial']}
+        self.db.message(self.sid, 'run', {'role': 'assistant', 'content': '',
+            'tool_calls': [{'id': 'query-spatial', 'type': 'function',
+                'function': {'name': 'circuit_query_many',
+                             'arguments': json.dumps(query_args)}}]})
+        query_manifest = {'selected_fields': ['identity', 'properties.高电平'],
+                          'query_coverage': {'requested': 2, 'represented': 2, 'complete': True},
+                          'rows': [
+                              {'query': 'C1', 'ok': True, 'component_ids': ['one'],
+                               'requested_values_complete': True,
+                               'components': [{'id': 'one', 'ref': 'C1',
+                                               'properties': {'高电平': 3.0}}]},
+                              {'query': 'C2', 'ok': True, 'component_ids': ['two'],
+                               'requested_values_complete': True,
+                               'components': [{'id': 'two', 'ref': 'C2',
+                                               'properties': {'高电平': 5.0}}]},
+                          ]}
+        _, until = self.db.tool_outcome(self.sid, 'run', 'query-spatial',
+            'circuit_query_many', json.dumps({'ok': True, 'data': {
+                'query_count': 2, 'spatial_order': spatial,
+                'query_manifest': query_manifest, 'results': []}}), True)
+        budget = self.budget()
+        journal = budget._tool_index(until, 4096)
+        evidence = json.loads(journal.split('\n', 1)[1])['machine_evidence']
+        interface_ref = ((evidence.get('interface_sets') or [None])[0] or
+                         evidence['interface_execution_coverage']
+                         ['complete_small_records'][0])
+        interface = interface_ref['interface_groups']
+        self.assertEqual(interface['groups'][0]['top_to_bottom_bands'][0]
+                         ['left_to_right'], [{'ref': 'C1'}, {'ref': 'C2'}])
+        query_ref = ((evidence.get('query_refs') or [None])[0] or
+                     evidence['query_execution_coverage']['complete_small_records'][0])
+        self.assertEqual(query_ref['query_coverage']['represented'], 2)
+        self.assertEqual(query_ref['rows'][0]['components'][0]['properties']['高电平'], 3.0)
+        self.assertEqual(query_ref['rows'][1]['components'][0]['properties']['高电平'], 5.0)
+        spatial_ref = (evidence.get('spatial_order_refs') or
+                       [query_ref['spatial_order']])[0]
+        self.assertTrue(spatial_ref['covers_all_query_matches'])
+        self.assertEqual(spatial_ref['logical_bit_order_status'], 'undeclared')
+
+    def test_tight_checkpoint_compacts_complete_query_execution_scope(self):
+        until = 0
+        batches = [(1, 24), (25, 48), (49, 68), (69, 79)]
+        for batch_index, (start, end) in enumerate(batches):
+            call_id = f'query-batch-{batch_index}'
+            queries = [f'C{number}' for number in range(start, end + 1)]
+            args = {'path': '/tmp/design.sav', 'queries': queries,
+                    'fields': ['pins', 'properties.高电平']}
+            self.db.message(self.sid, 'run', {'role': 'assistant', 'content': '',
+                'tool_calls': [{'id': call_id, 'type': 'function', 'function': {
+                    'name': 'circuit_query_many', 'arguments': json.dumps(args)}}]})
+            rows = [{'query': query, 'ok': True, 'component_ids': [f'id-{query}'],
+                     'match_count': 1, 'has_more': False,
+                     'components': [{'id': f'id-{query}', 'ref': query,
+                                     'type': 'Controlled Source',
+                                     'properties': {'blob': 'x' * 600}}]}
+                    for query in queries]
+            manifest = {'selected_fields': ['identity', 'pins', 'properties.高电平'],
+                        'query_coverage': {'requested': len(rows),
+                                           'represented': len(rows), 'complete': True},
+                        'rows': rows}
+            _, until = self.db.tool_outcome(self.sid, 'run', call_id,
+                'circuit_query_many', json.dumps({'ok': True, 'data': {
+                    'query_manifest': manifest, 'results': []}}), True)
+
+        client = Client(LLMConfig(context_length=8192, max_output_tokens=512))
+        client.count = lambda messages, tools=None: (len(json.dumps(
+            [messages, tools or []], ensure_ascii=False).encode()) // 3 + 1)
+        budget = ContextBudget(client, self.db, self.sid, 'run', 8192,
+            lambda *x: None, policy=ContextPolicyConfig(
+                safety_tokens=128, summary_max_tokens=2048))
+        journal = budget._tool_index(until, 1024)
+        self.assertLessEqual(client.count([{'role': 'user', 'content': journal}]), 1024)
+        evidence = json.loads(journal.split('\n', 1)[1])['machine_evidence']
+        coverage = evidence['query_execution_coverage']
+        self.assertEqual(coverage['completed_batches'], 4)
+        self.assertTrue(coverage['all_record_rows_complete'])
+        self.assertEqual(coverage['numeric_ref_ranges'], [
+            {'prefix': 'C', 'start': 1, 'end': 79, 'count': 79}])
+        self.assertEqual(coverage['repeated_identifier_rows'], 0)
+        self.assertGreaterEqual(evidence['families']['query_refs']['shown'], 1)
+        self.assertNotIn('components', json.dumps(evidence['query_refs'][0]))
+        self.assertNotIn('spatial_order', json.dumps(evidence['query_refs'][0]))
 
     def test_active_request_is_pinned_after_long_single_turn_compaction(self):
         self.add('user', 'original request ' * 350)

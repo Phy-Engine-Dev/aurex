@@ -333,6 +333,45 @@ class PhysicsLabToPECoverageTests(unittest.TestCase):
         self.assertEqual(schmitt["pl_source"]["engineering_defaults"]["schema"],
                          "current public PhysicsLab low/high/inverted")
 
+    def test_multimeter_mode_7_is_a_low_burden_current_measurement(self):
+        saved = self.make_sav("multimeter-current", [
+            {"id": "V", "model_id": "Battery Source",
+             "properties": {"电压": 3, "内阻": 0,
+                            "最大功率": PL_MAX_POWER_W},
+             "nodes": ["src", "gnd"], "position": [0, 0, 0]},
+            {"id": "M", "model_id": "Multimeter",
+             "properties": {"状态": 7},
+             "nodes": ["src", "load"], "position": [.2, 0, 0]},
+            {"id": "R", "model_id": "Resistor",
+             "properties": {"电阻": 10},
+             "nodes": ["load", "gnd"], "position": [.4, 0, 0]},
+        ])
+        original = saved.read_bytes()
+        spec = _load_spec(self.runtime, str(saved))
+        meter_spec = next(row for row in spec["components"] if row["id"] == "M")
+        source_spec = next(row for row in spec["components"] if row["id"] == "V")
+        load_spec = next(row for row in spec["components"] if row["id"] == "R")
+        self.assertEqual(meter_spec["type"], "resistor")
+        self.assertEqual(meter_spec["nodes"][0], source_spec["nodes"][0])
+        self.assertEqual(meter_spec["nodes"][1], load_spec["nodes"][0])
+        self.assertEqual(meter_spec["params"], {"r": 1e-9})
+        contract = meter_spec["pl_source"]["measurement_contract"]
+        self.assertEqual(contract["quantity"], "current")
+        self.assertEqual(contract["native_observable"], "derived_current_0_to_1")
+
+        result = circuit_analyze(self.runtime, {"path": str(saved), "analysis": "dc"})
+        self.assertEqual(saved.read_bytes(), original)
+        meter = next(row for row in self.full_measurements(result) if row["id"] == "M")
+        expected_current = 3.0 / (10.0 + 1e-9)
+        self.assertAlmostEqual(
+            abs(meter["derived_current_0_to_1"]["real"]),
+            expected_current, places=6,
+        )
+        self.assertAlmostEqual(
+            abs(meter["voltage_across_0_to_1"]["real"]),
+            expected_current * 1e-9, places=15,
+        )
+
     def test_nonideal_transformer_and_saved_winding_losses_reach_ac_solver(self):
         saved = self.make_sav("nonideal-transformer", [
             {"id": "SRC", "model_id": "Sinewave Source", "properties": {

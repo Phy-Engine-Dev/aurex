@@ -33,6 +33,14 @@ _LOADS = {"Incandescent Lamp", "Buzzer", "Electric Bell", "Musical Box",
 _MEMS = {"Accelerometer", "Attitude Sensor", "Gravity Sensor", "Gyroscope",
          "Linear Accelerometer", "Magnetic Field Sensor"}
 
+# PhysicsLab's Multimeter dial state 7 is its current-measurement position.
+# Real saved measurements from that mode contain two independent V/I pairs
+# (instantaneous and settled) whose ratios are both exactly 1e-9 ohm.  Model
+# that passive burden directly: PE then exposes the branch current without an
+# ideal 0 V source or a high-impedance voltage probe changing the topology.
+_MULTIMETER_CURRENT_MODE = 7.0
+_MULTIMETER_CURRENT_BURDEN_OHM = 1e-9
+
 
 def _number(props: dict, key: str, cid: str, *, optional: bool = False,
             default: float = 0.0) -> float:
@@ -247,11 +255,25 @@ def import_element(el: dict, *, scene: dict) -> list[dict[str, Any]] | None:
                        "input_resistance_ohm": resistance}})
     elif kind == "Multimeter":
         mode = _number(props, "状态", cid)
-        append("voltage_meter", [pins[0], pins[1]], {"r_input": 1e9}, "safe_voltage_input",
-               [0, 1], common + [
-                   "The public SDK does not define dial-state semantics or input impedance. Unknown/non-calibrated modes use an explicit 1 Gohm voltage-observation load instead of a 0 V source or archived V/I fitting.",
-               ], extra_source={"engineering_defaults": {"saved_dial_state": mode,
-                   "input_resistance_ohm": 1e9, "calibrated": False}})
+        if mode == _MULTIMETER_CURRENT_MODE:
+            append("resistor", [pins[0], pins[1]],
+                   {"r": _MULTIMETER_CURRENT_BURDEN_OHM},
+                   "low_resistance_current_input", [0, 1], common + [
+                       "Saved dial state 7 is the PhysicsLab low-resistance current-measurement mode. Its 1 nOhm passive burden is preserved between the original two terminals; PE reports derived_current_0_to_1 from the solved terminal voltage and live resistance.",
+                       "The burden is not an ideal 0 V source and archived Statistics are not replayed or fitted into the new solve.",
+                   ], extra_source={"support_level": "observed_physicslab_current_mode",
+                       "measurement_contract": {
+                           "saved_dial_state": mode,
+                           "quantity": "current",
+                           "native_observable": "derived_current_0_to_1",
+                           "burden_resistance_ohm": _MULTIMETER_CURRENT_BURDEN_OHM,
+                       }})
+        else:
+            append("voltage_meter", [pins[0], pins[1]], {"r_input": 1e9}, "safe_voltage_input",
+                   [0, 1], common + [
+                       "The public SDK does not define the remaining dial-state semantics or input impedance. Unknown/non-calibrated modes use an explicit 1 Gohm voltage-observation load instead of a 0 V source or archived V/I fitting.",
+                   ], extra_source={"engineering_defaults": {"saved_dial_state": mode,
+                       "input_resistance_ohm": 1e9, "calibrated": False}})
     elif kind == "Electricity Meter":
         rated = _number(props, "额定电流", cid)
         if rated <= 0:

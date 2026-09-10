@@ -6,6 +6,8 @@
 #include <cstdlib>
 #include <limits>
 #include <utility>
+#include <unordered_map>
+#include <algorithm>
 #include <fast_io/fast_io_dsal/vector.h>
 
 #ifdef PHY_ENGINE_USE_MKL
@@ -23,6 +25,7 @@
 #include "analyze.h"
 #include "analyzer/impl.h"
 #include "digital/update_table.h"
+#include "digital/settle.h"
 
 #if (defined(__CUDA__) || defined(__CUDACC__) || defined(__NVCC__)) && !defined(__CUDA_ARCH__)
     #include "solver/cuda_sparse_lu.h"
@@ -60,6 +63,54 @@ namespace phy_engine
     struct circult
     {
     public:
+        ::phy_engine::digital::settle_status digital_settle{};
+        ::std::size_t digital_event_budget{10'000'000};
+        ::std::size_t digital_ticks_attempted{}, digital_ticks_settled{};
+
+        void inspect_digital_drivers() noexcept
+        {
+            auto inspect = [&](auto& node) {
+                if(node.pins.empty()) return;
+                ::std::size_t drivers{}, loads{};
+                bool unknown{}, clock_load{};
+                for(auto* pin:node.pins)
+                {
+                    auto* model=pin->model;
+                    if(!model || !model->ptr) { unknown=true; continue; }
+                    // Analog attachments neither excuse multiple digital
+                    // drivers nor count as digital drivers/loads themselves.
+                    if(model->ptr->get_device_type()!=::phy_engine::model::model_device_type::digital) continue;
+                    auto view=model->ptr->generate_pin_view();
+                    auto role=model->ptr->get_digital_pin_role(static_cast<::std::size_t>(pin-view.pins));
+                    if(role==1) ++drivers;
+                    else if(role==0) ++loads;
+                    else unknown=true;
+                    if(role==0 && pin->name==u8"clk") clock_load=true;
+                }
+                if(drivers>1)
+                {
+                    ++digital_settle.multiple_driver_nodes;
+                    if(digital_settle.conflicts.size()<8) digital_settle.conflicts.push_back(&node);
+                }
+                if(drivers==0 && loads && !unknown && node.num_of_analog_node==0 && &node!=&nl.ground_node)
+                {
+                    ++digital_settle.undriven_nodes;
+                    if(clock_load)
+                    {
+                        ++digital_settle.undriven_clock_nodes;
+                        auto position=::std::min(digital_settle.undriven_clock_nodes-1,digital_settle.undriven.size());
+                        if(position<8)
+                        {
+                            digital_settle.undriven.insert(digital_settle.undriven.begin()+position,&node);
+                            if(digital_settle.undriven.size()>8) digital_settle.undriven.resize(8);
+                        }
+                    }
+                    else if(digital_settle.undriven.size()<8) digital_settle.undriven.push_back(&node);
+                }
+            };
+            for(auto& block:nl.nodes) for(auto* node=block.begin;node!=block.curr;++node) inspect(*node);
+            inspect(nl.ground_node);
+        }
         enum class cuda_solve_policy : ::std::uint_fast8_t
         {
             auto_select,
@@ -314,25 +365,54 @@ namespace phy_engine
 
             // Process pending nodes until the queue is empty (combinational settle in one tick).
             // Use an iteration budget to avoid hanging on oscillating combinational loops.
-            std::size_t iter_budget{10'000'000};
+            std::size_t iter_budget{digital_event_budget};
+            ::std::unordered_map<::phy_engine::model::node_t*, ::std::size_t> activity{};
             while(!digital_update_tables.tables.empty())
             {
-                if(iter_budget-- == 0) { break; }
-
-                auto it = digital_update_tables.tables.begin();
-                auto* node = *it;
-                digital_update_tables.tables.erase(it);
-
-                for(auto p: node->pins)
+                // Round-robin batches prevent a self-requeued low-address net
+                // from starving every independent node in the pending set.
+                decltype(digital_update_tables.tables) batch{};
+                batch.swap(digital_update_tables.tables);
+                while(!batch.empty())
                 {
-                    auto model{p->model};
-                    if(model->ptr->get_device_type() == ::phy_engine::model::model_device_type::digital) [[likely]]
+                    if(iter_budget==0)
                     {
-                        auto const rt{
-                            model->ptr->update_digital_clk(digital_update_tables, tr_duration, ::phy_engine::model::digital_update_method_t::update_table)};
-                        if(rt.need_to_operate_analog_node) { digital_out.push_back(rt); }
+                        digital_update_tables.tables.insert(batch.begin(),batch.end());
+                        break;
+                    }
+                    --iter_budget;
+                    auto* node=*batch.begin();
+                    batch.erase(batch.begin());
+                    ++digital_settle.processed_events;
+                    ++activity[node];
+                    for(auto p: node->pins)
+                    {
+                        auto model{p->model};
+                        if(model->ptr->get_device_type() == ::phy_engine::model::model_device_type::digital) [[likely]]
+                        {
+                            auto const rt{
+                                model->ptr->update_digital_clk(digital_update_tables, tr_duration, ::phy_engine::model::digital_update_method_t::update_table)};
+                            if(rt.need_to_operate_analog_node) { digital_out.push_back(rt); }
+                        }
                     }
                 }
+                if(iter_budget==0) break;
+            }
+            digital_settle.pending_nodes=digital_update_tables.tables.size();
+            digital_settle.settled=digital_update_tables.tables.empty();
+            if(!digital_settle.settled)
+            {
+                digital_settle.reason=::phy_engine::digital::settle_reason::event_budget;
+                ::std::unordered_map<::phy_engine::model::node_t*, ::std::size_t> ordinals{};
+                ::std::size_t ordinal{};
+                for(auto& block:nl.nodes) for(auto* node=block.begin;node!=block.curr;++node) ordinals.emplace(node,ordinal++);
+                ordinals.emplace(&nl.ground_node,ordinal);
+                digital_settle.pending.assign(digital_update_tables.tables.begin(),digital_update_tables.tables.end());
+                ::std::sort(digital_settle.pending.begin(),digital_settle.pending.end(),[&](auto* a,auto* b){return ordinals.at(a)<ordinals.at(b);});
+                if(digital_settle.pending.size()>8) digital_settle.pending.resize(8);
+                for(auto const& [node,count]:activity) digital_settle.hot.push_back({node,count});
+                ::std::sort(digital_settle.hot.begin(),digital_settle.hot.end(),[&](auto const& a,auto const& b){return a.events!=b.events ? a.events>b.events : ordinals.at(a.node)<ordinals.at(b.node);});
+                if(digital_settle.hot.size()>8) digital_settle.hot.resize(8);
             }
         }
 
@@ -345,12 +425,29 @@ namespace phy_engine
             }
         }
 
-        void digital_clk() noexcept
+        ::phy_engine::digital::settle_status const& digital_clk() noexcept
         {
+            ++digital_ticks_attempted;
+            digital_settle={};
+            digital_settle.time_s=tr_duration;
+            inspect_digital_drivers();
             digital_out.clear();
+            if(digital_settle.multiple_driver_nodes)
+            {
+                digital_settle.reason=::phy_engine::digital::settle_reason::multiple_drivers;
+                digital_settle.pending_nodes=digital_update_tables.tables.size();
+                return digital_settle;
+            }
             before_digital_clk();
             update_table_digital_clk();
-            after_table_digital_clk();
+            // Delayed models enqueue the following tick during after_all_clk;
+            // those are intentional future work, not unfinished settling.
+            if(digital_settle.settled)
+            {
+                ++digital_ticks_settled;
+                after_table_digital_clk();
+            }
+            return digital_settle;
         }
 
         void update_digital() noexcept

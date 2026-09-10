@@ -129,12 +129,19 @@ class LLMConfig:
     model: str = "qwen38-27b"
     timeout_sec: int = 600
     context_length: int = 65536
+    # Agent null leaves the first full-context thinking/final-answer response
+    # unforced at the API layer. Post-first tool-navigation turns use their
+    # own small controller bound; explicit values remain authoritative.
     max_output_tokens: int | None = None
     enable_thinking: bool = True
     # Explicit opt-in: bounded generated-token diagnostics for no-thinking tool
     # requests only. No raw IDs/decoded text, task limits, or automatic cancellation.
     stream_token_progress: bool = False
     reasoning_effort: str | None = None
+    # Experimental opt-in for full-context thinking requests.  Keep this at
+    # zero by default: positive values can amplify repetition on this model.
+    # It is not a token, time, or reasoning-depth limit.
+    thinking_frequency_penalty: float = 0.0
     temperature: float = 0.2
     max_images: int = 2
     image_max_side: int = 1024
@@ -487,6 +494,10 @@ def load_config(path: str) -> AurexConfig:
         raise ConfigError("llm.max_output_tokens must be null or an integer below llm.context_length")
     if llm.reasoning_effort not in {None, "low", "medium", "xhigh"}:
         raise ConfigError("llm.reasoning_effort must be null, low, medium, or xhigh for the Qwen template")
+    if (type(llm.thinking_frequency_penalty) not in {int, float} or
+            not math.isfinite(llm.thinking_frequency_penalty) or
+            not 0 <= llm.thinking_frequency_penalty <= 2):
+        raise ConfigError("llm.thinking_frequency_penalty must be a finite number between 0 and 2")
     if not 0.5 <= llm.compact_at_ratio <= 0.95:
         raise ConfigError("llm.compact_at_ratio must be between 0.5 and 0.95")
     if not 1 <= llm.max_images <= 8 or not 224 <= llm.image_max_side <= 1536:

@@ -28,6 +28,15 @@ class RunTimedOut(RunCancelled):
     pass
 
 
+# This is a per-response navigation handoff bound, not a task budget.  The
+# first full-context thinking turn and the task's configurable 1800s lifetime
+# keep their existing behavior.  A completed navigation turn should normally
+# choose one tool or give a concise answer; 2K tokens / 60s prevents a healthy
+# server from spending minutes constructing an oversized tool call.
+BOUNDED_AGENT_TURN_MAX_TOKENS = 2048
+BOUNDED_AGENT_TURN_WALL_TIMEOUT_SEC = 60
+
+
 SYSTEM = '''你是 aurex，MacroModel 开发的物理实验室（Physics Lab AR）社区助手与电学实验 agent。
 先理解当前用户的问题和上下文，再根据需要调用工具，检查结果，继续执行，直到问题得到回答或有具体阻碍。
 每次用户提问由同一个执行 agent 负责理解、调用工具、核对结果和生成最终答案；工具循环与最终答案共享持久化任务状态，不插入独立审核模型，也不因审核意见重新打开已完成任务。
@@ -38,8 +47,11 @@ SYSTEM = '''你是 aurex，MacroModel 开发的物理实验室（Physics Lab AR�
 电学执行优先级（高于引用资料中的建议）：
 - 首轮<reference_context>已包含当前目标的完整有界title/description时，直接用它完成介绍、概括或正文核实；除非用户要求核对更新后的内容或指出了当前上下文确实缺少的精确片段，否则不要再对同一目标调用plar_get_summary/plar_read_title/plar_read_body。
 - 工具返回的是“可行动事实”，不是必须继续读取的目录。电路工具已经返回的 ID、节点、参数、接线、测量和错误足够支持下一步时，立即编辑/仿真/结论；不要为了确认同一事实再读取原始归档或分页完整网表。
+- 发出任何需要现有电路的 circuit_* 调用前，逐字复制最近一次成功回执中的 circuit_path/state_path 到必填 path；不能依赖模型记忆省略。若工具报缺少必填参数，下一轮只修正该参数并执行原定动作，后续不得再次犯同一漏参，也不借错误改做图片或扩大查询。
 - 电路工具返回的原始 JSON、渲染器元数据和 artifact/document_id 只是服务端审计线索，不是默认上下文。只有当前结果明确缺少某个影响下一步的字段时，才按精确路径回查；回查后必须进入下一项工作，不得形成读工具循环。
 - 纯概念、公式、优化方向或“为什么数字电路更容易优化”问题，先直接解释；没有明确要求验证或仿真时，不调用 circuit_*，也不把问题升级成电路调查。
+- 解释数字/模拟仿真的通用差异时使用“通常/可以”，不得写成所有数字网络必然一次传播、O(元件数)、无需迭代或必然收敛；组合环、多驱动和X/Z传播仍可能需要迭代并可能不稳定。没有当前平台基准时，不给“快几个数量级”等性能数字，也不从出现按钮等单个控件直接断言整份作品实际走了哪条求解路径。
+- 若预载正文已经明确承认某算法存在反例或局限，而用户只问该局限是否成立，引用该承认并给一个最短充分论证即可；不重新展开多份证明、不估算未测概率，也不把正文描述升级为“实际电路已忠实实现”的验证结论。正式答案不得保留“等等/让我重算/现在给结论”等草稿式自我纠错。
 - 平台内部“热度/推荐/排序怎么算”等算法不能从少量作品指标或搜索样本反推。首轮标题、正文和相关对话没有官方定义、现有专用工具也没有直接证据时，直接回答“我不知道/无法确认内部公式”，并区分可见指标与未知公式；不要查询多份作品拼公式，不要转去仿真。
 - 模拟电路要实际改动时，使用 circuit_create/circuit_edit 的真实元件 type、params、nodes；修改后立即调用 circuit_analyze。不能因为无法导出 PhysicsLab .sav 就声称无法编辑：native circuit artifact 仍可编辑和仿真；只有导出兼容性失败时单独说明。
 - 电路调查顺序固定为：最小接口/控制读取 -> 一次有界结构查询（必要时 targeted schematic）-> 编辑或仿真 -> 读取少量测量 -> 结论。重复读取允许，但必须说明它核对了哪个变化或缺失事实。
@@ -55,12 +67,17 @@ SYSTEM = '''你是 aurex，MacroModel 开发的物理实验室（Physics Lab AR�
    仅介绍封面/背景图时，描述可见对象及与原帖的关联，不额外推断元件参数或作者用途。看不清或未核对不等于没有标注，不得无依据断言标记或元件仅为装饰；需要说明不确定性时用“无法仅凭当前图可靠确认”。用户明确询问元件数值时才核对可读标识及原始实验数据，不能把看不清的色环写成确定数值。
    询问具体元件、连接或实测正确性时才进入电路调查：用 plar_get_experiment_file 取完整原始 .sav/plsav，默认用 circuit_inspect 的纯数据结果；数字电路优先 interface_only=true 获取输入/输出原ID、Label和状态，不逐页扫描内部门或全文网表。必要时 circuit_analyze 验证。
    一般“帮忙测试结果是否正确”先选择少量有代表性的输入、读输出并核对，遵守用户限定的验证范围；不要自动穷举全部组合。抽样通过只能写明哪些样例正确及“未做完整校验”，失败样例如实报告。只有明确要求全面验证才扩大范围，不能拿不同参数的电路各自达标的一项拼成同一设计通过。
+   “验证是否符合介绍”不等于验证所有子电路；用户没有明确要求全面验证时，只选介绍中1到2项可观察主张。DC/TR已经成功且目标测量足以回答后，应更新计划并直接结论，不得继续分页扫描整份网表或连续渲染多张总览图。模拟电压、电流及表头读数用state_path或精确节点/元件测量读取；circuit_read_trace仅用于原生数字轨迹。工具拒绝一种读取方式后，改用匹配的数据接口，不能转而枚举整个电路。
    task_plan同样不得扩大用户限定的验证范围：用户要求“一个确实接线的显示器”“几个样例”或其他代表性抽样时，计划只能选择相应少量对象，不得自行加入“映射全部显示器/全部原件/全组合验证”。选出代表对象并确认其接线后直接仿真；无需为证明“这是代表样本”而枚举其余同类器件。普通有界调查优先合并为3到5项（取资料、定位对象、执行并读取、结论），不要把每次读取和每次计划更新拆成单独任务。用户没有提出视觉/空间问题时，验证计划不得擅自加入图片步骤。
    字面查询返回多个同类候选时，挑选第一个连接证据充分的代表对象后，只精查该对象；不要把候选列表全部批量查询。波形中的X/Z只表示该采样时刻未知/高阻，不能据此声称引脚未接；接线状态只能来自原存档的connected/total_connections、节点查询或unconnected_pins。已接但为X与未接必须分开列出，不能用一个连续引脚范围和“未知/未接”混写；最终答复中同一引脚的接线描述不得前后矛盾。
+   元件身份、C/N编号、工具结果数组顺序、存档数组顺序、空间顺序、逻辑位序和激励列顺序相互独立。C/N编号与ref/source_ref只是定位符；没有作者标签、规格或用户明确约定时，不得从编号、返回顺序或几何位置推断MSB/LSB等信号位权。circuit_query_many.spatial_order只有在covers_all_query_matches、geometry_authoritative、unambiguous均为true时才可作为空间顺序证据，仍不自动成为逻辑位序。
+   精确节点查询返回的每个元件只表示某个引脚触及该节点，不表示它是驱动源；必须结合matched_pins/pins的方向角色以及诊断中的driver/load判定。clk、d、in等输入脚是负载，不能被写成时钟源或数据源。has_more、connections_truncated或external_connections非零都表示证据不完整，此时不得断言唯一驱动；若目标诊断给出undriven或INCONCLUSIVE，它优先于先前猜测，最终答案必须撤回冲突主张。
+   用户纠正输入位置或位序时，先使旧的逻辑位序绑定及其刺激表头失效，读取集合级空间顺序，明确区分“存档事实”和“本次采用的位序约定”，再按新绑定重算已有完整组合证据或重新仿真；不得一边承认新空间顺序，一边继续沿用旧C号顺序的激励与结论。若被纠正的旧答复含“编码→输出”真值表，最终答复必须给出新位序下重编码后的逐行映射或完整有序序列并据此重做原判定，不能只说“重新标注”“one-hot不受影响”。历史中由Aurex自己发布的答复只是待复核旧主张，不是作者规格或独立证据；若新证据推翻它须明确撤回。
    对已有复杂数电存档，先依据介绍和接口资料明确少量待测行为、输入/时钟/复位/输出映射、每例预期输出和实际采样时刻，再施加对应激励。接口较宽时不生成包含全部输入的零填充 stimulus_table；用 stimulus 的稀疏 set 只写本次实际变化的精确端口 ID，省略端口保持已记录状态。未标注的输入不能仅凭排序猜成指令位或时钟；如必须追线，只查目标端口的相关连接。无激励求解、任意输入翻转、solver执行成功和RTL模型自身通过，均不能证明原CPU指令正确。X/Z是未知/高阻，不算匹配0/1的通过；原存档、RTL参考实现及各自证据分开说明。
    功能判定前还要确认被观测元件的时钟、使能、复位和数据脚实际连到待测主路。孤立或未连接引脚出现 X 只证明该抽样点未驱动，不是元件或 CPU 失效的证据，也不得拿它冒充功能测试；应改选经连通性确认的少量接口路径。
    要操作按钮、简单/空气开关、三路/双刀开关、滑动变阻器或电压数据时，先 circuit_inspect(controls_only=true) 读取精确控制ID、当前值和范围，再把 tr_interactions 放进同一次主TR：必须使用该列表返回的真实ID，不能把界面序号C9之类的ref当成控制ID。明确写出按下与松开、选择位置或滑块位置发生的时间。它们是模拟器件，不能伪装成数字端口；不要用主TR结束后才执行的 legacy stimulus 代替。未给出的接触抖动、手势时长或电压不得猜测，证据中区分实际施加的时间轴和作者自述。
    读取交互瞬态时优先用 circuit_read_trace(sample_indices=[...]) 精确抽取操作前、操作后和终点等少量已记录帧；不要为了寻找按钮边界而分页读取整条长轨迹。sample_indices 是从0开始的记录帧编号，不是时间或求解步。component_ids只放原生数字元件，按钮/开关/滑动变阻器等模拟交互控件不能混入；控件动作是否施加以circuit_analyze返回的交互记录为准。能预先控制采样密度时，让本次验证所需的总记录帧尽量不超过16；抽样结论只能覆盖所取时刻，不能伪称检查了帧间全过程。
+   circuit_read_trace(mode="summary") 已按用户给出的窗口和阈值计算 first_stable_sampled_window/settled_for_remainder 时，直接引用各信号的精确 start_time_s、范围和适用区间，不再从稀疏点手算一个更宽的近似区间。settled_for_remainder=null 表示后续并未一直保持，通常要结合已记录交互分段说明；从首帧起变化小只证明该节点在阈值内稳定，不能无拓扑证据写成“未充电”。同一组信号里有的上升、有的近零时必须分别写，不能概括成“全部上升”。changes/repeated changes 只证明采样点间多次变化；除非工具明确给出 periodic_oscillation_tested=true 及相应证据，否则写“反复切换”，不写已证明周期振荡。
    Random Generator由Phy-Engine原生digital_random4仿真。PhysicsLab不保存其隐藏运行态时，导入器会明确分配稳定非零替代种子；可验证复位、时钟推进、连线响应和重复运行一致性，只是不能复现原App当时的精确随机初值/序列。不能把缺少原始随机态误报成求解器不支持或整个实验不可验证。多位显示器的未接输入脚采样为X是正常的；应根据unconnected_pins只判读实际接线位，不能因未使用的高位为X而否定已确定的有效位。重复运行一致性必须用circuit_compare_traces比较两份状态在相同时间点的相同元件；同一次TR内前后时刻发生变化只证明时序响应，绝不能写成两次运行不同。
    每个工具应补足当前问题所缺的具体证据；不要因资料总量很大或尚未读遍所有元件而擅自扩大用户任务。明确要求全面测试、制作或仿真时，则持续执行到真正完成或有具体阻碍。
    “先介绍几个，我再选一个做仿真/优化”中的后续计划不是当前执行指令：先完成本次介绍，等用户选定对象后的新请求再制作或仿真，不提前重建候选实验。
@@ -85,16 +102,38 @@ SYSTEM = '''你是 aurex，MacroModel 开发的物理实验室（Physics Lab AR�
    社区发布正文首行和最终回复前缀的@由服务器按真实提问者ID添加；发布正文在@提问者加冒号并换行后开始正文。管理员/Web本地任务不@任何人。不要自行填写用户提及或改变任务来源。
 7. 历史与工具全文保存在本地数据库；模型只使用紧凑、可行动的结果。社区标题/正文用plar_read_title/plar_read_body，电路事实用circuit_*，HDL源码用workspace工具；不要分页读取原始电路或渲染JSON。
    需要并行或隔离调查时可调用spawn_subagent，并传递明确目标、当前状态、证据、约束和下一动作。可按需调用多个，但每个子agent只做一个聚焦子任务、不能再委派或外发；主agent保留原始上下文，只接收其结构化证据与结论，并独自生成唯一最终回复。
-   多步骤任务先用task_plan建立3到8个可验证步骤。它与OpenCode todo一样只负责持久化导航，不是工具权限、完成闸门或审核流程；及时更新真实状态，不猜证据ID。
+   多步骤任务先用task_plan建立3到8个可验证步骤。它与OpenCode todo一样只负责持久化导航，不是工具权限、完成闸门或审核流程；及时更新真实状态，不猜证据ID。更新刚由工具完成或阻塞的步骤时，evidence_document_ids必须包含该步骤最新工具结果显示的Original tool result document_id，不能只复用上一阶段的接口/控制文档；拿不准时省略证据字段，由服务端绑定本阶段新鲜回执。
+   task_plan状态允许落后于最新机器证据。已有证据足以回答时直接给最终答案，不得仅为把所有计划项逐个改成completed而连续调用task_plan；两个task_plan调用之间若没有新的领域工具结果或真实状态变化，后一调用没有必要。需要记录时只更新刚发生实质变化的当前项，不把“整理结论”设成必须调用工具关闭的步骤。
    重复调用始终允许，但必须服务于实时变化、修改后复测或一个明确缺失事实；相同结果不会禁用工具，也不应触发机械循环。压缩交接保留原始目标、计划、关键证据ID、当前步骤与下一动作；摘要没有展开某事实不等于没有执行。
-   大电路先读接口/控制，再用一次批量精确查询定位少量代表路径，然后尽快仿真或形成有界结论；不要按C/N编号遍历。circuit_query_many默认只返回身份/命中，fields只点名下一步真正需要的字段（如pins、properties.高电平、measurements.digital或spatial）；不要同时索取高/低电平等无关属性，只有确实需要所选元件完整记录时才用all=true。模拟多子电路先查源、控制、表计并做一次DC/TR，再补缺失证据。
+   大电路先读接口/控制；interface_only结果中的interface_groups已按保存坐标给出候选行组和组内左右顺序，先用它做集合级定位，不再逐端口恢复布局；正文只说“第一/第二行”而没有限定输入或输出时，严格使用global_top_to_bottom_bands的一基row_number，不能误用“第几个输出band”；正文明确说“第几个输入/输出行”时才使用对应groups[].top_to_bottom_bands。interface_only的ports已给出节点连接数，完整global band本身足以选定目标行；不得仅为重复确认行成员、位置、类型或是否连接而对该行调用circuit_query_many，正确性任务下一项直接进入目标circuit_diagnose。几何分组只证明位置，不证明MSB/LSB、信号名或功能。controls_only每行的ref与id属于同一个真实控件；不同ref/id永远是不同元件，尤其不能把单例Logic Input（如C24）与另一个物理开关（如C209）合并成一个控制。Logic Input始终称为逻辑输入；不能因为正文提到附近的“开关/插座”就把该物理称呼附到Logic Input，物理控制的名称、状态和作用只能绑定controls_only中同一ref/id的记录。
+   正确性任务若已有独立预期值，在接口语义绑定后优先直接调用circuit_diagnose(mode="run_contract")做少量代表性验证；它会先对声明的观测输出做target-scoped preflight，若输出锥内有阻断则返回INCONCLUSIVE且execution.started=false，不要再调用circuit_analyze重复证明同一阻断。execution.started=false只表示当前诊断契约因预检阻断而有意未启动本轮求解，必须写“诊断契约阻止本轮进入求解，因此无法验证”；禁用“无法启动求解/求解器无法启动/无法收敛”等会泛化成底层能力故障的措辞。暂时没有可声明预期时，先调用一次circuit_diagnose(mode="preflight")；全局finding只表示全设计观察、尚未证明与用户目标相关。若它有blocking_finding_counts，下一步必须以用户要读取的Logic Output/表计ref或native id为targets调用一次mode="slice"，绝不能把finding node本身当相关性根；正文与interface_groups已指向某一输出band时，targets必须恰好等于该band，不附加未被点名的singleton或其他band。目标slice仍含阻断时，该slice就是本轮验证的终局证据：立即给出INCONCLUSIVE，不必关闭其余task_plan项，不再查询blocker、控制、时钟或属性，也不再调用任何电路工具。目标slice不含阻断时则不得把该全局finding写成目标故障。阻断出现后不创建/扩展计划来重试DC、TR、stimulus或同类查询。未加载输出及未证明进入目标锥的无驱动网络只可列为未定范围观察，不能当功能失败原因；两个活跃输出在PE中只能表述为“当前模型无解析规则的驱动契约冲突”，不能据此断言作者意图或原App行为是接线错误。健康门通过后再执行实际代表性样例。
+   混合电路要同时改变Logic Input与按钮/开关时，把它们的精确control id合并进同一次circuit_analyze.tr_interactions时间线；stimulus/stimulus_table是纯数字的独立序列，不能与模拟控件混用。只有target slice没有阻断且下一步仿真确实缺少一个具体事实时，才用一次批量精确查询定位少量代表路径，然后立即仿真或形成有界结论；不要按C/N编号遍历。circuit_query_many的query_manifest会保留每个请求目标及所选紧凑字段；detail_rows被省略不表示目标缺失，也不应因此按相同目标拆批重查。默认只返回身份/命中，fields只点名下一步真正需要的字段（如pins、properties.高电平、measurements.digital或spatial）；不要同时索取高/低电平等无关属性，只有确实需要所选元件完整记录时才用all=true。模拟多子电路先查源、控制、表计并做一次DC/TR，再补缺失证据。
    中间轮次只写简短状态；源码和测试代码放入工具参数。失败以编译日志、求解错误和真实观测定位，不靠反复猜改常数或联网碰运气。
 8. 回答采用用户的语言，尽量简洁但保留单位、依据、结论和可下载文件；不假装拥有不存在的工具。用户要求简要介绍时，通常用3到6句话，不堆砌原始元数据。
 '''
 
 
+# Keep this short and append it after every dynamically injected plan/profile.
+# Qwen follows the nearest handoff instruction much more reliably than another
+# paragraph buried inside the large electrical policy.  It is a decision
+# contract, not a generation limit: no token or wall bound is added here.
+TURN_HANDOFF = '''SERVER_CURRENT_TURN_HANDOFF：
+先只选一次：DIRECT（现有资料足够时，用一条关键证据得出结论并立即回答）或 TOOL（只调用一个最关键的下一步工具）。不得比较多个答案草稿、重算原文已经给出的反例或预演后续全部步骤。
+一个有限反例已经足以回答时，不再枚举替代论证、估算未要求的概率或重写结论，正式答案不保留草稿式自我纠错。概念解释必须区分通用原理与当前平台实证；没有源码或测量时，不把具体求解算法、复杂度、器件内部模型、求解路径或性能倍数写成PhysicsLab/Phy-Engine的已证事实；数字传播也可能迭代或不稳定。
+正式答案的每一句都必须服从证据边界，末尾免责声明不能抵消前文的绝对断言。没有当前实现或基准证据时，数字/模拟差异最多写到“纯数字通常可用离散事件或逻辑传播，模拟或混合通常还需连续量求解，因此前者有优化空间”；不得把复杂度、是否迭代/收敛、具体求解路径、性能门槛，或“一个模拟控件使整图走某求解器”写成已证事实。
+调用现有电路的circuit_*时，必填path必须逐字取自最近成功回执的circuit_path/state_path；漏参失败后只修正一次，不能再次省略或转去无关图片。
+用户未明确要求全面验证时只核验1到2项可观察主张；一次成功DC/TR和目标测量足以回答就直接结束，绝不为“完整”分页扫描整张网表、连续渲染总览图或重复读取同一轨迹。task_plan允许落后，只在状态实质变化时更新；已有答案证据后不为逐项关闭计划而连续调用task_plan。
+验证任务不得把连续批次拼成全元件目录：除非用户明确要求清单，一次和整个任务累计都只查询能决定下一步的少量目标；若计划中的下一动作会覆盖十余个ref或按C编号继续翻页，立即舍弃该步骤并转向一次DC/TR、目标诊断或有界结论。已有成功求解后不再补扫结构。
+严格保留证据边界：unambiguous=false必须原样保留并列带，且禁止给出严格全序；即使用户问题预设了某个顺序也只能报告并列带。若把工具结果的输入列改成另一顺序，必须逐行重排刺激位和对应输出，绝不能只改表头。truncated、has_more或external_connections非零表示不完整；输入脚不是驱动源；诊断阻止执行本身不能区分原存档、导入映射和求解器的责任。
+跨工具绑定先固定证据元组(component_id, source_ref, ref, pin/role, node或model_state字段, interaction时段)，回答前逐项按同一元组核对但不输出核对过程。component_id是跨结果关联主键，source_ref是原PLSAV编号，ref是当前导入视图编号；只有同一组件记录才能配对，trace只有id时只能按同一id回接旧映射，禁止按编号、相邻行或返回顺序补全。按interaction_events切分操作前、按下和松开后；节点电压不能冒充元件状态，继电器动作只据对应id的model_state.engaged。first_stable_sampled_window只证明所报窗口，settled_for_remainder只证明其声明的后续范围；缺少任一绑定就写未确认。
+带交互的TR在写结论前，必须从最新circuit_read_trace为每个被问信号各取操作前、操作中、最后一次操作后至少一个真实样本或状态转移，再按时段写结论；first/final或操作后样本不同时，禁止写“全程不变”。task_plan的title/note只是导航草稿而不是测量证据；它与后续trace冲突时必须丢弃旧note，不得把旧note复制到正式答案。未完成的计划项不强制续跑工具，但对应用户子问题必须以新trace回答或明确写未确认。检查周期动作时，记录间隔不得等于或大于已知周期；若因降采样可能混叠，只能写“记录点未观察到”或未确认，不得写“不振荡”。运放数值只能取对应component_id中pin_voltage_v的label=out那一行，或analog_nodes中与该out node同名的列，禁止把相邻列或另一运放的数值复制过来。继电器的驱动只由COIL+/COIL-引脚决定，NC/COM/NO是接点而不是线圈；认定施密特触发器是“驱动继电器”前，必须确认其output node与同一继电器的COIL+或COIL-节点相同。
+受控源验证必须分别建立完整量纲证据：VCVS=V/V、VCCS=A/V、CCVS=V/A、CCCS=A/A；空间象限只能按明确坐标/标签绑定，不能按返回顺序猜类型。电流输出必须读取对应支路电流，不能用端电压冒充电流，也不能虚构未查询的负载电阻后用欧姆定律倒算。measurements.digital只是数字引脚的0/1/X/Z状态，不是模拟电压或电流；模拟表计必须读measurements.voltage_across_0_to_1.real或measurements.derived_current_0_to_1.real等带量纲字段。对同一组元件，一次circuit_query_many已返回query_coverage.complete=true后，空间查询即已完成；projection_truncated只是展示裁剪，不得将同一集合换序、拆批或重发来补图。若geometry_authoritative/unambiguous不成立，就写象限绑定未确认，改用明确类型、引脚与测量绑定；成功DC/TR后不返回重查空间或正文，除非仍缺一个可用单次窄查询绑定的具体测量。
+最终答案从第一个可见字符起使用用户的语言。'''
+
+
 CPU_ACCEPTANCE_SYSTEM = '''SERVER_CPU_ACCEPTANCE_PROTOCOL（仅当前CPU任务）：
 - task_plan是持久化导航，不是工具权限闸门；workspace read/edit/write和仿真在每个正常轮次都可使用。社区正文和电路事实使用各自的窄/原生工具，不通过原始归档分页。
+- 元件总数、D触发器数量、门网络存在或空间分组只能证明结构统计，不能单独证明它们分别构成取指/译码/执行/写回四级，也不能证明冒险等待、跳转冲刷或并行推进已经实现。只有标签或逐级连通/时序证据才能绑定这些功能；目标诊断在求解前阻断时，最终答案不得把作者介绍改写成“结构上已有对应网络”。
 - 当用户要求从头设计RV32I教学CPU时，第一个设计文件必须直接实现模块 aurex_rv32i_teaching，端口为：
   module aurex_rv32i_teaching(input clk,rst, output [31:0] imem_addr, input [31:0] imem_rdata, output dmem_we, output [31:0] dmem_addr,dmem_wdata, input [31:0] dmem_rdata, output halted,trap, input [4:0] debug_reg_addr, output [31:0] debug_reg_data);
 - 创建工作区后，首个功能仿真必须是 hdl_simulate(profile="rv32i_teaching_v1", workspace_id=..., workspace_revision=...)。该profile自带独立测试台；在它通过前不要先写custom测试台，也不要自创简化opcode。
@@ -104,6 +143,41 @@ CPU_ACCEPTANCE_SYSTEM = '''SERVER_CPU_ACCEPTANCE_PROTOCOL（仅当前CPU任务�
 - 若同一设计源hash已在固定profile中verified=true，后续custom测试失败时不得因此改CPU源文件；先审计自写测试台的指令编码、复位时序、采样边沿和存储器映射。PC/数据地址是字节地址，32位word数组须用addr>>2索引，不能直接用addr的低位；时序寄存器的期望值在negedge或非阻塞赋值生效后采样。补充测试必须从标准RV32I位域独立核对每个指令word，不从注释猜常量。
 - 在已有workspace上添加custom补充测试时，先用hdl_workspace_write写入role=testbench文件并取得新revision，再调用hdl_simulate(profile="custom", workspace_id=..., workspace_revision=..., top="测试台模块名", design_top="aurex_rv32i_teaching")；绝不能在同一次hdl_simulate里同时传workspace_id和files。补充抽样保持很小，通常只核对1到2个固定profile之外的边界事实。若用基础算术作烟雾测试，标准编码示例为：ADDI x1,x0,5 = 32'h00500093；ADDI x2,x0,3 = 32'h00300113；ADD x3,x1,x2 = 32'h002081b3；SUB x4,x1,x2 = 32'h40208233。必须按rd/rs1/rs2位域重新核对，不能靠增加等待周期修复写错的机器码。测试台连续设置debug_reg_addr后不能同一delta内立即检查debug_reg_data；每次改变选择器后先#1等待组合输出稳定。本地编译/仿真日志和当前测试台足以定位时，不转去外部搜索猜测仿真器bug。
 - 只有固定profile的 verified=true 且具体case通过才能关闭主验证计划项。custom测试台可在此后作用户需要的补充证据。'''
+
+
+EXISTING_CPU_VERIFICATION_SYSTEM = '''SERVER_EXISTING_CPU_VERIFICATION_PROTOCOL（仅当前已有CPU/流水线存档的验证任务）：
+- 这是已有电路证据审计，不是从头设计RV32I，也不进入HDL教学CPU固定profile流程。先对原存档调用一次circuit_inspect(interface_only=true)，保存其精确path、输入/输出ref、标签和节点。
+- 若接口没有能绑定功能的语义标签，或用户/作者没有给出独立的预期输入输出，接口后的首个电路检查必须是且只需一次circuit_diagnose(mode="preflight", path=原精确path)；不得先按C/N编号调用circuit_inspect或circuit_query_many漫游查找PC、寄存器、时钟、流水级或控制网络。
+- preflight之后，只有接口中已有1到2个明确输出ref/ID且它们直接对应用户要核验的主张时，才以这些输出为targets调用一次circuit_diagnose(mode="slice")。不要把诊断报告中的故障节点当targets，也不要为了凑targets枚举D触发器或节点。
+- 若没有独立预期，或接口/目标slice仍无法把可观察端口绑定到“取指/译码/执行/写回、冒险、冲刷”等具体主张，立即给出INCONCLUSIVE并列明已确认的接口/诊断事实；不要继续扫C/N范围，也不要用元件数量、D触发器/门数量、空间顺序或共同clock节点推断四级流水线。
+- task_plan中的“定位各级/枚举节点/补全所有连线”只是可舍弃的候选导航。它与本协议冲突或不能产生独立可判定证据时，直接舍弃并转向上述诊断或有界结论，不为关闭计划项继续查询。'''
+
+
+CONTROLLED_SOURCE_VERIFICATION_SYSTEM = '''SERVER_CONTROLLED_SOURCE_VERIFICATION_PROTOCOL（仅当前已有受控源实验的验证任务）：
+- 这是有界黑盒合同测试，不是多阶段调查：本任务不调用task_plan，也不为四个象限创建分阶段计划。如历史中已有计划，它只是可丢弃导航，不得为逐项关闭计划继续查询。
+- 把原实验当作黑盒合同验证：只从用户/作者给出的独立预期、外部激励源和外部表计/输出建立输入→输出关系，不从内部元件数量或几何顺序猜电路功能。interface_only最多一次，controls_only最多一次。
+- 首轮已经带入完整标题和正文；不再调用plar_get_summary重读它们。本请求没有要求操作开关时，也不读controls_only。取得.sav后直接做一次DC，不在求解前查C/N编号。
+- 本任务不需要空间象限来验证数值，因此不得请求spatial字段或with_image，也不得分页查看原理图。成功DC后，对state_path只调用一次circuit_query_many：queries固定为["Multimeter","Current Source","Logic Input","No Gate"]，limit=8，fields固定为["pins","edit.i","edit.r","measurements.voltage","measurements.voltage_across_0_to_1.real","measurements.derived_current_0_to_1.real"]；不要假设导入后仍存在名为“Voltage Source”的原件。模拟量使用measurements.voltage、measurements.voltage_across_0_to_1.real或measurements.derived_current_0_to_1.real；measurements.digital只是数字引脚的0/1/X/Z，绝不能用来读模拟电压/电流。该批查返回后，无论个别语义名是否无匹配、fields、all、has_more、projection_truncated如何，都必须基于成功行立即给出按source_ref排列的有界结论；紧接着的模型轮次必须直接输出最终正文且不得产生任何tool_calls，包括task_plan。不得调用任何更多电路工具，不得换字段、换序、拆批或重查同组C/N；禁止按C编号枚举内部运放、电阻、辅助源或逐节点恢复整张网表。
+- 最终表格中的每个输入值、输出值、正负号和source_ref必须逐项来自上述同一批结果；电流源输入必须使用对应行的edit.i，不能从标题、位置或增益反推。只允许在抄录这些原始值以后计算输出/输入比，禁止为了匹配k而同时倍增、改号或交换输入输出。电流表输出直接引用measurements.derived_current_0_to_1.real；不得把它说成由假定1Ω负载换算，若提及分流电阻只能逐字使用同一行的edit.r（物实mode=7表计导入值通常为1e-9Ω）。renderer的ref是本次渲染编号，引用原存档元件时只用稳定的source_ref。按source_ref逐行报告；若资料不能把某行唯一绑定到VCVS/VCCS/CCVS/CCCS，就把该行或类型写成INCONCLUSIVE，绝不为确认象限再查图或扫网表。
+- 整个验证合计1到2次DC/TR：一次求解可同时读取四象限；只在同一独立控制量的第二个设置对比确有必要时再做第二次。第一次成功DC/TR后不再回到内部结构检索；已绑定的直接给出比值，未绑定的立即写INCONCLUSIVE。工具执行成功不是功能通过；最终只报告实际施加的输入、实测输出、所得比值和未覆盖范围。
+- 四类受控源必须使用正确量纲：VCVS检验Vout/Vcontrol（V/V，无量纲）；VCCS检验Iout/Vcontrol（A/V，即S）；CCVS检验Vout/Icontrol（V/A，即Ω）；CCCS检验Iout/Icontrol（A/A，无量纲）。不得用假设负载把电压反推电流后冒充实测，也不得把四类各自不完整的一项拼成全部通过。
+- 若某类的外部控制端、输出端、极性/参考方向或独立预期无法从正文、接口和一次有界消歧中绑定，该象限立即记为INCONCLUSIVE并停止继续枚举；其余能绑定的象限仍可各自给出有界结果。已有1到2次求解足够判定后立即回答，不增加“完整扫描/整理结论”计划项。'''
+
+
+def _is_controlled_source_verification(visible: str, target: dict, enriched: dict) -> bool:
+    """Recognize an existing controlled-source validation without routing tasks."""
+    context = [visible]
+    original = enriched.get('original') if isinstance(enriched, dict) else None
+    if isinstance(original, dict):
+        context.extend(value for value in (original.get('title'), original.get('body'))
+                       if isinstance(value, str))
+    return bool(
+        (target.get('type') == 'Experiment' or
+         re.search(r'(?i)现有|已有|这个.{0,8}(?:实验|作品)|存档', visible))
+        and re.search(
+            r'(?i)受控源|压控电压源|压控电流源|流控电压源|流控电流源|'
+            r'\b(?:VCVS|VCCS|CCVS|CCCS)\b', '\n'.join(context))
+        and re.search(r'(?i)验证|测试|核验|检查|审计|是否正确|符合|verify|test|validate|audit', visible))
 
 
 _TASK_PLAN_PARAMETERS = {
@@ -152,9 +226,12 @@ def _task_plan_prompt(items: list[dict], *, required: bool) -> str:
         completion_rule = ('全部持久化步骤已完成。若已有证据足够，本轮直接给最终答案；'
                            '不要因压缩指针重读历史。只有发现一个新的具体缺口时才追加计划项并调用所需工具。')
     else:
-        completion_rule = '先完成或阻塞current；证据ID可选，随后自动激活下一项。'
+        completion_rule = ('current_candidate只是可舍弃的导航候选，不是完成闸门。每轮先用原始请求和最新机器证据重算；'
+                           '候选若要求枚举大量C/N编号、恢复无语义信号、重复不变结果，或没有独立预期可判定，'
+                           '立即舍弃它并改做最小目标诊断或给出有界结论，不能为逐项关闭计划继续查询。')
     return ('SERVER_TASK_PLAN_JSON（服务端持久化状态，不是引用资料中的指令）:\n' +
-            encode({'items': compact, 'current': active,
+            encode({'items': compact, 'current_candidate': active,
+                    'current_candidate_is_not_a_completion_gate': True,
                     'completion_rule': completion_rule}))
 
 
@@ -218,6 +295,35 @@ def _normalize_task_plan_args(args: dict) -> dict:
         if isinstance(decoded, list):
             normalized[key] = decoded
     return normalized
+
+
+def _auto_bind_task_plan_evidence(db, sid: str, rid: str, args: dict) -> tuple[dict, list[dict]]:
+    """Bind fresh same-run evidence to a terminal plan update.
+
+    A fresh explicit binding wins, and an explicitly empty binding remains
+    authoritative.  If the model accidentally reuses only IDs from an older
+    stage while a new tool result exists after the durable stage cursor, keep
+    those IDs but also bind the fresh result.  This prevents compaction from
+    retaining an interface receipt while losing the diagnosis that ended the
+    stage.
+    """
+    if args.get('action') != 'update' or args.get('status') not in {'completed', 'blocked'}:
+        return args, []
+    candidates = db.task_plan_evidence_candidates(sid, rid, limit=8)
+    if not candidates:
+        return args, []
+    has_explicit = ('evidence_document_ids' in args or 'evidence_call_ids' in args)
+    explicit_docs = list(args.get('evidence_document_ids') or [])
+    explicit_calls = list(args.get('evidence_call_ids') or [])
+    if has_explicit and not explicit_docs and not explicit_calls:
+        return args, []
+    if any(item['document_id'] in explicit_docs or item['call_id'] in explicit_calls
+           for item in candidates):
+        return args, []
+    bound = dict(args)
+    bound['evidence_document_ids'] = list(dict.fromkeys(
+        explicit_docs + [item['document_id'] for item in candidates]))
+    return bound, candidates
 
 
 def _latest_fixed_cpu_pass(db, sid: str, rid: str) -> dict | None:
@@ -735,7 +841,10 @@ class SessionAgent:
                 'description': ('Create, inspect, append, or advance this task\'s durable execution plan. '
                     'Use it for multi-step design, simulation, verification, and complex investigation. '
                     'The plan survives compaction and service restarts. Evidence IDs are optional because tool outcomes '
-                    'are already durable; the next pending item is activated automatically.'),
+                    'are already durable; the next pending item is activated automatically. This is navigation only, '
+                    'not a completion gate: never call task_plan in consecutive model turns, never walk through old '
+                    'items merely to mark them completed, and never call it after sufficient domain evidence instead '
+                    'of giving the final answer. A final answer may leave plan items open.'),
                 'parameters': _TASK_PLAN_PARAMETERS}}
             from .subagent_runtime import SPAWN_SUBAGENT_TOOL
             schemas += [
@@ -750,11 +859,22 @@ class SessionAgent:
             recent_hdl_testbench_failures = deque(maxlen=8)
             recent_assistant_narration = deque(maxlen=8)
             completed_replay_safe_calls = _durable_completed_calls(self.db, sid, rid)
-            cpu_verification = bool(re.search(r'(?i)cpu|处理器|中央处理器', visible))
+            cpu_task = bool(re.search(
+                r'(?i)cpu|处理器|中央处理器|流水线|pipeline|rv32i|risc-?v', visible))
+            cpu_from_scratch = bool(re.search(
+                r'(?i)从头|新建|创建(?:一个|一颗|一套)?|设计并验证|'
+                r'(?:实现|制作|设计)(?:(?:一个|一颗|一套)\s*)?(?:rv32i|risc-?v|cpu|处理器)|'
+                r'(?:design|implement|build|create).{0,24}(?:rv32i|risc-?v|cpu)|from\s+scratch', visible))
+            existing_cpu_verification = bool(
+                cpu_task and not cpu_from_scratch and
+                (target.get('type') == 'Experiment' or
+                 re.search(r'(?i)验证|测试|检查|审计|现有|已有|这个|作品|存档|实验', visible)))
             rv32i_design_acceptance = bool(
-                cpu_verification
+                cpu_task and cpu_from_scratch
                 and re.search(r'(?i)rv32i|risc-?v', visible)
-                and re.search(r'(?i)设计|实现|制作|从头|design|implement|build|create', visible))
+            )
+            controlled_source_verification = _is_controlled_source_verification(
+                visible, target, enriched)
             # task_plan is always available and never mandatory. The model uses
             # it when a task genuinely has multiple durable steps.
             requires_task_plan = False
@@ -765,6 +885,60 @@ class SessionAgent:
             step = last_model_step
             clarification_answer_mode = False
             invalid_response_retries = 0
+            generation_recoveries = 0
+            generation_evidence = []
+            generation_seen_outcomes = set()
+            generation_notices = set()
+            # A normal tool-capable navigation turn is deliberately small.
+            # If it was actually composing a final answer, one same-agent
+            # answer-only retry gets the full configured/server allocation.
+            final_answer_recovery = False
+
+            def generation_notice(reason, **details):
+                # UI-only status: never prepend these periodic notices to the
+                # model prompt or create a second reviewing agent.
+                key = (step, reason)
+                if key not in generation_notices:
+                    generation_notices.add(key)
+                    emit('generation_notice', {'step': step, 'reason': reason, **details})
+
+            def recover_generation(reason):
+                nonlocal generation_recoveries
+                generation_recoveries += 1
+                generation_notice('recovery', cause=reason, attempt=generation_recoveries,
+                    message='单次模型响应未完成有效交接；部分工具未执行，正在依据已保存证据恢复。')
+                if generation_recoveries <= 2:
+                    return None
+                evidence = '\n'.join('- ' + item for item in generation_evidence[-6:])
+                answer = ('当前结论：INCONCLUSIVE（尚无法确认）。模型连续未完成有效交接，'
+                          '有限恢复后仍未取得新的工具证据，任务已停止；未执行半截工具调用，'
+                          '这不能证明电路或实验本身失败。')
+                if evidence:
+                    answer += '\n\n已保存的工具回执（不是未完成的模型推测）：\n' + evidence
+                remaining_plan = [str(item.get('title', ''))[:120]
+                    for item in self.db.task_plan(sid, rid)
+                    if item.get('status') in {'pending', 'in_progress'}][:3]
+                if remaining_plan:
+                    answer += '\n\n持久化计划中尚待完成：' + '；'.join(remaining_plan) + '。'
+                generation_notice('stopped', message='恢复未取得新证据，已保留真实回执并停止本任务。')
+                record = finalize_direct_answer(runtime, answer, self.db, sid, rid, emit, outcome='blocked')
+                emit('final_reply_once', {'outcome': 'blocked', 'message': '生成恢复已结束，仅交付一次有界结论。'})
+                return deliver_final(record)
+
+            def stop_final_answer_recovery(reason):
+                evidence = '\n'.join('- ' + item for item in generation_evidence[-6:])
+                answer = ('当前结论：INCONCLUSIVE（尚无法确认）。模型的最终答复专用恢复轮仍未形成完整答案，'
+                          f'已停止而没有执行任何半截工具调用（{reason}）。')
+                if evidence:
+                    answer += '\n\n已保存的工具回执：\n' + evidence
+                record = finalize_direct_answer(
+                    runtime, answer, self.db, sid, rid, emit, outcome='blocked')
+                emit('final_reply_once', {
+                    'outcome': 'blocked',
+                    'message': '最终答复专用恢复只执行一次；失败后已停止。',
+                })
+                return deliver_final(record)
+
             while True:
                 check_cancel()
                 step += 1
@@ -782,7 +956,7 @@ class SessionAgent:
                 # execution turn may need one fresh measurement or a precise
                 # correction.  Only an unresolved reference clarification
                 # deliberately runs without unrelated investigation tools.
-                model_tools = [] if clarification_only else schemas
+                model_tools = [] if (clarification_only or final_answer_recovery) else schemas
                 if clarification_only and not clarification_answer_mode:
                     model_tools = []
                 # Loop telemetry may add a brief navigation hint, but it never
@@ -793,12 +967,27 @@ class SessionAgent:
                 runtime_system = SYSTEM
                 if rv32i_design_acceptance:
                     runtime_system += '\n\n' + CPU_ACCEPTANCE_SYSTEM
+                elif existing_cpu_verification:
+                    runtime_system += '\n\n' + EXISTING_CPU_VERIFICATION_SYSTEM
                 if plan_prompt:
                     runtime_system += '\n\n' + plan_prompt
+                # Keep a task-specific evidence protocol after the durable
+                # plan.  The plan is advisory state; it must not override the
+                # bounded black-box contract on later turns or after compaction.
+                if controlled_source_verification:
+                    runtime_system += '\n\n' + CONTROLLED_SOURCE_VERIFICATION_SYSTEM
+                runtime_system += '\n\n' + TURN_HANDOFF
                 prompt = budget.messages(runtime_system, model_tools)
                 exposed_tool_names = {schema.get('function', {}).get('name') for schema in model_tools}
                 pending = {'text': '', 'reasoning': ''}
                 last_flush = time.monotonic()
+                generation_started = last_flush
+
+                def generation_tick():
+                    check_cancel()
+                    if time.monotonic() - generation_started >= 30:
+                        generation_notice('generating', thinking=thinking,
+                            message='模型仍在生成本次响应，尚未完成工具交接；已保存的任务与工具证据保持可查。')
 
                 def flush(force=False):
                     nonlocal last_flush
@@ -810,7 +999,7 @@ class SessionAgent:
                         last_flush = time.monotonic()
 
                 def delta(kind, text):
-                    check_cancel()
+                    generation_tick()
                     if kind == 'progress':
                         progress = _token_progress_event(text)
                         if progress is not None and not thinking and model_tools:
@@ -819,13 +1008,60 @@ class SessionAgent:
                     pending[kind] += text
                     flush()
 
-                thinking = bool(self.cfg.llm.enable_thinking and not completed_model_turn and step == last_model_step + 1)
-                emit('model_start', {'step': step, 'thinking': thinking})
+                first_context_turn = bool(
+                    not completed_model_turn and step == last_model_step + 1)
+                thinking = bool(self.cfg.llm.enable_thinking and first_context_turn)
+                remaining_output_tokens = max(
+                    1, budget.capacity - self.client.count(prompt, model_tools)
+                    - budget.policy.safety_tokens)
+                configured_output_tokens = self.cfg.llm.max_output_tokens
+                # null is intentional on the first full-context thinking turn
+                # and on the one answer-only recovery: VLLMClient omits
+                # max_tokens so no new 4K/32K hard truncation is introduced.
+                output_tokens = (min(configured_output_tokens,
+                                     remaining_output_tokens)
+                                 if configured_output_tokens is not None else None)
+                # Bound only post-first, no-thinking turns which can call
+                # tools.  This is a response-mode contract: it neither removes
+                # tools nor changes the task deadline/agent hierarchy.  The
+                # first full-context turn remains governed solely by the model
+                # and remaining context window.
+                bounded_agent_turn = bool(
+                    model_tools and not thinking and
+                    (completed_model_turn or step > last_model_step + 1))
+                generation_wall_timeout_sec = None
+                response_mode = ('final_answer_recovery' if final_answer_recovery else
+                    ('first_context_thinking' if thinking else
+                    ('first_context_no_thinking' if first_context_turn else
+                     ('bounded_tool_navigation' if bounded_agent_turn else 'unbounded_answer_only'))))
+                if bounded_agent_turn:
+                    output_tokens = min(
+                        output_tokens if output_tokens is not None else remaining_output_tokens,
+                        BOUNDED_AGENT_TURN_MAX_TOKENS)
+                    generation_wall_timeout_sec = BOUNDED_AGENT_TURN_WALL_TIMEOUT_SEC
+                if generation_recoveries and not final_answer_recovery:
+                    # Recovery asks for a focused handoff, not a second full
+                    # generation of the same oversized answer/source file.
+                    # Fresh tool evidence restores the normal allocation.
+                    output_tokens = min(
+                        output_tokens if output_tokens is not None else remaining_output_tokens,
+                        8192)
+                    if bounded_agent_turn:
+                        response_mode = 'bounded_agent_recovery'
+                emit('model_start', {
+                    'step': step,
+                    'thinking': thinking,
+                    'requested_max_tokens': output_tokens,
+                    'generation_wall_timeout_sec': generation_wall_timeout_sec,
+                    'response_mode': response_mode,
+                })
                 invalid_response = None
                 repetition_error = None
                 try:
                     reply = self.client.chat(prompt, tools=model_tools, thinking=thinking,
-                                             max_tokens=None, on_delta=delta)
+                                             max_tokens=output_tokens, on_delta=delta,
+                                             on_tick=generation_tick,
+                                             generation_timeout_sec=generation_wall_timeout_sec)
                 except InvalidToolCall as error:
                     # Transport completed, but the entire tool batch is invalid.
                     # Do not execute a valid prefix or replay the request here.
@@ -840,19 +1076,60 @@ class SessionAgent:
                 emit('model_end', {'step': step, 'usage': reply.usage, 'finish_reason': reply.finish_reason,
                                    'reasoning_characters': len(reply.reasoning), 'content_characters': len(reply.content)})
                 if repetition_error is not None:
-                    partial = self.db.document(sid, 'Mechanically repetitive model output (no tools executed)',
+                    guard_reason = repetition_error.progress.get('reason')
+                    navigation_timeout = guard_reason == 'generation_wall_timeout'
+                    partial = self.db.document(sid,
+                        ('Bounded model response timeout (no tools executed)' if navigation_timeout else
+                         'Mechanically repetitive model output (no tools executed)'),
                         encode({'diagnostic': repetition_error.diagnostic,
                                 'content': reply.content, 'tool_calls': reply.tool_calls,
                                 'progress': repetition_error.progress}))
-                    emit('generation_repetition_guard', {
+                    emit(('generation_navigation_guard' if navigation_timeout else
+                          'generation_repetition_guard'), {
                         'step': step, 'document_id': partial, 'executed': False,
-                        'reason': repetition_error.progress.get('reason'),
+                        'reason': guard_reason,
                         'generated_tokens': repetition_error.progress.get('generated_tokens'),
                         'max_same_token_run': repetition_error.progress.get('max_same_token_run'),
                         'max_exact_repeat': repetition_error.progress.get('max_exact_repeat'),
-                        'message': '当前单次模型输出触发极端机械重复熔断；未执行部分工具调用，任务和工作区保持。'})
+                        'tool_name': repetition_error.progress.get('tool_name', ''),
+                        'tool_argument_characters': repetition_error.progress.get(
+                            'tool_argument_characters', 0),
+                        'elapsed_seconds': repetition_error.progress.get('elapsed_seconds'),
+                        'request_elapsed_seconds': repetition_error.progress.get('request_elapsed_seconds'),
+                        'message': ('当前非思考工具导航响应达到单轮时间边界；未执行部分工具调用，任务和工作区保持。'
+                                    if navigation_timeout else
+                                    '当前单次模型输出触发极端机械重复熔断；未执行部分工具调用，任务和工作区保持。')})
+                    answer_handoff = bool(
+                        navigation_timeout and bounded_agent_turn and
+                        reply.content.strip() and not reply.tool_calls and
+                        not repetition_error.progress.get('tool_name') and
+                        not repetition_error.progress.get('tool_argument_characters'))
+                    if answer_handoff:
+                        emit('generation_final_answer_handoff', {
+                            'step': step, 'document_id': partial,
+                            'reason': 'bounded_navigation_timeout_with_text_only',
+                            'partial_delivered': False,
+                            'message': '候选最终答复触及工具导航边界；下一轮关闭工具并生成一次完整最终答复。',
+                        })
+                        self.db.message(sid, rid, {
+                            'role': 'user', '_attachment': True, 'content':
+                            '上一候选最终答复只有正文、没有任何工具调用，但被工具导航单轮边界截断。'
+                            '该半截正文仅作私有审计，不是已交付答案。本轮关闭工具和思考；只能依据同一原始请求、'
+                            '持久化计划与已完成工具证据，一次性给出完整最终答复，不再补查。'
+                        })
+                        final_answer_recovery = True
+                        continue
+                    if final_answer_recovery:
+                        return stop_final_answer_recovery(guard_reason or 'generation_guard')
+                    stopped = recover_generation(
+                        'generation_wall_timeout' if navigation_timeout else 'mechanical_repetition')
+                    if stopped is not None:
+                        return stopped
                     self.db.message(sid, rid, {'role': 'user', '_attachment': True, 'content':
-                        '上一条单次模型输出出现极端机械重复，已在流式生成中止。其部分正文与工具参数均未执行，'
+                        ('上一条非思考工具导航响应达到单轮时间边界，已关闭当前流。'
+                         if navigation_timeout else
+                         '上一条单次模型输出出现极端机械重复，已在流式生成中止。') +
+                        '其部分正文与工具参数均未执行，'
                         '不是任务失败或完成证据。从当前持久化task_plan、workspace revision和已完成工具结果继续，'
                         '下一轮只提交一个完整、聚焦的下一步工具调用；不要重建工作区或重复输出源码。'
                         f'被截断内容仅存档于document_id={partial}，不需要读取它。'})
@@ -860,18 +1137,42 @@ class SessionAgent:
                 if reply.finish_reason == 'length':
                     partial = self.db.document(sid, 'Interrupted model output (no tools executed)',
                                                encode({'content': reply.content, 'tool_calls': reply.tool_calls}))
+                    limit_progress = getattr(reply, 'generation_progress', None) or {}
                     emit('generation_continuation', {'step': step, 'document_id': partial,
+                         'reason': limit_progress.get('reason', 'max_tokens'),
+                         'tool_name': limit_progress.get('tool_name', ''),
+                         'tool_argument_characters': limit_progress.get(
+                             'tool_argument_characters', 0),
+                         'elapsed_seconds': limit_progress.get('elapsed_seconds'),
+                         'request_elapsed_seconds': limit_progress.get('request_elapsed_seconds'),
                          'message': 'Single response reached the model limit; task remains active. No partial tool call was executed.'})
+                    if bounded_agent_turn and reply.content.strip() and not reply.tool_calls:
+                        emit('generation_final_answer_handoff', {
+                            'step': step, 'document_id': partial,
+                            'reason': 'bounded_navigation_token_limit_with_text_only',
+                            'partial_delivered': False,
+                            'message': '候选最终答复触及工具导航token边界；下一轮关闭工具并生成一次完整最终答复。',
+                        })
+                        self.db.message(sid, rid, {
+                            'role': 'user', '_attachment': True, 'content':
+                            '上一候选最终答复只有正文、没有任何工具调用，但被工具导航单轮token边界截断。'
+                            '该半截正文仅作私有审计，不是已交付答案。本轮关闭工具和思考；只能依据同一原始请求、'
+                            '持久化计划与已完成工具证据，一次性给出完整最终答复，不再补查。'
+                        })
+                        final_answer_recovery = True
+                        continue
+                    if final_answer_recovery:
+                        return stop_final_answer_recovery('max_tokens')
+                    stopped = recover_generation('length')
+                    if stopped is not None:
+                        return stopped
                     self.db.message(sid, rid, {'role': 'user', '_attachment': True, 'content':
                         '上一条模型输出触及单次响应/上下文上限，任务并未完成，该响应中的工具均未执行。'
-                        '继续原任务，调用下一步所需的工具并根据真实结果推进，不要因为单次输出限制收尾。'
+                        '依据已保存的真实证据，选择一个聚焦工具调用，或直接给出有依据的简洁结论；'
+                        '大型HDL应在现有工作区分片编辑，勿重新输出整份源码。恢复窗口至多8192 token，'
+                        '没有新证据时恢复次数有限；无法确认就说明未验证范围，不把推测当作事实。'
                         f'未完成的正式输出与工具参数仅归档到审计document_id={partial}，不向模型回放；不要假定其内容完整有效。'})
-                    if not reply.tool_calls:
-                        continue
-                    # Retrying the same oversized tool batch can consume the
-                    # full model window forever. Review the next meaningful
-                    # action, not a task budget and not a forced final answer.
-                    invalid_response = 'Single model response ended with truncated, unexecuted tool calls'
+                    continue
                 candidate_draft = None
                 if invalid_response is None and reply.tool_calls:
                     ids = [call.get('id') for call in reply.tool_calls]
@@ -919,8 +1220,13 @@ class SessionAgent:
                     emit('execution_recovery', {'document_id': rejected, 'executed': False,
                         'method': 'same_agent_retry_from_recorded_evidence', 'task_limit_applied': False,
                         'clarification_only': clarification_only})
-                if (not reply.tool_calls and not reply.content.strip() and reply.reasoning
-                        and thinking and candidate_draft is None):
+                if (not reply.tool_calls and not reply.content.strip()
+                        and candidate_draft is None):
+                    if final_answer_recovery:
+                        return stop_final_answer_recovery('empty_answer')
+                    stopped = recover_generation('empty_handoff')
+                    if stopped is not None:
+                        return stopped
                     # Some reasoning models end a nominally successful stream
                     # after private analysis without handing off an answer or
                     # tool call. Treat that as an incomplete first-turn
@@ -938,6 +1244,8 @@ class SessionAgent:
                     # the diagnostic and ask the same execution agent for a
                     # fresh complete response; never hand the diagnostic to a
                     # another model or post it as the public answer.
+                    if final_answer_recovery:
+                        return stop_final_answer_recovery('invalid_answer_only_response')
                     invalid_response_retries += 1
                     if clarification_only:
                         clarification_answer_mode = True
@@ -1056,6 +1364,7 @@ class SessionAgent:
                 inspection_recovery = None
                 analysis_barrier_recovery = None
                 hdl_testbench_recovery = None
+                circuit_repeat_recovery = None
                 for call in reply.tool_calls:
                     check_cancel()
                     name = call['function']['name']
@@ -1088,7 +1397,21 @@ class SessionAgent:
                         if name == 'task_plan':
                             import jsonschema
                             jsonschema.validate(args, _TASK_PLAN_PARAMETERS)
+                            args, auto_bound_evidence = _auto_bind_task_plan_evidence(
+                                self.db, sid, rid, args)
                             data = _mutate_task_plan(self.db, sid, rid, args)
+                            if auto_bound_evidence:
+                                emit('task_plan_evidence_auto_bound', {
+                                    'item_id': args.get('id'),
+                                    'evidence_document_ids': [item['document_id']
+                                                              for item in auto_bound_evidence],
+                                    'evidence_call_ids': [item['call_id']
+                                                          for item in auto_bound_evidence],
+                                    'candidate_limit': 8,
+                                    'source': 'successful_same_run_tools_since_last_plan_change',
+                                    'message': ('模型结束计划项时未传证据字段；控制器已自动绑定本任务'
+                                                '当前计划阶段内的新鲜成功工具回执。'),
+                                })
                             emit('task_plan_updated', {
                                 'action': args.get('action'), 'current': data.get('current'),
                                 'remaining': data.get('remaining'), 'items': data.get('items')})
@@ -1147,6 +1470,20 @@ class SessionAgent:
                     # Equal parameters do not imply equal live results. Execute
                     # normally; repeated identical outcomes only merit a hint.
                     outcome_signature = signature + _progress_fingerprint(name, {'ok': ok, 'data': data})
+                    # Re-reading remains legal, but an unchanged receipt (or a
+                    # plan edit) cannot replenish failed-generation retries.
+                    if ok and name != 'task_plan' and outcome_signature not in generation_seen_outcomes:
+                        generation_seen_outcomes.add(outcome_signature)
+                        generation_recoveries = 0
+                        invalid_response_retries = 0
+                        receipt = {'tool': name, 'ok': True}
+                        if isinstance(data, dict):
+                            for field in ('status', 'execution', 'settled', 'verified', 'error',
+                                          'reason', 'measurement_source', 'value', 'workspace_id', 'revision'):
+                                if field in data:
+                                    receipt[field] = data[field]
+                        generation_evidence.append(encode(receipt)[:360])
+                        generation_evidence[:] = generation_evidence[-6:]
                     repeats = repeats + 1 if outcome_signature == last_signature else 0
                     last_signature = outcome_signature
                     is_read = name in {'circuit_read_trace', 'circuit_read_stimulus'}
@@ -1158,12 +1495,25 @@ class SessionAgent:
                     # circuit snapshots, ignoring only artifact filenames.
                     # This still executes every call and only requests a hint;
                     # ordinary live tools retain consecutive-result semantics.
-                    if name in {'circuit_analyze', 'circuit_create', 'circuit_edit', 'circuit_inspect'}:
+                    if name in {'circuit_analyze', 'circuit_create', 'circuit_edit',
+                                'circuit_inspect', 'circuit_query_many'}:
                         recent_circuit_outcomes.append(outcome_signature)
-                        if recent_circuit_outcomes.count(outcome_signature) >= 3:
+                        aba_cycle = (
+                            len(recent_circuit_outcomes) >= 3 and
+                            recent_circuit_outcomes[-1] == recent_circuit_outcomes[-3] and
+                            recent_circuit_outcomes[-1] != recent_circuit_outcomes[-2])
+                        repeated_snapshot = recent_circuit_outcomes.count(outcome_signature) >= 3
+                        if aba_cycle or repeated_snapshot:
                             assess_progress = True
-                            recent_circuit_outcomes.clear()
-                            recent_circuit_outcomes.append(outcome_signature)
+                            circuit_repeat_recovery = {
+                                'tool': name,
+                                'pattern': 'A-B-A' if aba_cycle else 'repeated_snapshot',
+                                'unchanged_result_is_not_new_evidence': True,
+                                'tools_remain_enabled': True,
+                            }
+                            if repeated_snapshot:
+                                recent_circuit_outcomes.clear()
+                                recent_circuit_outcomes.append(outcome_signature)
                     if name == 'circuit_analyze':
                         if ok:
                             recent_analysis_failures.clear()
@@ -1307,14 +1657,22 @@ class SessionAgent:
                         '不要为此修改imem驱动方式或联网猜测Icarus bug；随后只做一次小范围测试台修正和复测。'
                         '所有workspace与仿真工具仍可使用。'
                         if hdl_testbench_recovery else '')
+                    circuit_repeat_guidance = (
+                        '检测到电路调用结果形成A-B-A回返或多次相同快照。工具仍然允许再次调用，但在输入文件、'
+                        'revision、参数、激励和实时状态均未变化时，完整重复结果不能当作新证据，也不能据此推进或关闭计划。'
+                        '请复用首次回执，改做一个能改变判定的目标诊断/仿真；若现有证据已经达到终局，立即回答。'
+                        if circuit_repeat_recovery else '')
                     emit('loop_recovery', {'method': 'same_agent_navigation_hint',
                         **({'inspection_failure_group': inspection_recovery} if inspection_recovery else {}),
                         **({'circuit_modeling_barrier': analysis_barrier_recovery} if analysis_barrier_recovery else {}),
                         **({'hdl_testbench_failures': hdl_testbench_recovery} if hdl_testbench_recovery else {}),
+                        **({'circuit_repeated_result': circuit_repeat_recovery} if circuit_repeat_recovery else {}),
                         'message': inspection_guidance + analysis_barrier_guidance + hdl_testbench_guidance +
+                            circuit_repeat_guidance +
                             '检测到重复结果或同类工具失败。本轮重新确认下一步；任务不按重复次数结束，工具不会因此禁用。'})
                     self.db.message(sid, rid, {'role': 'user', '_attachment': True, 'content':
-                        inspection_guidance + analysis_barrier_guidance + hdl_testbench_guidance + '当前调查返回了重复结果或同类失败。先判断已有证据是否足够，再选择下一步：'
+                        inspection_guidance + analysis_barrier_guidance + hdl_testbench_guidance +
+                        circuit_repeat_guidance + '当前调查返回了重复结果或同类失败。先判断已有证据是否足够，再选择下一步：'
                         '可以直接回答、更新task_plan、调用新工具，或为确认实时状态/修改结果而重复同一调用。'
                         '所有正常工具仍可使用；不得把未执行的验证声称为成功。'})
                 if new_images:

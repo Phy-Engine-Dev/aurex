@@ -19,6 +19,16 @@ def main() -> int:
         print(json.dumps(result, allow_nan=False))
         return 0
     except Exception as error:
+        # Preserve bounded machine-readable settle evidence across the worker
+        # boundary. Prefixing/truncating stderr could otherwise remove the
+        # failure reason or the exact conflicting drivers.
+        try:
+            diagnostic = json.loads(str(error))
+        except (ValueError, TypeError):
+            diagnostic = None
+        if isinstance(diagnostic, dict) and diagnostic.get("execution_status") == "failed" and "digital_settle" in diagnostic:
+            print(json.dumps({"error": diagnostic}, allow_nan=False))
+            return 1
         print(f"{type(error).__name__}: {error}", file=sys.stderr)
         return 1
 

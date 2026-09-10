@@ -36,6 +36,9 @@ class ModelReply:
     tool_calls: list[dict]
     usage: dict
     finish_reason: str
+    # Safe per-response metadata only.  Partial content/tool arguments stay in
+    # the fields above for private archival and are never copied here.
+    generation_progress: dict | None = None
 
 
 class InvalidToolCall(ModelError):
@@ -53,7 +56,7 @@ class InvalidToolCall(ModelError):
 
 
 class DegenerateGeneration(ModelError):
-    """One streamed response became mechanically repetitive.
+    """One streamed response became mechanically repetitive or hit its bound.
 
     This aborts only the current generation and never executes its partial tool
     call. The agent can re-orient from durable task/workspace state on its next
@@ -185,8 +188,10 @@ class VLLMClient:
         """Input-side headroom, not a task budget or a generated-token limit.
 
         OpenAI-compatible model listings often publish only the total window.
-        Without an explicit request limit, retain a fraction of that window for
-        output; chat() still leaves the actual generation limit to the server.
+        Without an explicit configured limit, retain a fraction of that window
+        for output. The agent may intentionally pass explicit None on the
+        first full-context/final-answer response while separately bounding
+        post-first tool navigation; direct callers retain the same distinction.
         """
         configured = self.config.max_output_tokens
         return int(configured) if configured is not None else max(1, capacity // 4)
@@ -367,12 +372,33 @@ class VLLMClient:
     def chat(self, messages: list[dict], *, tools: list[dict] | None = None,
              thinking: bool | None = None,
              max_tokens: int | None | object = _DEFAULT_MAX_TOKENS,
+             generation_timeout_sec: float | None = None,
              on_delta: Callable[[str, str], None] | None = None,
              on_tick: Callable[[], None] | None = None) -> ModelReply:
+        if (generation_timeout_sec is not None and
+                (isinstance(generation_timeout_sec, bool) or
+                 not isinstance(generation_timeout_sec, (int, float)) or
+                 generation_timeout_sec <= 0)):
+            raise ValueError('generation_timeout_sec must be a positive number or None')
+        effective_thinking = self.config.enable_thinking if thinking is None else thinking
         payload = {'model': self.config.model, 'messages': messages,
                    'stream': True, 'stream_options': {'include_usage': True},
-                   'temperature': self.config.temperature,
-                   'chat_template_kwargs': self._template_kwargs(self.config.enable_thinking if thinking is None else thinking)}
+                   'chat_template_kwargs': self._template_kwargs(effective_thinking)}
+        # Qwen's shipped generation_config is part of its reasoning recipe.
+        # A low application temperature made long thinking responses repeatedly
+        # revisit the same branch even though the stream was neither stalled nor
+        # mechanically repetitive.  Preserve the configured deterministic
+        # temperature for no-thinking controller/summary turns, while allowing
+        # thinking turns to use the model-native sampler.  This is deliberately
+        # not a token or wall-clock bound: difficult first turns may still reason
+        # for as long as the task/context limits allow.
+        if effective_thinking:
+            thinking_frequency_penalty = getattr(
+                self.config, 'thinking_frequency_penalty', 0.0)
+            if thinking_frequency_penalty:
+                payload['frequency_penalty'] = thinking_frequency_penalty
+        else:
+            payload['temperature'] = self.config.temperature
         requested_limit = (self.config.max_output_tokens
                            if max_tokens is _DEFAULT_MAX_TOKENS else max_tokens)
         if requested_limit is not None:
@@ -394,9 +420,63 @@ class VLLMClient:
         finish = ''
         stream_done = False
         on_tick = on_tick if on_tick is not None else getattr(self, 'on_tick', None)
-        lines = self._stream_lines(payload, on_tick=on_tick)
+        request_started = time.monotonic()
+        generation_activity_started = None
+
+        def partial_reply(finish_reason: str) -> ModelReply:
+            # A partial call is retained only for private audit/recovery.  The
+            # caller must never execute it because its JSON may end mid-token.
+            return ModelReply(
+                ''.join(content), ''.join(reasoning),
+                [calls[i] for i in sorted(calls)], dict(usage), finish_reason)
+
+        def generation_bound_progress(reason: str, now: float) -> dict:
+            # Never expose argument text, call IDs, model text or token IDs in
+            # liveness telemetry.  Parallel tool calls are disabled, but sum
+            # argument characters defensively if a provider streams several.
+            tool_name = ''
+            argument_characters = 0
+            for item in calls.values():
+                function = item.get('function') or {}
+                name = function.get('name')
+                if not tool_name and isinstance(name, str) and name:
+                    tool_name = name[:128]
+                arguments = function.get('arguments')
+                if isinstance(arguments, str):
+                    argument_characters += len(arguments)
+            activity_started = (generation_activity_started
+                                if generation_activity_started is not None else now)
+            return {
+                'reason': reason,
+                'tool_name': tool_name,
+                'tool_argument_characters': argument_characters,
+                'elapsed_seconds': round(max(0.0, now - activity_started), 3),
+                'request_elapsed_seconds': round(max(0.0, now - request_started), 3),
+            }
+
+        def transport_tick() -> None:
+            # User cancellation and the task's 1800s deadline remain
+            # authoritative over this much smaller per-response navigation
+            # bound.
+            if on_tick:
+                on_tick()
+            now = time.monotonic()
+            if (generation_timeout_sec is not None and
+                    generation_activity_started is not None and
+                    now - generation_activity_started >= generation_timeout_sec):
+                report = generation_bound_progress('generation_wall_timeout', now)
+                raise DegenerateGeneration(
+                    'Current bounded model response reached its wall timeout; '
+                    'its partial tool call was not executed',
+                    partial_reply('generation_timeout'), report)
+
+        lines = self._stream_lines(payload, on_tick=transport_tick)
         try:
             for line in lines:
+                # Test the wall bound even for transports that do not implement
+                # periodic on_tick callbacks, and before accepting another SSE
+                # fragment after the deadline.
+                transport_tick()
                 if not line or not line.startswith(b'data:'):
                     continue
                 raw = line[5:].strip()
@@ -409,13 +489,24 @@ class VLLMClient:
                 if packet.get('usage'):
                     usage = packet['usage']
                 for choice in packet.get('choices', []):
+                    delta = choice.get('delta') or {}
+                    has_activity = bool(
+                        choice.get('token_ids') or choice.get('finish_reason') or
+                        delta.get('content') or delta.get('reasoning_content') or
+                        delta.get('reasoning') or delta.get('tool_calls'))
+                    if has_activity and generation_activity_started is None:
+                        generation_activity_started = time.monotonic()
                     # n defaults to one. Count only this request's generated
                     # choice-zero delta IDs, never prompt_token_ids or logprobs.
                     choice_index = choice.get('index', 0)
                     if progress is not None and type(choice_index) is int and choice_index == 0:
                         progress.observe(choice.get('token_ids'))
                         degenerate = progress.degenerate_reason()
-                        if degenerate is not None:
+                        # Repeated source code, tables and arrays are legal
+                        # tool arguments. Token periodicity alone cannot tell
+                        # a large HDL payload from broken natural language.
+                        in_tool_payload = bool(calls or (choice.get('delta') or {}).get('tool_calls'))
+                        if degenerate is not None and not in_tool_payload:
                             update = progress.take(final=True)
                             report = json.loads(update) if update is not None else {}
                             if update is not None and on_delta:
@@ -431,7 +522,6 @@ class VLLMClient:
                         update = progress.take()
                         if update is not None and on_delta:
                             on_delta('progress', update)
-                    delta = choice.get('delta') or {}
                     if choice.get('finish_reason'):
                         finish = choice['finish_reason']
                     for name, target in [('content', content), ('reasoning_content', reasoning), ('reasoning', reasoning)]:
@@ -465,7 +555,10 @@ class VLLMClient:
         if finish not in {'stop', 'tool_calls', 'length'}:
             raise ModelError(f'vLLM response did not complete normally ({finish}); no tool was executed')
         ordered = [calls[i] for i in sorted(calls)]
-        reply = ModelReply(''.join(content), ''.join(reasoning), ordered, usage, finish)
+        generation_progress = (generation_bound_progress(
+            'max_tokens', time.monotonic()) if finish == 'length' else None)
+        reply = ModelReply(''.join(content), ''.join(reasoning), ordered, usage, finish,
+                           generation_progress)
         if finish != 'length':
             if bool(ordered) != (finish == 'tool_calls'):
                 raise InvalidToolCall('vLLM finish reason and tool calls disagree; no tool was executed', reply)

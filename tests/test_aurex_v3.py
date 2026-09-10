@@ -195,6 +195,9 @@ class SessionAgentTests(unittest.TestCase):
         self.assertIn('不得在内部循环重写同一份草稿', SYSTEM)
         self.assertIn('直接说“我不知道”或“目前无法确认”', SYSTEM)
         self.assertIn('不要再对同一目标调用plar_get_summary/plar_read_title/plar_read_body', SYSTEM)
+        self.assertIn('空间顺序、逻辑位序和激励列顺序相互独立', SYSTEM)
+        self.assertIn('使旧的逻辑位序绑定及其刺激表头失效', SYSTEM)
+        self.assertIn('不能只说“重新标注”“one-hot不受影响”', SYSTEM)
 
     def test_comment_context_defaults_are_independent(self):
         self.assertEqual(self.cfg.agent.community_max_related_post_comments, 16)
@@ -373,7 +376,7 @@ class SessionAgentTests(unittest.TestCase):
         self.assertIn('circuit_analyze', names)
         self.assertIn('spawn_subagent', names)
         self.assertNotIn('web_search', names)
-        self.assertIsNone(fake.requests[0][1]['max_tokens'])
+        self.assertEqual(fake.requests[0][1]['max_tokens'], 512)
         events = agent.db.events(sid)
         self.assertFalse(any(event['kind'] == 'compaction_start' for event in events))
         self.assertTrue(any(event['kind'] == 'cover_auto_loaded' for event in events))
@@ -437,7 +440,7 @@ class SessionAgentTests(unittest.TestCase):
         agent, fake = self.agent([reply("", reasoning="private reasoning marker", calls=[call], finish="tool_calls"), reply("Measured 5 V")], tools)
         result = agent.handle(user_text="Measure voltage")
         self.assertEqual([options["thinking"] for _, options in fake.requests], [True, False])
-        self.assertTrue(all(options["max_tokens"] is None for _, options in fake.requests))
+        self.assertTrue(all(options["max_tokens"] == 512 for _, options in fake.requests))
         self.assertEqual(result["answer"], "Measured 5 V")
         self.assertNotIn("private reasoning marker", json.dumps(agent.db.messages(result["session_id"])))
         self.assertNotIn("private reasoning marker", json.dumps(fake.requests[-1][0]))
@@ -454,7 +457,7 @@ class SessionAgentTests(unittest.TestCase):
         self.assertEqual(result["status"], "completed")
         self.assertEqual(result["answer"], "Recovered concise answer")
         self.assertEqual([options["thinking"] for _, options in fake.requests], [True, False])
-        self.assertTrue(all(options["max_tokens"] is None for _, options in fake.requests))
+        self.assertTrue(all(options["max_tokens"] == 512 for _, options in fake.requests))
         self.assertNotIn("private loop", json.dumps(fake.requests[1][0]))
         self.assertNotIn("private loop", json.dumps(agent.db.messages(result["session_id"])))
         events = agent.db.events(result["session_id"])
@@ -974,6 +977,8 @@ class TransportTests(unittest.TestCase):
         self.assertEqual(result.reasoning, "analysis")
         self.assertEqual(result.tool_calls[0]["function"]["arguments"], '{"x":1}')
         self.assertIs(post.call_args.args[0]["chat_template_kwargs"]["enable_thinking"], True)
+        self.assertNotIn("temperature", post.call_args.args[0])
+        self.assertNotIn("frequency_penalty", post.call_args.args[0])
 
     def test_missing_finish_reason_is_not_success(self):
         client = VLLMClient(LLMConfig())
@@ -987,7 +992,26 @@ class TransportTests(unittest.TestCase):
             client.chat([{"role": "user", "content": "question"}], thinking=True)
         body = post.call_args.args[0]
         self.assertNotIn("max_tokens", body)
+        self.assertNotIn("temperature", body)
+        self.assertNotIn("frequency_penalty", body)
         self.assertEqual(body["chat_template_kwargs"], {"enable_thinking": True})
+
+    def test_no_thinking_keeps_configured_controller_temperature(self):
+        client = VLLMClient(LLMConfig(temperature=0.2))
+        response = self.response([{"choices": [{"delta": {"content": "ok"}, "finish_reason": "stop"}]}])
+        with mock.patch.object(client, "_stream_lines", return_value=response) as post:
+            client.chat([{"role": "user", "content": "question"}], thinking=False)
+        self.assertEqual(post.call_args.args[0]["temperature"], 0.2)
+        self.assertNotIn("frequency_penalty", post.call_args.args[0])
+
+    def test_thinking_frequency_penalty_is_explicit_and_thinking_only(self):
+        client = VLLMClient(LLMConfig(thinking_frequency_penalty=0.3))
+        response = self.response([{"choices": [{"delta": {"content": "ok"},
+                                                  "finish_reason": "stop"}]}])
+        with mock.patch.object(client, "_stream_lines", return_value=response) as post:
+            client.chat([{"role": "user", "content": "question"}], thinking=True)
+        self.assertEqual(post.call_args.args[0]["frequency_penalty"], 0.3)
+        self.assertNotIn("temperature", post.call_args.args[0])
 
     def test_explicit_none_omits_configured_max_tokens_for_unbounded_thinking(self):
         config = LLMConfig(max_output_tokens=4096)

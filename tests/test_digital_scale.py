@@ -145,6 +145,12 @@ class DigitalScaleNativeTests(unittest.TestCase):
             self.assertEqual([r["step"] for r in page["steps"]], [7, 8, 9])
             self.assertEqual([r["digital"]["I0"] for r in page["steps"]], [[1], [0], [1]])
             self.assertTrue(page["has_more"])
+            selected = [f"I{index}" for index in range(11)]
+            combined = circuit_read_stimulus(self.runtime, {"path": str(path), "component_ids": selected,
+                                                              "offset": 0, "limit": 1})
+            self.assertEqual([component["id"] for component in combined["components"]], selected)
+            self.assertEqual([component["column"] for component in combined["components"]], list(range(11)))
+            self.assertEqual(list(combined["steps"][0]["digital"]), selected)
             detail = circuit_inspect(self.runtime, {"path": str(path), "focus_id": "I19", "limit": 1})
             self.assertEqual(detail["netlist"]["components"][0]["native"]["measurements"]["id"], "I19")
         self.assertEqual(path.read_bytes(), original)

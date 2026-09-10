@@ -13,6 +13,7 @@
 #include "operation.h"
 
 #include "../../circuits/MNA/mna.h"
+#include "../../circuits/digital/settle.h"
 
 namespace phy_engine::model
 {
@@ -54,6 +55,9 @@ namespace phy_engine::model
             virtual constexpr ::fast_io::u8string_view get_attribute_name(::std::size_t index) noexcept = 0;
 
             virtual constexpr ::phy_engine::model::pin_view generate_pin_view() noexcept = 0;
+            // 0 is a load, 1 a (possibly bidirectional) driver, -1 unknown.
+            // Dynamic modules override the static primitive interface table.
+            virtual constexpr int get_digital_pin_role(::std::size_t index) noexcept = 0;
             virtual constexpr ::fast_io::u8string_view get_model_name() noexcept = 0;
             virtual constexpr ::fast_io::u8string_view get_identification_name() noexcept = 0;
             virtual constexpr ::phy_engine::model::model_device_type get_device_type() noexcept = 0;
@@ -505,6 +509,14 @@ namespace phy_engine::model
             }
 
             virtual constexpr ::fast_io::u8string_view get_model_name() noexcept override { return rcvmod_type::model_name; }
+
+            virtual constexpr int get_digital_pin_role(::std::size_t index) noexcept override
+            {
+                if constexpr(requires { { m.digital_pin_role(index) } -> ::std::convertible_to<int>; })
+                    return m.digital_pin_role(index);
+                else
+                    return ::phy_engine::digital::pin_role(rcvmod_type::model_name,index);
+            }
 
             virtual constexpr ::fast_io::u8string_view get_identification_name() noexcept override { return rcvmod_type::identification_name; }
 

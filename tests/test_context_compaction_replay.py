@@ -111,6 +111,28 @@ class ReplayTests(unittest.TestCase):
         self.assertEqual(result['fields']['/data/type'], 'ToolError')
         self.assertNotIn('/data/netlist/components', result['sections'])
 
+    def test_stimulus_semantics_survive_projection_and_machine_evidence(self):
+        semantics = {'digital_ticks_per_frame': 1,
+            'ordering': 'set_all_inputs -> one_digital_tick_and_settle -> capture',
+            'physical_time_advanced': False,
+            'scope': 'Separate logical frames after baseline analysis.'}
+        data = {'state_path': '/immutable/result.pe-state.json',
+                'measurements': {'stimulus_semantics': semantics, 'stimulus_results': [],
+                                 'components': []}}
+        _, did, _, raw = self.tool('circuit_analyze', data)
+        projected = json.loads(self.budget.tool_document('analysis', raw, document_id=did,
+                                                       tool_name='circuit_analyze'))
+        self.assertEqual(projected['fields']['/data/measurements/stimulus_semantics'], semantics)
+        boundary = self.budget._journal_boundary()
+        capsule = self.budget._evidence_capsule(self.budget._journal_calls(boundary), boundary)
+        self.assertEqual(capsule['analysis_calls'][0]['stimulus_semantics'], semantics)
+        index = json.loads(self.budget._tool_index(boundary, 16000).split('\n', 1)[1])
+        self.assertEqual(index['machine_evidence']['analysis_outcome_refs'][0]['stimulus_semantics'], semantics)
+        facts = self.budget._recorded_facts({'data': data})
+        fact = next(row for row in facts if row['source_json_path'].endswith('.stimulus_semantics'))
+        self.assertEqual(fact['digital_ticks_per_frame'], 1)
+        self.assertIs(fact['physical_time_advanced'], False)
+
     def test_non_json_display_uses_raw_outcome_and_retains_source_documents(self):
         data = {'id': 'source-doc', 'offset': 9, 'total_chars': 90000, 'text': 'verbatim ' * 9000,
                 'json_pointer': '/module/ports', 'has_more': True}

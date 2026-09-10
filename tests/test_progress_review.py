@@ -4,11 +4,26 @@ import unittest
 from unittest import mock
 
 import test_aurex_v3 as support
+from aurex.session_agent import (_auto_bind_task_plan_evidence,
+                                 _is_controlled_source_verification,
+                                 _task_plan_prompt)
 from aurex.tools.registry import ToolRegistry, ToolSpec
 
 
 class ProgressReviewTests(unittest.TestCase):
-    def test_cpu_planning_first_turn_has_no_artificial_generation_cap(self):
+    def test_task_plan_current_is_a_discardable_candidate_not_a_gate(self):
+        prompt = _task_plan_prompt([{
+            'id': 'locate_pipeline', 'title': '枚举全部 C/N 定位四级流水线',
+            'status': 'in_progress', 'note': '', 'evidence_document_ids': [],
+        }], required=False)
+        payload = json.loads(prompt.split('\n', 1)[1])
+        self.assertNotIn('current', payload)
+        self.assertEqual(payload['current_candidate']['id'], 'locate_pipeline')
+        self.assertTrue(payload['current_candidate_is_not_a_completion_gate'])
+        self.assertIn('枚举大量C/N编号', payload['completion_rule'])
+        self.assertIn('立即舍弃', payload['completion_rule'])
+
+    def test_cpu_planning_first_turn_respects_configured_generation_allocation(self):
         tools = ToolRegistry()
         agent, fake = self.agent([support.reply('')], tools)
         sid = agent.db.session('cpu-planning-bound', source='admin')
@@ -32,7 +47,7 @@ class ProgressReviewTests(unittest.TestCase):
         fake.chat = chat
         result = agent.handle(user_text='设计并验证 RV32I CPU', session_id=sid, run_id=rid)
         self.assertTrue(result['cancelled'])
-        self.assertIsNone(fake.requests[0][1]['max_tokens'])
+        self.assertEqual(fake.requests[0][1]['max_tokens'], 512)
         first_prompt = json.dumps(fake.requests[0][0], ensure_ascii=False)
         self.assertIn('SERVER_CPU_ACCEPTANCE_PROTOCOL', first_prompt)
         self.assertIn('rv32i_teaching_v1', first_prompt)
@@ -42,6 +57,8 @@ class ProgressReviewTests(unittest.TestCase):
         self.assertIn('绝不能在同一次hdl_simulate里同时传workspace_id和files', first_prompt)
         self.assertIn("ADDI x1,x0,5 = 32'h00500093", first_prompt)
         self.assertIn('每次改变选择器后先#1', first_prompt)
+        self.assertIn('不能单独证明它们分别构成取指/译码/执行/写回四级', first_prompt)
+        self.assertIn('不得把作者介绍改写成“结构上已有对应网络”', first_prompt)
         first_tools = {schema['function']['name']
                        for schema in fake.requests[0][1]['tools']}
         self.assertIn('task_plan', first_tools)
@@ -51,6 +68,64 @@ class ProgressReviewTests(unittest.TestCase):
         self.assertNotIn('web_search', first_tools)
         self.assertFalse(any(event['kind'] == 'tool_limit_reached'
                              for event in agent.db.events(sid)))
+
+    def test_existing_cpu_verification_gets_preflight_before_navigation_protocol(self):
+        agent, fake = self.agent([support.reply('当前没有独立预期，结论为 INCONCLUSIVE。')])
+        result = agent.handle(user_text='测试这个现有 CPU 作品的流水线部分是否符合介绍。')
+        self.assertEqual(result['status'], 'completed')
+        first_prompt = json.dumps(fake.requests[0][0], ensure_ascii=False)
+        self.assertIn('SERVER_EXISTING_CPU_VERIFICATION_PROTOCOL', first_prompt)
+        self.assertNotIn('SERVER_CPU_ACCEPTANCE_PROTOCOL', first_prompt)
+        self.assertIn('circuit_diagnose(mode=\\"preflight\\"', first_prompt)
+        self.assertIn('不得先按C/N编号', first_prompt)
+        self.assertIn('立即给出INCONCLUSIVE', first_prompt)
+
+    def test_controlled_source_protocol_can_be_selected_from_existing_post_body(self):
+        target = {'type': 'Experiment', 'id': 'a' * 24}
+        enriched = {'original': {
+            'title': '四类受控源',
+            'body': '包含 VCVS、VCCS、CCVS 与 CCCS 的对照实验。',
+        }}
+        self.assertTrue(_is_controlled_source_verification(
+            '请验证这个实验是否符合介绍。', target, enriched))
+        self.assertFalse(_is_controlled_source_verification(
+            '请简单介绍这个实验。', target, enriched))
+        self.assertFalse(_is_controlled_source_verification(
+            '请验证这个实验。', target, {'original': {'title': '普通RC电路'}}))
+
+    def test_existing_controlled_source_verification_gets_black_box_protocol(self):
+        agent, fake = self.agent([support.reply('缺少独立预期的象限为 INCONCLUSIVE。')])
+        result = agent.handle(
+            user_text='测试这个现有受控源实验里的 VCVS、VCCS、CCVS、CCCS 是否正确。')
+        self.assertEqual(result['status'], 'completed')
+        first_prompt = json.dumps(fake.requests[0][0], ensure_ascii=False)
+        self.assertIn('SERVER_CONTROLLED_SOURCE_VERIFICATION_PROTOCOL', first_prompt)
+        self.assertIn('本任务不调用task_plan', first_prompt)
+        self.assertIn('interface_only最多一次', first_prompt)
+        self.assertIn('controls_only最多一次', first_prompt)
+        self.assertIn('不再调用plar_get_summary', first_prompt)
+        self.assertIn('成功DC后，对state_path只调用一次circuit_query_many', first_prompt)
+        self.assertIn('limit=8', first_prompt)
+        self.assertIn('measurements.voltage_across_0_to_1.real', first_prompt)
+        self.assertIn('measurements.derived_current_0_to_1.real', first_prompt)
+        self.assertIn('edit.i', first_prompt)
+        self.assertIn('edit.r', first_prompt)
+        self.assertIn('禁止为了匹配k而同时倍增', first_prompt)
+        self.assertIn('不得把它说成由假定1Ω负载换算', first_prompt)
+        self.assertIn('不得请求spatial字段或with_image', first_prompt)
+        self.assertIn('queries固定为', first_prompt)
+        self.assertIn('不得调用任何更多电路工具', first_prompt)
+        self.assertIn('measurements.digital只是数字引脚', first_prompt)
+        self.assertIn('measurements.voltage_across_0_to_1.real或measurements.derived_current_0_to_1.real', first_prompt)
+        self.assertIn('整个验证合计1到2次DC/TR', first_prompt)
+        self.assertIn('不得换字段、换序、拆批', first_prompt)
+        self.assertIn('第一次成功DC/TR后不再回到内部结构检索', first_prompt)
+        self.assertIn('Vout/Vcontrol（V/V，无量纲）', first_prompt)
+        self.assertIn('Iout/Vcontrol（A/V，即S）', first_prompt)
+        self.assertIn('Vout/Icontrol（V/A，即Ω）', first_prompt)
+        self.assertIn('Iout/Icontrol（A/A，无量纲）', first_prompt)
+        self.assertIn('禁止按C编号枚举内部运放、电阻', first_prompt)
+        self.assertIn('立即记为INCONCLUSIVE', first_prompt)
 
     setUp = support.SessionAgentTests.setUp
     agent = support.SessionAgentTests.agent
@@ -99,12 +174,200 @@ class ProgressReviewTests(unittest.TestCase):
         self.assertEqual(sum(event['kind'] == 'answer'
                              for event in agent.db.events(result['session_id'])), 1)
 
+    def test_completed_plan_auto_binds_fresh_successful_tool_evidence(self):
+        tools = ToolRegistry()
+        inspect = mock.Mock(return_value={'measurement_source': 'fresh solve', 'value': 5.0})
+        tools.register(ToolSpec('circuit_inspect', 'Inspect', {'type': 'object'}, inspect))
+
+        def call(cid, name, arguments):
+            return {'id': cid, 'type': 'function', 'function': {
+                'name': name, 'arguments': json.dumps(arguments)}}
+
+        outputs = [
+            support.reply('', calls=[call('plan-set', 'task_plan', {'action': 'set', 'items': [
+                {'id': 'inspect', 'title': '读取实际测量'}]})], finish='tool_calls'),
+            support.reply('', calls=[call('fresh', 'circuit_inspect', {})], finish='tool_calls'),
+            support.reply('', calls=[call('plan-done', 'task_plan', {
+                'action': 'update', 'id': 'inspect', 'status': 'completed',
+                'note': '测量完成。'})], finish='tool_calls'),
+            support.reply('实测值为 5。'),
+        ]
+        agent, fake = self.agent(outputs, tools)
+        fake.final_reviews = iter([{'outcome': 'completed', 'answer': '实测值为 5。'}])
+        result = agent.handle(user_text='读取并报告实际测量。')
+        outcome = agent.db.get_tool_outcome(result['session_id'], result['task_id'], 'fresh')
+        plan = agent.db.task_plan(result['session_id'], result['task_id'])
+        self.assertEqual(plan[0]['evidence_document_ids'], [outcome['document_id']])
+        events = [event for event in agent.db.events(result['session_id'], run_id=result['task_id'])
+                  if event['kind'] == 'task_plan_evidence_auto_bound']
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0]['data']['evidence_call_ids'], ['fresh'])
+        self.assertEqual(events[0]['data']['source'],
+                         'successful_same_run_tools_since_last_plan_change')
+
+    def test_blocked_plan_auto_binds_the_fresh_diagnostic_evidence(self):
+        tools = ToolRegistry()
+        diagnose = mock.Mock(return_value={
+            'verdict': 'INCONCLUSIVE',
+            'failure_class': 'invalid_netlist_or_drive_contract',
+            'execution': {'started': False},
+        })
+        tools.register(ToolSpec('circuit_diagnose', 'Diagnose', {'type': 'object'}, diagnose))
+
+        def call(cid, name, arguments):
+            return {'id': cid, 'type': 'function', 'function': {
+                'name': name, 'arguments': json.dumps(arguments)}}
+
+        outputs = [
+            support.reply('', calls=[call('plan-set', 'task_plan', {'action': 'set', 'items': [
+                {'id': 'simulate', 'title': '验证目标输出'}]})], finish='tool_calls'),
+            support.reply('', calls=[call('target-slice', 'circuit_diagnose', {})],
+                          finish='tool_calls'),
+            support.reply('', calls=[call('plan-blocked', 'task_plan', {
+                'action': 'update', 'id': 'simulate', 'status': 'blocked',
+                'note': '目标锥存在阻断，当前诊断契约未启动求解。'})], finish='tool_calls'),
+            support.reply('本轮未启动，因此无法验证。'),
+        ]
+        agent, fake = self.agent(outputs, tools)
+        fake.final_reviews = iter([{'outcome': 'completed',
+                                    'answer': '本轮未启动，因此无法验证。'}])
+        result = agent.handle(user_text='验证目标输出。')
+        outcome = agent.db.get_tool_outcome(
+            result['session_id'], result['task_id'], 'target-slice')
+        plan = agent.db.task_plan(result['session_id'], result['task_id'])
+        self.assertEqual(plan[0]['status'], 'blocked')
+        self.assertEqual(plan[0]['evidence_document_ids'], [outcome['document_id']])
+        events = [event for event in agent.db.events(result['session_id'], run_id=result['task_id'])
+                  if event['kind'] == 'task_plan_evidence_auto_bound']
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0]['data']['item_id'], 'simulate')
+        self.assertEqual(events[0]['data']['evidence_call_ids'], ['target-slice'])
+
+    def test_stale_explicit_plan_evidence_is_augmented_with_fresh_diagnosis(self):
+        agent, _ = self.agent([])
+        sid = agent.db.session('stale-plan-evidence', source='admin')
+        rid = agent.db.enqueue_task(sid, 'diagnose', source='admin')
+        agent.db.set_task_plan(sid, rid, [
+            {'id': 'interface', 'title': '读取接口'},
+            {'id': 'preflight', 'title': '诊断目标'},
+        ])
+        old_doc, _ = agent.db.tool_outcome(
+            sid, rid, 'interface-call', 'circuit_inspect',
+            json.dumps({'ok': True, 'data': {'ports': ['C11']}}), True)
+        agent.db.update_task_plan_item(
+            sid, rid, 'interface', 'completed', evidence_document_ids=[old_doc])
+        fresh_doc, _ = agent.db.tool_outcome(
+            sid, rid, 'diagnose-call', 'circuit_diagnose',
+            json.dumps({'ok': True, 'data': {'verdict': 'INCONCLUSIVE'}}), True)
+        args, candidates = _auto_bind_task_plan_evidence(agent.db, sid, rid, {
+            'action': 'update', 'id': 'preflight', 'status': 'completed',
+            'evidence_document_ids': [old_doc],
+        })
+        self.assertEqual(args['evidence_document_ids'], [old_doc, fresh_doc])
+        self.assertEqual([item['call_id'] for item in candidates], ['diagnose-call'])
+
+    def test_explicit_plan_evidence_wins_and_failed_results_are_not_auto_bound(self):
+        tools = ToolRegistry()
+        inspect = mock.Mock(side_effect=[{'value': 1}, {'value': 2}, RuntimeError('failed solve')])
+        tools.register(ToolSpec('circuit_inspect', 'Inspect', {'type': 'object'}, inspect))
+
+        def call(cid, name, arguments):
+            return {'id': cid, 'type': 'function', 'function': {
+                'name': name, 'arguments': json.dumps(arguments)}}
+
+        outputs = [
+            support.reply('', calls=[call('plan-set', 'task_plan', {'action': 'set', 'items': [
+                {'id': 'one', 'title': '第一阶段'}, {'id': 'two', 'title': '第二阶段'}]})],
+                          finish='tool_calls'),
+            support.reply('', calls=[call('one-a', 'circuit_inspect', {}),
+                                     call('one-b', 'circuit_inspect', {})], finish='tool_calls'),
+            support.reply('', calls=[call('complete-one', 'task_plan', {
+                'action': 'update', 'id': 'one', 'status': 'completed',
+                'evidence_call_ids': ['one-a']})], finish='tool_calls'),
+            support.reply('', calls=[call('failed-two', 'circuit_inspect', {})], finish='tool_calls'),
+            support.reply('', calls=[call('complete-two', 'task_plan', {
+                'action': 'update', 'id': 'two', 'status': 'completed'})], finish='tool_calls'),
+            support.reply('已完成。'),
+        ]
+        agent, fake = self.agent(outputs, tools)
+        fake.final_reviews = iter([{'outcome': 'completed', 'answer': '已完成。'}])
+        result = agent.handle(user_text='执行两个阶段。')
+        first = agent.db.get_tool_outcome(result['session_id'], result['task_id'], 'one-a')
+        plan = agent.db.task_plan(result['session_id'], result['task_id'])
+        self.assertEqual(plan[0]['evidence_document_ids'], [first['document_id']])
+        self.assertEqual(plan[1]['evidence_document_ids'], [])
+        self.assertFalse(any(event['kind'] == 'task_plan_evidence_auto_bound'
+                             for event in agent.db.events(result['session_id'], run_id=result['task_id'])))
+
+    def test_auto_bound_evidence_is_cleared_before_the_next_plan_stage(self):
+        tools = ToolRegistry()
+        tools.register(ToolSpec('circuit_inspect', 'Inspect', {'type': 'object'},
+                                mock.Mock(return_value={'value': 3})))
+
+        def call(cid, name, arguments):
+            return {'id': cid, 'type': 'function', 'function': {
+                'name': name, 'arguments': json.dumps(arguments)}}
+
+        outputs = [
+            support.reply('', calls=[call('plan-set', 'task_plan', {'action': 'set', 'items': [
+                {'id': 'one', 'title': '第一阶段'}, {'id': 'two', 'title': '第二阶段'}]})],
+                          finish='tool_calls'),
+            support.reply('', calls=[call('stage-one-result', 'circuit_inspect', {})],
+                          finish='tool_calls'),
+            support.reply('', calls=[call('complete-one', 'task_plan', {
+                'action': 'update', 'id': 'one', 'status': 'completed'})], finish='tool_calls'),
+            support.reply('', calls=[call('complete-two', 'task_plan', {
+                'action': 'update', 'id': 'two', 'status': 'completed'})], finish='tool_calls'),
+            support.reply('已完成。'),
+        ]
+        agent, fake = self.agent(outputs, tools)
+        fake.final_reviews = iter([{'outcome': 'completed', 'answer': '已完成。'}])
+        result = agent.handle(user_text='执行两个阶段。')
+        outcome = agent.db.get_tool_outcome(
+            result['session_id'], result['task_id'], 'stage-one-result')
+        plan = agent.db.task_plan(result['session_id'], result['task_id'])
+        self.assertEqual(plan[0]['evidence_document_ids'], [outcome['document_id']])
+        self.assertEqual(plan[1]['evidence_document_ids'], [])
+        events = [event for event in agent.db.events(result['session_id'], run_id=result['task_id'])
+                  if event['kind'] == 'task_plan_evidence_auto_bound']
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0]['data']['item_id'], 'one')
+
+    def test_plan_evidence_candidates_are_bounded_to_the_exact_task(self):
+        agent, _ = self.agent([])
+        sid = agent.db.session('plan-evidence-run-scope', source='admin')
+        first_rid = agent.db.enqueue_task(sid, 'first', source='admin')
+        second_rid = agent.db.enqueue_task(sid, 'second', source='admin')
+        agent.db.set_task_plan(sid, first_rid, [{'id': 'work', 'title': 'first work'}])
+        agent.db.set_task_plan(sid, second_rid, [{'id': 'work', 'title': 'second work'}])
+        first_doc, _ = agent.db.tool_outcome(
+            sid, first_rid, 'same-readable-call', 'circuit_inspect',
+            json.dumps({'ok': True, 'data': {'value': 1}}), True)
+        self.assertEqual([item['document_id'] for item in
+                          agent.db.task_plan_evidence_candidates(sid, first_rid)], [first_doc])
+        self.assertEqual(agent.db.task_plan_evidence_candidates(sid, second_rid), [])
+
+    def test_explicit_plan_evidence_cannot_cross_runs_in_one_session(self):
+        agent, _ = self.agent([])
+        sid = agent.db.session('plan-explicit-run-scope', source='admin')
+        first_rid = agent.db.enqueue_task(sid, 'first', source='admin')
+        second_rid = agent.db.enqueue_task(sid, 'second', source='admin')
+        agent.db.set_task_plan(sid, second_rid, [{'id': 'work', 'title': 'second work'}])
+        first_doc, _ = agent.db.tool_outcome(
+            sid, first_rid, 'first-call', 'circuit_inspect',
+            json.dumps({'ok': True, 'data': {'value': 1}}), True)
+        for field in ('evidence_document_ids', 'evidence_call_ids'):
+            with self.subTest(field=field), self.assertRaisesRegex(ValueError, 'exact task|this task'):
+                agent.db.update_task_plan_item(
+                    sid, second_rid, 'work', 'completed', **{field: [first_doc]})
+
     def test_completed_plan_history_cannot_be_replaced_or_reopened(self):
         agent, _ = self.agent([])
         sid = agent.db.session('plan-history', source='admin')
         rid = agent.db.enqueue_task(sid, '复杂验证', source='admin')
         agent.db.set_task_plan(sid, rid, [{'id': 'measure', 'title': '取得测量证据'}])
-        did = agent.db.document(sid, 'measurement', '{"voltage":5}')
+        did, _ = agent.db.tool_outcome(
+            sid, rid, 'measurement-call', 'circuit_inspect', '{"voltage":5}', True)
         agent.db.update_task_plan_item(sid, rid, 'measure', 'completed',
                                        evidence_call_ids=[did])
         with self.assertRaisesRegex(ValueError, 'already exists'):
@@ -256,6 +519,46 @@ class ProgressReviewTests(unittest.TestCase):
         self.assertFalse(any(messages[0].get('content') == final_system
                              for messages, _ in fake.requests))
         self.assertEqual(sum(event['kind'] == 'answer' for event in events), 1)
+
+    def test_query_many_a_b_a_unchanged_outcome_adds_hint_without_disabling_tools(self):
+        tools = ToolRegistry()
+        query = mock.Mock(return_value={
+            'query_manifest': {'query_coverage': {
+                'requested': 1, 'represented': 1, 'complete': True}},
+            'results': [{'query': 'N676', 'ok': True, 'component_ids': ['dff-1']}]})
+        inspect = mock.Mock(return_value={
+            'node_query': {'node': 'N1', 'exact': True, 'match_count': 1},
+            'netlist': {'components': [{'id': 'gate-1'}]}})
+        tools.register(ToolSpec('circuit_query_many', 'Query', {'type': 'object'}, query))
+        tools.register(ToolSpec('circuit_inspect', 'Inspect', {'type': 'object'}, inspect))
+
+        def call(cid, name, arguments):
+            return {'id': cid, 'type': 'function', 'function': {
+                'name': name, 'arguments': json.dumps(arguments)}}
+
+        same = {'path': '/cpu.sav', 'queries': ['N676'], 'fields': ['pins']}
+        outputs = [
+            support.reply('', calls=[call('query-a1', 'circuit_query_many', same)],
+                          finish='tool_calls'),
+            support.reply('', calls=[call('inspect-b', 'circuit_inspect', {
+                'path': '/cpu.sav', 'query': 'N1'})], finish='tool_calls'),
+            support.reply('', calls=[call('query-a2', 'circuit_query_many', same)],
+                          finish='tool_calls'),
+            support.reply('重复快照不是新证据，当前结论为 INCONCLUSIVE。'),
+        ]
+        agent, fake = self.agent(outputs, tools)
+        result = agent.handle(user_text='测试这个现有 CPU，但不要重复扫网表。')
+        self.assertEqual(result['status'], 'completed')
+        self.assertEqual(query.call_count, 2)
+        self.assertEqual(inspect.call_count, 1)
+        events = agent.db.events(result['session_id'], run_id=result['task_id'])
+        recovery = next(event for event in events if event['kind'] == 'loop_recovery')
+        self.assertEqual(recovery['data']['circuit_repeated_result']['pattern'], 'A-B-A')
+        self.assertTrue(recovery['data']['circuit_repeated_result']['tools_remain_enabled'])
+        final_prompt = json.dumps(fake.requests[-1][0], ensure_ascii=False)
+        self.assertIn('完整重复结果不能当作新证据', final_prompt)
+        self.assertIn('所有正常工具仍可使用', final_prompt)
+        self.assertTrue(fake.requests[-1][1]['tools'])
 
     def test_explicit_exact_pagination_exposes_only_the_required_next_node_page(self):
         tools = ToolRegistry()

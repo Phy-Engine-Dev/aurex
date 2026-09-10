@@ -1051,8 +1051,8 @@ extern "C" int circuit_digital_clk(void* circuit_ptr)
 {
     if(circuit_ptr == nullptr) { return 1; }
     auto* c = static_cast<::phy_engine::circult*>(circuit_ptr);
-    c->digital_clk();
-    return 0;
+    auto const& status=c->digital_clk();
+    return status.settled ? 0 : (status.reason==::phy_engine::digital::settle_reason::multiple_drivers ? 11 : 10);
 }
 
 extern "C" int circuit_sample(void* circuit_ptr,
@@ -1076,6 +1076,8 @@ extern "C" int circuit_sample(void* circuit_ptr,
     auto& nl{c->get_netlist()};
 
     voltage_ord[0] = current_ord[0] = digital_ord[0] = 0;
+    if(c->digital_ticks_attempted && !c->digital_settle.settled)
+        return c->digital_settle.reason==::phy_engine::digital::settle_reason::multiple_drivers ? 11 : 10;
     for(::std::size_t i{}; i < comp_size; ++i)
     {
         phy_engine::model::model_base* model = get_model(nl, ::phy_engine::netlist::model_pos{vec_pos[i], chunk_pos[i]});
@@ -1137,6 +1139,8 @@ extern "C" int circuit_sample_u8(void* circuit_ptr,
     auto& nl{c->get_netlist()};
 
     voltage_ord[0] = current_ord[0] = digital_ord[0] = 0;
+    if(c->digital_ticks_attempted && !c->digital_settle.settled)
+        return c->digital_settle.reason==::phy_engine::digital::settle_reason::multiple_drivers ? 11 : 10;
     for(::std::size_t i{}; i < comp_size; ++i)
     {
         phy_engine::model::model_base* model = get_model(nl, ::phy_engine::netlist::model_pos{vec_pos[i], chunk_pos[i]});

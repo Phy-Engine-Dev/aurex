@@ -387,6 +387,12 @@ def pe_simulate(runtime: ToolRuntime, args: dict[str, Any]) -> dict[str, Any]:
     except subprocess.TimeoutExpired as error:
         raise ToolError("Phy-Engine simulation exceeded its wall-clock limit; reduce circuit size or time steps") from error
     if proc.returncode:
+        try:
+            failure = json.loads(proc.stdout).get("error")
+        except (ValueError, AttributeError):
+            failure = None
+        if isinstance(failure, dict) and failure.get("execution_status") == "failed" and "digital_settle" in failure:
+            raise ToolError(json.dumps(failure, ensure_ascii=False, separators=(",", ":")))
         raise ToolError("Phy-Engine simulation failed: " + (proc.stderr.strip()[-3000:] or f"worker exit {proc.returncode}"))
     try:
         return json.loads(proc.stdout)
@@ -440,8 +446,8 @@ def _measurement_rows(comp_meta: list[dict], sample: dict) -> list[dict]:
             if disconnected:
                 row["unconnected_pins"] = disconnected
                 row["unconnected_pin_note"] = (
-                    "Raw samples on disconnected pins are X; native model defaults, when defined, "
-                    "are applied internally and are reflected by model_state/output behavior.")
+                    "These pins have no external load/driver. Named unloaded outputs remain measurable; "
+                    "open input samples are X, while native input defaults are reflected by model_state/output behavior.")
         if meta.get("pl_source"):
             row["pl_source"] = copy.deepcopy(meta["pl_source"])
         if meta.get("plsav_import"):
@@ -511,6 +517,19 @@ def _control_catalog(groups: dict[str, dict[str, Any]]) -> list[dict[str, Any]]:
                     members[0]["meta"].get("pl_source", {}).get("model_id",
                     members[0]["meta"]["type"])),
                "primitive_component_ids": [member["meta"]["id"] for member in members]}
+        source_refs = []
+        for member in members:
+            ref = member["meta"].get("pl_source", {}).get("source_ref")
+            if isinstance(ref, str) and ref and ref not in source_refs:
+                source_refs.append(ref)
+        if len(source_refs) == 1:
+            row["ref"] = source_refs[0]
+        elif source_refs:
+            row["source_refs"] = source_refs
+        positions = [member["meta"].get("position") for member in members
+                     if isinstance(member["meta"].get("position"), list)]
+        if len(positions) == 1:
+            row["position"] = positions[0]
         for key in ("allowed", "minimum", "maximum", "momentary",
                     "rated_resistance_ohm", "minimum_segment_ohm"):
             if key in definition:
@@ -622,8 +641,11 @@ def _simulate_spec(spec: Any, lib_path: str, *, return_state: bool = False,
     at = _ANALYZE_TYPES.get(analysis)
     if at is None:
         raise ToolError("pe_simulate: analysis must be one of op/dc/ac/acop/tr/trop")
-    mixed = (any(str(c.get("type", "")).startswith("digital_") for c in comps if isinstance(c, dict))
-             and any(not str(c.get("type", "")).startswith("digital_") for c in comps if isinstance(c, dict)))
+    has_digital = any(str(c.get("type", "")).startswith("digital_")
+                      for c in comps if isinstance(c, dict))
+    has_analog = any(not str(c.get("type", "")).startswith("digital_")
+                     for c in comps if isinstance(c, dict))
+    mixed = has_digital and has_analog
     if mixed and analysis not in ("op", "dc", "tr"):
         raise ToolError("Mixed-signal simulation supports op/dc/tr only; AC/trop coupling is not implemented")
 
@@ -647,7 +669,12 @@ def _simulate_spec(spec: Any, lib_path: str, *, return_state: bool = False,
     if stimulus:
         known = {c.get("id"): c for c in comps if isinstance(c, dict) and isinstance(c.get("id"), str)}
         if any(not str(c.get("type", "")).startswith("digital_") for c in known.values()):
-            raise ToolError("stimulus currently requires a digital-only circuit; use a supported mixed transient source for analog-connected inputs")
+            raise ToolError(
+                "MIXED_REQUIRES_TR_INTERACTIONS: stimulus is a post-analysis digital-only sequence. "
+                "For analysis=tr on a mixed circuit, put the exact digital_input control IDs and physical "
+                "switch/button/source IDs together in tr_interactions [{time_s,set:{...}}]. Do not retry "
+                "stimulus or stimulus_table on this unchanged mixed circuit."
+            )
         inputs = [cid for cid, component in known.items() if component.get("type") == "digital_input"]
         # Validate the complete sequence before loading or running native code.
         # A typo is actionable input feedback, not a solver failure to retry.
@@ -747,13 +774,13 @@ def _simulate_spec(spec: Any, lib_path: str, *, return_state: bool = False,
                 wires.extend([0, 0, int(ele), int(pin)])
             continue
         if len(pins) <= 1:
-            # A saved one-pin *digital* net is an unconnected pin, not a driven
-            # X node.  Keep it disconnected so native models can apply their
-            # documented open-input semantics (notably random4 reset_n=high).
-            # Analog pins still need a self-edge because their floating node is
-            # part of the MNA topology and may carry initial/device state.
+            # A named output remains a real observable net without a load.
+            # Singleton digital inputs stay disconnected so defaults such as
+            # random4's open reset_n=high are not replaced by an invented X
+            # driver. Analog floating nodes remain part of the MNA topology.
             for ele, pin in pins:
-                if not comp_meta[int(ele) - 1]["type"].startswith("digital_"):
+                kind = comp_meta[int(ele) - 1]["type"]
+                if not kind.startswith("digital_") or pin in _ELEMENTS[kind].get("digital_output_pins", ()):
                     wires.extend([int(ele), int(pin), int(ele), int(pin)])
             continue
         root_ele, root_pin = pins[0]
@@ -762,6 +789,7 @@ def _simulate_spec(spec: Any, lib_path: str, *, return_state: bool = False,
 
     circuit = lib.create_circuit(elements=element_codes, wires=wires, properties=properties)
     sequence_samples = []
+    digital_settle = None
     transient = None
     initial_operating_point = None
     max_pins = max(m["pins"] for m in comp_meta)
@@ -771,8 +799,36 @@ def _simulate_spec(spec: Any, lib_path: str, *, return_state: bool = False,
     normalized_interactions: list[dict] = []
     applied_interactions: list[dict] = []
 
+    def bind_settle(status):
+        if not status:
+            return status
+        for key in ("pending", "conflicts", "undriven", "hot"):
+            for node in status.get(key, []):
+                for pin in node.get("pins", []):
+                    index = pin.get("component_index")
+                    if not isinstance(index, int) or not 0 <= index < len(comp_meta):
+                        continue
+                    meta = comp_meta[index]
+                    pin["component_id"] = meta["id"]
+                    source = meta.get("pl_source", {})
+                    if source.get("source_ref"):
+                        pin["source_ref"] = source["source_ref"]
+                        # Source reference plus native index identifies this
+                        # revision unambiguously; avoid repeating UUIDs on
+                        # every diagnostic edge in the model context.
+                        pin.pop("component_id", None)
+                    p = pin.get("pin")
+                    if isinstance(p, int) and 0 <= p < len(meta["nodes"]):
+                        node["node"] = meta["nodes"][p]
+        return status
+
     def capture():
         measured = circuit.sample_complex(max_pins=max_pins)
+        settle_query = getattr(circuit, "digital_settle_status", None) if has_digital else None
+        if settle_query is not None:
+            status = settle_query()
+            if status:
+                measured["digital_settled"] = status.get("settled", False)
         measured["pin_currents"] = {}
         measured["model_states"] = {}
         measured["model_digital_states"] = {}
@@ -877,7 +933,7 @@ def _simulate_spec(spec: Any, lib_path: str, *, return_state: bool = False,
         # unsampled steps. Do not append the legacy implicit tick to a completed
         # trace; explicit user-requested post-analysis ticks remain additional.
         per_step = bool(transient and transient.get("digital_propagation", {}).get("verified_per_step"))
-        default_ticks = 0 if per_step or mixed else (1 if any(m["type"].startswith("digital_") for m in comp_meta) else 0)
+        default_ticks = 0 if per_step or mixed else (1 if has_digital else 0)
         ticks = int(spec.get("digital_clock_ticks", default_ticks))
         if ticks < 0:
             ticks = 0
@@ -891,21 +947,32 @@ def _simulate_spec(spec: Any, lib_path: str, *, return_state: bool = False,
 
         sample = capture()
         if stimulus:
-            circuit.set_analyze_type(_ANALYZE_TYPES["tr"])
-            circuit.set_tr(1e-8, 1e-8)
             input_indices = {c["id"]: index for index, c in enumerate(comp_meta) if c["type"] == "digital_input"}
             for step, vector in enumerate(stimulus):
                 for cid, state in vector.get("set", {}).items():
                     circuit.set_model_digital(input_indices[cid], 0, int(state))
-                circuit.digital_clk()
-                circuit.analyze()
+                # One logical frame advances stateful digital models once and
+                # drains the combinational event queue before observation.
+                # These digital-only vectors carry no physical time/delay;
+                # an extra TR solve/tick would change sequential behaviour.
                 circuit.digital_clk()
                 sample = capture()
-                sequence_samples.append({"step": step, "inputs": vector.get("set", {}), "digital": {
+                sequence_samples.append({"step": step, "inputs": vector.get("set", {}),
+                    "digital_settled": sample.get("digital_settled", False), "digital": {
                     c["id"]: _reported_digital(c, sample,
                         sample["digital_ord"][i], sample["digital_ord"][i + 1])[0]
                     for i, c in enumerate(comp_meta)}})
+        settle_query = getattr(circuit, "digital_settle_status", None) if has_digital else None
+        if settle_query is not None:
+            digital_settle = bind_settle(settle_query())
     except PhyEngineError as e:
+        try:
+            failure = json.loads(str(e))
+        except (ValueError, TypeError):
+            failure = None
+        if isinstance(failure, dict) and "digital_settle" in failure:
+            bind_settle(failure["digital_settle"])
+            raise ToolError(json.dumps(failure, ensure_ascii=False, separators=(",", ":"))) from e
         raise ToolError(str(e)) from e
     finally:
         circuit.close()
@@ -917,6 +984,9 @@ def _simulate_spec(spec: Any, lib_path: str, *, return_state: bool = False,
         "notes": ["Voltage arrays are per pin relative to ground; branch currents exist only for models with explicit MNA branches.",
                   "Transient results are the final state at tr_stop; no unmeasured waveform is inferred."]}
     out["components"] = _measurement_rows(comp_meta, sample)
+    out["execution_status"] = "completed"
+    if digital_settle:
+        out["digital_settle"] = digital_settle
     if interaction_catalog:
         out["interaction_controls"] = _control_catalog(interaction_groups)
         out["interaction_states"] = sample.get("interaction_states", {})
@@ -928,12 +998,20 @@ def _simulate_spec(spec: Any, lib_path: str, *, return_state: bool = False,
         }
     if sequence_samples:
         out["stimulus_results"] = sequence_samples
+        out["stimulus_semantics"] = {
+            "digital_ticks_per_frame": 1,
+            "ordering": "set_all_inputs -> one_digital_tick_and_settle -> capture",
+            "physical_time_advanced": False,
+            "scope": "Separate logical frames after the requested baseline analysis and explicit post-analysis ticks.",
+        }
     if transient:
         if initial_operating_point is not None:
             transient["initial_operating_point"] = initial_operating_point
         for point in transient.get("samples", []):
             raw_sample = point.pop("sample")
             point["components"] = _measurement_rows(comp_meta, raw_sample)
+            if "digital_settled" in raw_sample:
+                point["digital_settled"] = raw_sample["digital_settled"]
             if raw_sample.get("interaction_states"):
                 point["interaction_states"] = raw_sample["interaction_states"]
         if normalized_interactions:

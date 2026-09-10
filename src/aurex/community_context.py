@@ -529,6 +529,13 @@ def build_mention_context(
     actual_nickname = requester_nickname if requester_user_id else (trigger['author_nickname'] if trigger else None)
     active, selection = _related_comments(all_records, trigger, requester_id=actual_requester,
         target_type=target_type, window_seconds=window, max_related=related_limit)
+    for item in active:
+        if bot_user_id and item.get('author_id') == bot_user_id:
+            item['speaker_role'] = 'assistant_history'
+            item['evidence_status'] = 'prior_claim_to_recheck_not_author_spec'
+        else:
+            item['speaker_role'] = 'external_user'
+            item['evidence_status'] = 'source_comment_not_verified_author_spec'
     images = _cover_images(summary, target_type, target_id)[:1]
     if download_images and cache_dir:
         for image in images:
